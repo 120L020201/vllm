@@ -602,7 +602,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                spec_hidden_states = pre_hc_hidden_states[
+                    : hidden_states.shape[0]
+                ]  # type: ignore[union-attr]
             self.speculator.propose(
                 input_batch=input_batch,
                 attn_metadata=attn_metadata,
@@ -753,6 +755,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
         for req_id in finished_req_ids:
             self._remove_request(req_id)
+            if self.speculator is not None:
+                self.speculator.reset_request(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -1429,6 +1433,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            self.speculator.maybe_apply_pending_weights()
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
@@ -1436,7 +1441,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                spec_hidden_states = pre_hc_hidden_states[
+                    : hidden_states.shape[0]
+                ]  # type: ignore[union-attr]
+
+            if len(input_batch.req_ids) == 1:
+                observation_payload: dict[str, torch.Tensor] = {
+                    "hidden_states": spec_hidden_states,
+                    "sampled_token_ids": sampler_output.sampled_token_ids,
+                    "num_sampled": num_sampled,
+                    "num_rejected": num_rejected,
+                    "temperature": self.sampler.sampling_states.temperature.gpu,
+                    "seeds": self.sampler.sampling_states.seeds.gpu,
+                }
+                if aux_hidden_states is not None:
+                    for idx, aux_hidden_state in enumerate(aux_hidden_states):
+                        observation_payload[f"aux_hidden_states_{idx}"] = (
+                            aux_hidden_state
+                        )
+                self.speculator.observe_step(
+                    input_batch.req_ids[0],
+                    0,
+                    observation_payload,
+                )
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,

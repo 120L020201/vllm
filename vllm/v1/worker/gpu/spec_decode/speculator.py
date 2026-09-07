@@ -66,6 +66,20 @@ class BaseSpeculator(ABC):
     ) -> torch.Tensor:
         pass
 
+    def observe_step(
+        self,
+        request_id: str,
+        step_id: int,
+        payload: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        return None
+
+    def maybe_apply_pending_weights(self) -> None:
+        return None
+
+    def reset_request(self, req_id: str) -> None:
+        return None
+
 
 class DraftModelSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):

@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     PrefillSpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from online_eagle3.weights import load_trainable_state_dict
 
 logger = init_logger(__name__)
 
@@ -49,6 +50,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.prefill_cudagraph_manager: PrefillSpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeSpeculatorCudaGraphManager | None = None
+        self.weight_update_bridge: Any | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -92,6 +94,31 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             cudagraph_mode,
             decode_query_len=1,
         )
+
+    def set_weight_update_bridge(self, bridge: Any | None) -> None:
+        self.weight_update_bridge = bridge
+
+    def observe_step(
+        self,
+        request_id: str,
+        step_id: int,
+        payload: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        if self.weight_update_bridge is None:
+            return
+        self.weight_update_bridge.observe_step(request_id, step_id, payload)
+
+    def maybe_apply_pending_weights(self) -> None:
+        if self.weight_update_bridge is None or not hasattr(self, "model"):
+            return
+        pending = self.weight_update_bridge.maybe_apply_pending_weights()
+        if pending is not None:
+            load_trainable_state_dict(self.model, pending.state_dict)
+
+    def reset_request(self, req_id: str) -> None:
+        if self.weight_update_bridge is None:
+            return
+        self.weight_update_bridge.reset_request(req_id)
 
     def capture(
         self,
