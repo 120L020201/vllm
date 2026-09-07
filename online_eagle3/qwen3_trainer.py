@@ -74,10 +74,23 @@ class Qwen3Eagle3CpuTrainer:
             self.config.frozen_prefixes,
             strict=strict,
         )
-        self._version = max(self._version, snapshot.version)
+        self._version = snapshot.version
+
+    def restore_snapshot(
+        self,
+        snapshot: TrainableWeightSnapshot,
+        *,
+        strict: bool = True,
+    ) -> None:
+        self.load_snapshot(snapshot, strict=strict)
+        self.clear_optimizer_state()
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
+
+    def clear_optimizer_state(self) -> None:
+        self.optimizer.state.clear()
+        self.zero_grad()
 
     def step(self) -> None:
         self.optimizer.step()

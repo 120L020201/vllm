@@ -88,6 +88,8 @@ def load_trainable_state_dict(
         )
 
     filtered_state = {
-        name: tensor for name, tensor in trainable_state.items() if name in expected_keys
+        name: tensor
+        for name, tensor in trainable_state.items()
+        if name in expected_keys
     }
     module.load_state_dict(filtered_state, strict=False)
