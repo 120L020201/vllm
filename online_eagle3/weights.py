@@ -59,10 +59,8 @@ def export_trainable_state_dict(
     frozen_prefixes: Sequence[str] = QWEN3_EAGLE3_FROZEN_PREFIXES,
 ) -> dict[str, torch.Tensor]:
     state_dict: dict[str, torch.Tensor] = {}
-    for name, tensor in module.state_dict().items():
-        if is_frozen_name(name, frozen_prefixes):
-            continue
-        state_dict[name] = tensor.detach().cpu().clone()
+    for name, parameter in get_trainable_named_parameters(module, frozen_prefixes):
+        state_dict[name] = parameter.detach().cpu().clone()
     return state_dict
 
 
@@ -73,10 +71,10 @@ def load_trainable_state_dict(
     *,
     strict: bool = True,
 ) -> None:
-    current_state = module.state_dict()
-    expected_keys = {
-        name for name in current_state if not is_frozen_name(name, frozen_prefixes)
-    }
+    current_parameters = dict(module.named_parameters())
+    expected_keys = set(
+        name for name in current_parameters if not is_frozen_name(name, frozen_prefixes)
+    )
     incoming_keys = set(trainable_state)
 
     missing_keys = sorted(expected_keys - incoming_keys)
@@ -91,7 +89,7 @@ def load_trainable_state_dict(
         for name, source in trainable_state.items():
             if name not in expected_keys:
                 continue
-            target = current_state[name]
+            target = current_parameters[name]
             if target.shape != source.shape:
                 raise ValueError(
                     f"Shape mismatch for {name}: "

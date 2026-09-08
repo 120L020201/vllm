@@ -116,3 +116,17 @@ def test_async_bridge_reset_drops_pending_observations() -> None:
     assert bridge.maybe_apply_pending_weights() is None
 
     bridge.shutdown()
+
+
+def test_async_bridge_shutdown_is_idempotent() -> None:
+    model = _ToyEagle3Module()
+    trainer = Qwen3Eagle3CpuTrainer(model)
+    bridge = Qwen3Eagle3AsyncBridge(trainer, _train_step)
+
+    bridge.shutdown()
+    bridge.shutdown()
+    bridge.observe_step("req-1", 0)
+    bridge.reset_request("req-1")
+
+    assert not bridge._thread.is_alive()
+    assert bridge.maybe_apply_pending_weights() is None

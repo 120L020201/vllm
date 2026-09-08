@@ -83,6 +83,9 @@ class BaseSpeculator(ABC):
     def reset_request(self, req_id: str) -> None:
         return None
 
+    def shutdown(self) -> None:
+        return None
+
 
 class DraftModelSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):

@@ -17,6 +17,7 @@ class _ToyEagle3Module(nn.Module):
         self.model = nn.Module()
         self.model.embed_tokens = nn.Embedding(8, 4)
         self.model.fc = nn.Linear(4, 4)
+        self.model.register_buffer("attn_scale", torch.ones(1))
         self.lm_head = nn.Linear(4, 8, bias=False)
         self.draft_id_to_target_id = nn.Parameter(
             torch.zeros(8, dtype=torch.long), requires_grad=False
@@ -74,6 +75,17 @@ def test_load_trainable_state_only_restores_trainable_weights() -> None:
                 assert torch.allclose(parameter, expected)
             else:
                 assert torch.equal(parameter, expected)
+
+
+def test_load_trainable_state_ignores_non_parameter_buffers() -> None:
+    model = _ToyEagle3Module()
+    freeze_parameters(model)
+    snapshot = export_trainable_state_dict(model)
+
+    assert "model.attn_scale" in model.state_dict()
+    assert "model.attn_scale" not in snapshot
+
+    load_trainable_state_dict(model, snapshot)
 
 
 def test_cpu_trainer_tracks_version_and_trainable_names() -> None:

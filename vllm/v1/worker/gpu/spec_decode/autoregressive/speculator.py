@@ -144,6 +144,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             return
         self.weight_update_bridge.reset_request(req_id)
 
+    def shutdown(self) -> None:
+        bridge = self.weight_update_bridge
+        self.weight_update_bridge = None
+        if bridge is not None and hasattr(bridge, "shutdown"):
+            bridge.shutdown()
+
     def _start_proposal_trace(
         self,
         input_batch: InputBatch,
