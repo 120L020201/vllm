@@ -17,6 +17,12 @@ from .observations import (
     build_verified_target_labels,
     map_target_to_draft_labels,
 )
+from .torch_eagle3 import (
+    TorchEagle3Config,
+    TorchEagle3ForCausalLM,
+    convert_eagle3_checkpoint_state,
+    load_torch_eagle3_model,
+)
 from .weights import (
     QWEN3_EAGLE3_FROZEN_PREFIXES,
     TrainableWeightSnapshot,
@@ -38,11 +44,15 @@ __all__ = [
     "DraftVerifyLabels",
     "TrainableWeightSnapshot",
     "TrainObservation",
+    "TorchEagle3Config",
+    "TorchEagle3ForCausalLM",
     "build_target_to_draft_map",
     "build_verified_target_labels",
+    "convert_eagle3_checkpoint_state",
     "export_trainable_state_dict",
     "freeze_parameters",
     "get_trainable_named_parameters",
+    "load_torch_eagle3_model",
     "load_trainable_state_dict",
     "map_target_to_draft_labels",
 ]
