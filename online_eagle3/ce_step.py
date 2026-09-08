@@ -24,19 +24,24 @@ def qwen3_eagle3_ce_step(
 ) -> None:
     """Run one supervised CE update over completed draft-verify iterations."""
     losses: list[torch.Tensor] = []
-    trainer.zero_grad()
+    with torch.profiler.record_function("online_eagle3.cpu_zero_grad"):
+        trainer.zero_grad()
 
     for observation in observations:
-        loss = _loss_for_observation(trainer, observation)
+        with torch.profiler.record_function("online_eagle3.cpu_loss_for_observation"):
+            loss = _loss_for_observation(trainer, observation)
         if loss is not None:
             losses.append(loss)
 
     if not losses:
-        trainer.zero_grad()
+        with torch.profiler.record_function("online_eagle3.cpu_zero_grad_empty"):
+            trainer.zero_grad()
         return
 
-    torch.stack(losses).mean().backward()
-    trainer.step()
+    with torch.profiler.record_function("online_eagle3.cpu_backward"):
+        torch.stack(losses).mean().backward()
+    with torch.profiler.record_function("online_eagle3.cpu_optimizer_step"):
+        trainer.step()
 
 
 def _loss_for_observation(
@@ -56,72 +61,78 @@ def _loss_for_observation(
     if any(key not in payload for key in required_keys):
         return None
 
-    num_speculative_tokens = int(
-        payload["proposal_num_speculative_tokens"].reshape(-1)[0].item()
-    )
-    verify_labels = build_verified_target_labels(
-        _cpu_long(payload["sampled_token_ids"]),
-        _cpu_long(payload["num_sampled"]),
-        num_speculative_tokens,
-    )
-    target_to_draft = _get_target_to_draft_map(trainer.model)
+    with torch.profiler.record_function("online_eagle3.cpu_build_labels"):
+        num_speculative_tokens = int(
+            payload["proposal_num_speculative_tokens"].reshape(-1)[0].item()
+        )
+        verify_labels = build_verified_target_labels(
+            _cpu_long(payload["sampled_token_ids"]),
+            _cpu_long(payload["num_sampled"]),
+            num_speculative_tokens,
+        )
+        target_to_draft = _get_target_to_draft_map(trainer.model)
 
     model_device, model_dtype = _model_device_and_dtype(trainer.model)
-    input_ids = _cpu_long(payload["proposal_input_ids"][:num_speculative_tokens])
-    positions = _cpu_long(payload["proposal_positions"][:num_speculative_tokens])
-    hidden_states = _cpu_float(
-        payload["proposal_hidden_states"][:num_speculative_tokens],
-        device=model_device,
-        dtype=model_dtype,
-    )
-    aux_hidden_states = payload.get("proposal_aux_hidden_states")
-    if aux_hidden_states is not None and hasattr(
-        trainer.model, "combine_hidden_states"
-    ):
-        aux_hidden_states = _cpu_float(
-            aux_hidden_states,
+    with torch.profiler.record_function("online_eagle3.cpu_copy_observation_tensors"):
+        input_ids = _cpu_long(payload["proposal_input_ids"][:num_speculative_tokens])
+        positions = _cpu_long(payload["proposal_positions"][:num_speculative_tokens])
+        hidden_states = _cpu_float(
+            payload["proposal_hidden_states"][:num_speculative_tokens],
             device=model_device,
             dtype=model_dtype,
         )
-        combined_hidden_states = trainer.model.combine_hidden_states(aux_hidden_states)
-        hidden_states = hidden_states.clone()
-        hidden_states[: combined_hidden_states.shape[0]] = combined_hidden_states
-    input_embeds = _cpu_float(
-        payload["proposal_input_embeds"][:num_speculative_tokens],
-        device=model_device,
-        dtype=model_dtype,
-    )
+        aux_hidden_states = payload.get("proposal_aux_hidden_states")
+        if aux_hidden_states is not None and hasattr(
+            trainer.model, "combine_hidden_states"
+        ):
+            aux_hidden_states = _cpu_float(
+                aux_hidden_states,
+                device=model_device,
+                dtype=model_dtype,
+            )
+            combined_hidden_states = trainer.model.combine_hidden_states(
+                aux_hidden_states
+            )
+            hidden_states = hidden_states.clone()
+            hidden_states[: combined_hidden_states.shape[0]] = combined_hidden_states
+        input_embeds = _cpu_float(
+            payload["proposal_input_embeds"][:num_speculative_tokens],
+            device=model_device,
+            dtype=model_dtype,
+        )
 
-    output = trainer.model(
-        input_ids=input_ids.to(model_device),
-        positions=positions.to(model_device),
-        hidden_states=hidden_states,
-        inputs_embeds=input_embeds,
-    )
+    with torch.profiler.record_function("online_eagle3.cpu_forward"):
+        output = trainer.model(
+            input_ids=input_ids.to(model_device),
+            positions=positions.to(model_device),
+            hidden_states=hidden_states,
+            inputs_embeds=input_embeds,
+        )
     hidden_output = output[0] if isinstance(output, tuple) else output
 
-    if target_to_draft is not None:
-        train_labels = map_target_to_draft_labels(
-            verify_labels.target_token_ids,
-            target_to_draft,
-            verify_labels.loss_mask,
-        )
-        logits = _compute_draft_logits(trainer.model, hidden_output)
-    else:
-        train_labels = DraftTrainLabels(
-            draft_token_ids=verify_labels.target_token_ids,
-            loss_mask=verify_labels.loss_mask,
-        )
-        logits = trainer.model.compute_logits(hidden_output)
+    with torch.profiler.record_function("online_eagle3.cpu_compute_loss"):
+        if target_to_draft is not None:
+            train_labels = map_target_to_draft_labels(
+                verify_labels.target_token_ids,
+                target_to_draft,
+                verify_labels.loss_mask,
+            )
+            logits = _compute_draft_logits(trainer.model, hidden_output)
+        else:
+            train_labels = DraftTrainLabels(
+                draft_token_ids=verify_labels.target_token_ids,
+                loss_mask=verify_labels.loss_mask,
+            )
+            logits = trainer.model.compute_logits(hidden_output)
 
-    active_mask = train_labels.loss_mask.to(logits.device)
-    if not active_mask.any():
-        return None
+        active_mask = train_labels.loss_mask.to(logits.device)
+        if not active_mask.any():
+            return None
 
-    return F.cross_entropy(
-        logits[active_mask],
-        train_labels.draft_token_ids.to(logits.device)[active_mask],
-    )
+        return F.cross_entropy(
+            logits[active_mask],
+            train_labels.draft_token_ids.to(logits.device)[active_mask],
+        )
 
 
 def _get_target_to_draft_map(model: torch.nn.Module) -> torch.Tensor | None:

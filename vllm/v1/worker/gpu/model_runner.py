@@ -610,9 +610,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[
-                    : hidden_states.shape[0]
-                ]  # type: ignore[union-attr]
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             self.speculator.propose(
                 input_batch=input_batch,
                 attn_metadata=attn_metadata,
@@ -1265,13 +1263,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Run model.
+        profile_online_eagle3 = (
+            self.speculator is not None
+            and getattr(self.speculator, "weight_update_bridge", None) is not None
+        )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            if profile_online_eagle3:
+                with torch.profiler.record_function("online_eagle3.gpu_target_forward"):
+                    model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1296,12 +1302,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
+                    if profile_online_eagle3:
+                        with torch.profiler.record_function(
+                            "online_eagle3.gpu_target_forward"
+                        ):
+                            model_output = self.cudagraph_manager.run_pw_graph(
+                                self.model, model_inputs
+                            )
+                    else:
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    if profile_online_eagle3:
+                        with torch.profiler.record_function(
+                            "online_eagle3.gpu_target_forward"
+                        ):
+                            model_output = self.model(**model_inputs)
+                    else:
+                        model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1369,9 +1389,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+        profile_online_eagle3 = (
+            self.speculator is not None
+            and getattr(self.speculator, "weight_update_bridge", None) is not None
         )
+        if profile_online_eagle3:
+            with torch.profiler.record_function("online_eagle3.gpu_verify_sample"):
+                sampler_output, num_sampled, num_rejected = self.sample(
+                    hidden_states, input_batch, grammar_output
+                )
+        else:
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1449,9 +1479,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[
-                    : hidden_states.shape[0]
-                ]  # type: ignore[union-attr]
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
 
             if len(input_batch.req_ids) == 1:
                 observation_payload: dict[str, torch.Tensor] = {
@@ -1472,20 +1500,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     0,
                     observation_payload,
                 )
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
-            )
+            with torch.profiler.record_function("online_eagle3.gpu_draft_propose"):
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    mm_inputs=mm_inputs,
+                )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:

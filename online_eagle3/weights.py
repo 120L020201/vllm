@@ -58,10 +58,11 @@ def export_trainable_state_dict(
     module: nn.Module,
     frozen_prefixes: Sequence[str] = QWEN3_EAGLE3_FROZEN_PREFIXES,
 ) -> dict[str, torch.Tensor]:
-    state_dict: dict[str, torch.Tensor] = {}
-    for name, parameter in get_trainable_named_parameters(module, frozen_prefixes):
-        state_dict[name] = parameter.detach().cpu().clone()
-    return state_dict
+    with torch.profiler.record_function("online_eagle3.export_trainable_state_dict"):
+        state_dict: dict[str, torch.Tensor] = {}
+        for name, parameter in get_trainable_named_parameters(module, frozen_prefixes):
+            state_dict[name] = parameter.detach().cpu().clone()
+        return state_dict
 
 
 def load_trainable_state_dict(
@@ -71,31 +72,34 @@ def load_trainable_state_dict(
     *,
     strict: bool = True,
 ) -> None:
-    current_parameters = dict(module.named_parameters())
-    expected_keys = set(
-        name for name in current_parameters if not is_frozen_name(name, frozen_prefixes)
-    )
-    incoming_keys = set(trainable_state)
-
-    missing_keys = sorted(expected_keys - incoming_keys)
-    unexpected_keys = sorted(incoming_keys - expected_keys)
-    if strict and (missing_keys or unexpected_keys):
-        raise KeyError(
-            "Trainable state mismatch: "
-            f"missing={missing_keys}, unexpected={unexpected_keys}"
+    with torch.profiler.record_function("online_eagle3.load_trainable_state_dict"):
+        current_parameters = dict(module.named_parameters())
+        expected_keys = set(
+            name
+            for name in current_parameters
+            if not is_frozen_name(name, frozen_prefixes)
         )
+        incoming_keys = set(trainable_state)
 
-    with torch.no_grad():
-        for name, source in trainable_state.items():
-            if name not in expected_keys:
-                continue
-            target = current_parameters[name]
-            if target.shape != source.shape:
-                raise ValueError(
-                    f"Shape mismatch for {name}: "
-                    f"expected={tuple(target.shape)}, got={tuple(source.shape)}"
-                )
-            target.copy_(
-                source.to(device=target.device, dtype=target.dtype),
-                non_blocking=True,
+        missing_keys = sorted(expected_keys - incoming_keys)
+        unexpected_keys = sorted(incoming_keys - expected_keys)
+        if strict and (missing_keys or unexpected_keys):
+            raise KeyError(
+                "Trainable state mismatch: "
+                f"missing={missing_keys}, unexpected={unexpected_keys}"
             )
+
+        with torch.no_grad():
+            for name, source in trainable_state.items():
+                if name not in expected_keys:
+                    continue
+                target = current_parameters[name]
+                if target.shape != source.shape:
+                    raise ValueError(
+                        f"Shape mismatch for {name}: "
+                        f"expected={tuple(target.shape)}, got={tuple(source.shape)}"
+                    )
+                target.copy_(
+                    source.to(device=target.device, dtype=target.dtype),
+                    non_blocking=True,
+                )

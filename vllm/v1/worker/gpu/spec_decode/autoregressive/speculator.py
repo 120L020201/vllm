@@ -117,23 +117,26 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if self._pending_proposal_payload is None:
             return
 
-        observation_payload = dict(self._pending_proposal_payload)
-        observation_payload.update(payload or {})
-        proposal_step_id = self._pending_proposal_step_id
-        self._pending_proposal_payload = None
-        self._pending_proposal_step_id = None
-        self.weight_update_bridge.observe_step(
-            request_id,
-            proposal_step_id if proposal_step_id is not None else step_id,
-            observation_payload,
-        )
+        with torch.profiler.record_function("online_eagle3.gpu_observe_step"):
+            observation_payload = dict(self._pending_proposal_payload)
+            observation_payload.update(payload or {})
+            proposal_step_id = self._pending_proposal_step_id
+            self._pending_proposal_payload = None
+            self._pending_proposal_step_id = None
+            self.weight_update_bridge.observe_step(
+                request_id,
+                proposal_step_id if proposal_step_id is not None else step_id,
+                observation_payload,
+            )
 
     def maybe_apply_pending_weights(self) -> None:
         if self.weight_update_bridge is None or not hasattr(self, "model"):
             return
-        pending = self.weight_update_bridge.maybe_apply_pending_weights()
+        with torch.profiler.record_function("online_eagle3.gpu_poll_pending_weights"):
+            pending = self.weight_update_bridge.maybe_apply_pending_weights()
         if pending is not None:
-            load_trainable_state_dict(self.model, pending.state_dict)
+            with torch.profiler.record_function("online_eagle3.gpu_apply_weights"):
+                load_trainable_state_dict(self.model, pending.state_dict)
 
     def reset_request(self, req_id: str) -> None:
         self._current_proposal_trace = None
@@ -142,7 +145,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._pending_proposal_step_id = None
         if self.weight_update_bridge is None:
             return
-        self.weight_update_bridge.reset_request(req_id)
+        with torch.profiler.record_function("online_eagle3.gpu_reset_request"):
+            self.weight_update_bridge.reset_request(req_id)
 
     def shutdown(self) -> None:
         bridge = self.weight_update_bridge
@@ -207,9 +211,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if trace is None:
             return
 
-        payload = {
-            name: torch.cat(values, dim=0) for name, values in trace.items() if values
-        }
+        with torch.profiler.record_function("online_eagle3.gpu_finish_proposal_trace"):
+            payload = {
+                name: torch.cat(values, dim=0)
+                for name, values in trace.items()
+                if values
+            }
         if not payload:
             return
 
@@ -365,23 +372,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             need_eager=is_profile,
         )
 
-        if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Replay the full graph for draft prefill.
-            assert self.prefill_cudagraph_manager is not None
-            self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
-        else:
-            # The target model's attention metadata and slot mappings
-            # can directly be used for draft prefill, because of the
-            # identical batch shape and KV cache layout.
-            self._prefill(
-                num_reqs,
-                prefill_batch_desc.num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
-                mm_inputs=mm_inputs,
-            )
+        with torch.profiler.record_function("online_eagle3.gpu_draft_prefill"):
+            if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Replay the full graph for draft prefill.
+                assert self.prefill_cudagraph_manager is not None
+                self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
+            else:
+                # The target model's attention metadata and slot mappings
+                # can directly be used for draft prefill, because of the
+                # identical batch shape and KV cache layout.
+                self._prefill(
+                    num_reqs,
+                    prefill_batch_desc.num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
+                    mm_inputs=mm_inputs,
+                )
 
         if self.num_speculative_steps == 1:
             # Early exit.
@@ -413,12 +421,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
-        self._multi_step_decode(
-            num_reqs,
-            dummy_run and skip_attn_for_dummy_run,
-            decode_batch_desc,
-            num_tokens_across_dp,
-        )
+        with torch.profiler.record_function("online_eagle3.gpu_draft_decode"):
+            self._multi_step_decode(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+            )
 
         draft_tokens = self.draft_tokens[:num_reqs]
         self._finish_proposal_trace(draft_tokens)
@@ -497,25 +506,27 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self._record_proposal_input(last_token_indices)
 
-        last_hidden_states, hidden_states = self._run_model(
-            num_tokens,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            mm_inputs=mm_inputs,
-        )
+        with torch.profiler.record_function("online_eagle3.gpu_draft_prefill_forward"):
+            last_hidden_states, hidden_states = self._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                mm_inputs=mm_inputs,
+            )
         sample_hidden_states = last_hidden_states[last_token_indices]
 
-        self.draft_tokens[:num_reqs, 0] = self.sample_draft(
-            sample_hidden_states,
-            positions,
-            idx_mapping,
-            self.temperature,
-            self.seeds,
-            self.current_draft_step,
-            self.draft_logits,
-        )
+        with torch.profiler.record_function("online_eagle3.gpu_draft_prefill_sample"):
+            self.draft_tokens[:num_reqs, 0] = self.sample_draft(
+                sample_hidden_states,
+                positions,
+                idx_mapping,
+                self.temperature,
+                self.seeds,
+                self.current_draft_step,
+                self.draft_logits,
+            )
         self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = positions
 
@@ -555,18 +566,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.current_draft_step.fill_(step)
 
             # Generate draft tokens for the current step.
-            if batch_desc.cg_mode == CUDAGraphMode.FULL:
-                assert self.decode_cudagraph_manager is not None
-                self.decode_cudagraph_manager.run_fullgraph(batch_desc)
-            else:
-                self._generate_draft(
-                    num_reqs,
-                    batch_desc.num_tokens,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=batch_desc.cg_mode,
-                )
+            with torch.profiler.record_function("online_eagle3.gpu_draft_decode_step"):
+                if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                    assert self.decode_cudagraph_manager is not None
+                    self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+                else:
+                    self._generate_draft(
+                        num_reqs,
+                        batch_desc.num_tokens,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=batch_desc.cg_mode,
+                    )
 
     def _generate_draft(
         self,
@@ -581,39 +593,42 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         positions = self.input_buffers.positions[:num_reqs]
         self._record_proposal_input(self.req_indices[:num_reqs])
         # Run the draft model forward pass.
-        last_hidden_states, hidden_states = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
+        with torch.profiler.record_function("online_eagle3.gpu_draft_decode_forward"):
+            last_hidden_states, hidden_states = self._run_model(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
         last_hidden_states = last_hidden_states[:num_reqs]
 
         # Sample the draft tokens.
-        draft_tokens = self.sample_draft(
-            last_hidden_states,
-            positions,
-            idx_mapping,
-            self.temperature,
-            self.seeds,
-            self.current_draft_step,
-            self.draft_logits,
-        )
+        with torch.profiler.record_function("online_eagle3.gpu_draft_decode_sample"):
+            draft_tokens = self.sample_draft(
+                last_hidden_states,
+                positions,
+                idx_mapping,
+                self.temperature,
+                self.seeds,
+                self.current_draft_step,
+                self.draft_logits,
+            )
 
         # Update the inputs for the next step.
-        update_draft_inputs(
-            draft_tokens,
-            self.current_draft_step,
-            hidden_states,
-            self.draft_tokens,
-            self.hidden_states,
-            self.input_buffers,
-            num_reqs,
-            self.max_model_len,
-            self.num_speculative_steps,
-            advance_draft_positions=self.advance_draft_positions,
-        )
+        with torch.profiler.record_function("online_eagle3.gpu_update_draft_inputs"):
+            update_draft_inputs(
+                draft_tokens,
+                self.current_draft_step,
+                hidden_states,
+                self.draft_tokens,
+                self.hidden_states,
+                self.input_buffers,
+                num_reqs,
+                self.max_model_len,
+                self.num_speculative_steps,
+                advance_draft_positions=self.advance_draft_positions,
+            )
 
 
 @triton.jit

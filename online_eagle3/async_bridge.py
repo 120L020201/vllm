@@ -59,7 +59,11 @@ class Qwen3Eagle3AsyncBridge:
         self._reset_lock = threading.Lock()
         self._closed = threading.Event()
         self._shutdown_lock = threading.Lock()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="online_eagle3_cpu_worker",
+            daemon=True,
+        )
         self._thread.start()
         atexit.register(self.shutdown)
 
@@ -71,25 +75,30 @@ class Qwen3Eagle3AsyncBridge:
     ) -> None:
         if self._closed.is_set():
             return
-        self._inbox.put(
-            TrainObservation(
-                request_id=request_id,
-                step_id=step_id,
-                payload=dict(payload or {}),
+        with torch.profiler.record_function("online_eagle3.bridge_enqueue_observation"):
+            self._inbox.put(
+                TrainObservation(
+                    request_id=request_id,
+                    step_id=step_id,
+                    payload=dict(payload or {}),
+                )
             )
-        )
 
     def reset_request(self, request_id: str) -> None:
         if self._closed.is_set():
             return
-        with self._reset_lock:
-            self._reset_request_ids.add(request_id)
-        with self._outbox_lock:
-            self._latest_snapshot = None
-        self._inbox.put(ResetRequest(request_id=request_id))
+        with torch.profiler.record_function("online_eagle3.bridge_enqueue_reset"):
+            with self._reset_lock:
+                self._reset_request_ids.add(request_id)
+            with self._outbox_lock:
+                self._latest_snapshot = None
+            self._inbox.put(ResetRequest(request_id=request_id))
 
     def maybe_apply_pending_weights(self) -> TrainableWeightSnapshot | None:
-        with self._outbox_lock:
+        with (
+            torch.profiler.record_function("online_eagle3.bridge_poll_snapshot"),
+            self._outbox_lock,
+        ):
             latest = self._latest_snapshot
             self._latest_snapshot = None
         return latest
@@ -113,19 +122,20 @@ class Qwen3Eagle3AsyncBridge:
             if item is None or self._closed.is_set():
                 return
             if isinstance(item, ResetRequest):
-                pending_observations = [
-                    observation
-                    for observation in pending_observations
-                    if observation.request_id != item.request_id
-                ]
-                try:
-                    self.trainer.restore_snapshot(self._baseline_snapshot)
-                    self._publish_snapshot(self.trainer.snapshot())
-                except Exception:
-                    logger.exception("Failed to reset online EAGLE3 draft weights")
-                finally:
-                    with self._reset_lock:
-                        self._reset_request_ids.discard(item.request_id)
+                with torch.profiler.record_function("online_eagle3.cpu_reset_request"):
+                    pending_observations = [
+                        observation
+                        for observation in pending_observations
+                        if observation.request_id != item.request_id
+                    ]
+                    try:
+                        self.trainer.restore_snapshot(self._baseline_snapshot)
+                        self._publish_snapshot(self.trainer.snapshot())
+                    except Exception:
+                        logger.exception("Failed to reset online EAGLE3 draft weights")
+                    finally:
+                        with self._reset_lock:
+                            self._reset_request_ids.discard(item.request_id)
                 continue
 
             if self._is_reset_requested(item.request_id):
@@ -147,7 +157,8 @@ class Qwen3Eagle3AsyncBridge:
 
             step_observations = tuple(pending_observations)
             try:
-                self._step_fn(self.trainer, step_observations)
+                with torch.profiler.record_function("online_eagle3.cpu_update_step"):
+                    self._step_fn(self.trainer, step_observations)
             except Exception:
                 logger.exception("Failed to update online EAGLE3 draft weights")
                 self.trainer.zero_grad()
@@ -157,7 +168,10 @@ class Qwen3Eagle3AsyncBridge:
             if not self._closed.is_set() and not self._has_reset_requested(
                 step_observations
             ):
-                self._publish_snapshot(self.trainer.snapshot())
+                with torch.profiler.record_function(
+                    "online_eagle3.cpu_publish_snapshot"
+                ):
+                    self._publish_snapshot(self.trainer.snapshot())
 
     def _publish_snapshot(self, snapshot: TrainableWeightSnapshot) -> None:
         with self._outbox_lock:
@@ -234,5 +248,8 @@ class Qwen3Eagle3LazyBridge:
             if self._closed.is_set():
                 return None
             if self._bridge is None:
-                self._bridge = self._bridge_factory()
+                with torch.profiler.record_function(
+                    "online_eagle3.cpu_lazy_load_bridge"
+                ):
+                    self._bridge = self._bridge_factory()
             return self._bridge

@@ -55,12 +55,13 @@ class Qwen3Eagle3CpuTrainer:
         return self._version
 
     def snapshot(self) -> TrainableWeightSnapshot:
-        return TrainableWeightSnapshot(
-            version=self._version,
-            state_dict=export_trainable_state_dict(
-                self.model, self.config.frozen_prefixes
-            ),
-        )
+        with torch.profiler.record_function("online_eagle3.cpu_snapshot"):
+            return TrainableWeightSnapshot(
+                version=self._version,
+                state_dict=export_trainable_state_dict(
+                    self.model, self.config.frozen_prefixes
+                ),
+            )
 
     def load_snapshot(
         self,
@@ -68,13 +69,14 @@ class Qwen3Eagle3CpuTrainer:
         *,
         strict: bool = True,
     ) -> None:
-        load_trainable_state_dict(
-            self.model,
-            snapshot.state_dict,
-            self.config.frozen_prefixes,
-            strict=strict,
-        )
-        self._version = snapshot.version
+        with torch.profiler.record_function("online_eagle3.cpu_load_snapshot"):
+            load_trainable_state_dict(
+                self.model,
+                snapshot.state_dict,
+                self.config.frozen_prefixes,
+                strict=strict,
+            )
+            self._version = snapshot.version
 
     def restore_snapshot(
         self,
@@ -89,12 +91,14 @@ class Qwen3Eagle3CpuTrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
     def clear_optimizer_state(self) -> None:
-        self.optimizer.state.clear()
-        self.zero_grad()
+        with torch.profiler.record_function("online_eagle3.cpu_clear_optimizer_state"):
+            self.optimizer.state.clear()
+            self.zero_grad()
 
     def step(self) -> None:
-        self.optimizer.step()
-        self._version += 1
+        with torch.profiler.record_function("online_eagle3.cpu_trainer_step"):
+            self.optimizer.step()
+            self._version += 1
 
     def trainable_parameter_names(self) -> list[str]:
         return [
