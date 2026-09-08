@@ -49,6 +49,8 @@ def test_load_trainable_state_only_restores_trainable_weights() -> None:
     model = _ToyEagle3Module()
     freeze_parameters(model)
     snapshot = export_trainable_state_dict(model)
+    fc_weight = model.model.fc.weight
+    fc_bias = model.model.fc.bias
     frozen_before = {
         name: parameter.detach().clone()
         for name, parameter in model.named_parameters()
@@ -61,6 +63,8 @@ def test_load_trainable_state_only_restores_trainable_weights() -> None:
 
     load_trainable_state_dict(model, snapshot)
 
+    assert model.model.fc.weight is fc_weight
+    assert model.model.fc.bias is fc_bias
     assert torch.allclose(model.model.fc.weight, snapshot["model.fc.weight"])
     assert torch.allclose(model.model.fc.bias, snapshot["model.fc.bias"])
     for name, parameter in model.named_parameters():

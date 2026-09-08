@@ -87,9 +87,17 @@ def load_trainable_state_dict(
             f"missing={missing_keys}, unexpected={unexpected_keys}"
         )
 
-    filtered_state = {
-        name: tensor
-        for name, tensor in trainable_state.items()
-        if name in expected_keys
-    }
-    module.load_state_dict(filtered_state, strict=False)
+    with torch.no_grad():
+        for name, source in trainable_state.items():
+            if name not in expected_keys:
+                continue
+            target = current_state[name]
+            if target.shape != source.shape:
+                raise ValueError(
+                    f"Shape mismatch for {name}: "
+                    f"expected={tuple(target.shape)}, got={tuple(source.shape)}"
+                )
+            target.copy_(
+                source.to(device=target.device, dtype=target.dtype),
+                non_blocking=True,
+            )
