@@ -8,6 +8,7 @@ from .async_bridge import (
     ResetRequest,
     TrainObservation,
 )
+from .ce_step import qwen3_eagle3_ce_step
 from .observations import (
     IGNORE_LABEL,
     DraftTrainLabels,
@@ -31,6 +32,7 @@ __all__ = [
     "Qwen3Eagle3StepFn",
     "Qwen3Eagle3CpuTrainer",
     "ResetRequest",
+    "qwen3_eagle3_ce_step",
     "IGNORE_LABEL",
     "DraftTrainLabels",
     "DraftVerifyLabels",
