@@ -56,6 +56,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.weight_update_bridge: Any | None = None
         self._proposal_step_id = 0
         self._current_proposal_trace: dict[str, list[torch.Tensor]] | None = None
+        self._current_proposal_aux_hidden_states: torch.Tensor | None = None
         self._pending_proposal_payload: dict[str, torch.Tensor] | None = None
         self._pending_proposal_step_id: int | None = None
 
@@ -136,6 +137,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
     def reset_request(self, req_id: str) -> None:
         self._current_proposal_trace = None
+        self._current_proposal_aux_hidden_states = None
         self._pending_proposal_payload = None
         self._pending_proposal_step_id = None
         if self.weight_update_bridge is None:
@@ -145,6 +147,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     def _start_proposal_trace(
         self,
         input_batch: InputBatch,
+        aux_hidden_states: torch.Tensor | None,
         dummy_run: bool,
         is_profile: bool,
     ) -> None:
@@ -156,6 +159,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             or self.supports_mm_inputs
         ):
             self._current_proposal_trace = None
+            self._current_proposal_aux_hidden_states = None
             return
 
         self._current_proposal_trace = {
@@ -164,6 +168,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             "proposal_positions": [],
             "proposal_hidden_states": [],
         }
+        self._current_proposal_aux_hidden_states = aux_hidden_states
 
     def _record_proposal_input(self, indices: torch.Tensor) -> None:
         trace = self._current_proposal_trace
@@ -180,6 +185,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         trace["proposal_hidden_states"].append(
             self.hidden_states[indices].detach().clone()
         )
+        if self._current_proposal_aux_hidden_states is not None:
+            trace["proposal_aux_hidden_states"] = [
+                self._current_proposal_aux_hidden_states[indices].detach().clone()
+            ]
+            self._current_proposal_aux_hidden_states = None
 
     def _finish_proposal_trace(
         self,
@@ -187,6 +197,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> None:
         trace = self._current_proposal_trace
         self._current_proposal_trace = None
+        self._current_proposal_aux_hidden_states = None
         if trace is None:
             return
 
@@ -279,7 +290,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
-        self._start_proposal_trace(input_batch, dummy_run, is_profile)
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
@@ -294,13 +304,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions. By doing so,
         # we can also reuse the attention metadata (e.g., query_start_loc,
         # seq_lens) of the target model.
+        raw_aux_hidden_states = None
         if aux_hidden_states:
             assert self.method == "eagle3"
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            raw_aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+            hidden_states = self.model.combine_hidden_states(raw_aux_hidden_states)
         else:
             hidden_states = last_hidden_states
+        self._start_proposal_trace(
+            input_batch,
+            raw_aux_hidden_states,
+            dummy_run,
+            is_profile,
+        )
         self.hidden_states[:num_tokens].copy_(hidden_states)
 
         self._copy_request_inputs(

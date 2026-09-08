@@ -74,6 +74,18 @@ def _loss_for_observation(
         device=model_device,
         dtype=model_dtype,
     )
+    aux_hidden_states = payload.get("proposal_aux_hidden_states")
+    if aux_hidden_states is not None and hasattr(
+        trainer.model, "combine_hidden_states"
+    ):
+        aux_hidden_states = _cpu_float(
+            aux_hidden_states,
+            device=model_device,
+            dtype=model_dtype,
+        )
+        combined_hidden_states = trainer.model.combine_hidden_states(aux_hidden_states)
+        hidden_states = hidden_states.clone()
+        hidden_states[: combined_hidden_states.shape[0]] = combined_hidden_states
     input_embeds = _cpu_float(
         payload["proposal_input_embeds"][:num_speculative_tokens],
         device=model_device,

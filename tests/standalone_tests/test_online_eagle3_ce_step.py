@@ -33,6 +33,9 @@ class _ToyCpuDraft(nn.Module):
         hidden = self.model.fc(hidden_states + inputs_embeds)
         return hidden, hidden
 
+    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.fc(hidden_states)
+
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
 
@@ -46,6 +49,7 @@ def _make_observation(num_sampled: int = 2) -> TrainObservation:
             "proposal_input_embeds": torch.randn(2, 4),
             "proposal_positions": torch.tensor([4, 5], dtype=torch.int64),
             "proposal_hidden_states": torch.randn(2, 4),
+            "proposal_aux_hidden_states": torch.randn(1, 4),
             "proposal_num_speculative_tokens": torch.tensor([2], dtype=torch.int32),
             "sampled_token_ids": torch.tensor([[3, 4, 5]], dtype=torch.int32),
             "num_sampled": torch.tensor([num_sampled], dtype=torch.int32),
