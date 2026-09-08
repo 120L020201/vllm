@@ -39,6 +39,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
+        self.req_indices = torch.arange(
+            self.max_num_reqs, dtype=torch.int64, device=device
+        )
 
         self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
             self.draft_model_config
@@ -51,6 +54,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: PrefillSpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeSpeculatorCudaGraphManager | None = None
         self.weight_update_bridge: Any | None = None
+        self._proposal_step_id = 0
+        self._current_proposal_trace: dict[str, list[torch.Tensor]] | None = None
+        self._pending_proposal_payload: dict[str, torch.Tensor] | None = None
+        self._pending_proposal_step_id: int | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -106,7 +113,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> None:
         if self.weight_update_bridge is None:
             return
-        self.weight_update_bridge.observe_step(request_id, step_id, payload)
+        if self._pending_proposal_payload is None:
+            return
+
+        observation_payload = dict(self._pending_proposal_payload)
+        observation_payload.update(payload or {})
+        proposal_step_id = self._pending_proposal_step_id
+        self._pending_proposal_payload = None
+        self._pending_proposal_step_id = None
+        self.weight_update_bridge.observe_step(
+            request_id,
+            proposal_step_id if proposal_step_id is not None else step_id,
+            observation_payload,
+        )
 
     def maybe_apply_pending_weights(self) -> None:
         if self.weight_update_bridge is None or not hasattr(self, "model"):
@@ -116,9 +135,81 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             load_trainable_state_dict(self.model, pending.state_dict)
 
     def reset_request(self, req_id: str) -> None:
+        self._current_proposal_trace = None
+        self._pending_proposal_payload = None
+        self._pending_proposal_step_id = None
         if self.weight_update_bridge is None:
             return
         self.weight_update_bridge.reset_request(req_id)
+
+    def _start_proposal_trace(
+        self,
+        input_batch: InputBatch,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> None:
+        if (
+            self.weight_update_bridge is None
+            or input_batch.num_reqs != 1
+            or dummy_run
+            or is_profile
+            or self.supports_mm_inputs
+        ):
+            self._current_proposal_trace = None
+            return
+
+        self._current_proposal_trace = {
+            "proposal_input_ids": [],
+            "proposal_input_embeds": [],
+            "proposal_positions": [],
+            "proposal_hidden_states": [],
+        }
+
+    def _record_proposal_input(self, indices: torch.Tensor) -> None:
+        trace = self._current_proposal_trace
+        if trace is None:
+            return
+
+        input_ids = self.input_buffers.input_ids[indices]
+        input_embeds = self.model.embed_input_ids(input_ids)
+        trace["proposal_input_ids"].append(input_ids.detach().clone())
+        trace["proposal_input_embeds"].append(input_embeds.detach().clone())
+        trace["proposal_positions"].append(
+            self.input_buffers.positions[indices].detach().clone()
+        )
+        trace["proposal_hidden_states"].append(
+            self.hidden_states[indices].detach().clone()
+        )
+
+    def _finish_proposal_trace(
+        self,
+        draft_tokens: torch.Tensor,
+    ) -> None:
+        trace = self._current_proposal_trace
+        self._current_proposal_trace = None
+        if trace is None:
+            return
+
+        payload = {
+            name: torch.cat(values, dim=0)
+            for name, values in trace.items()
+            if values
+        }
+        if not payload:
+            return
+
+        proposal_step_id = self._proposal_step_id
+        self._proposal_step_id += 1
+        payload["proposal_draft_token_ids"] = draft_tokens[0].detach().clone()
+        payload["proposal_num_speculative_tokens"] = torch.tensor(
+            [draft_tokens.shape[1]], dtype=torch.int32, device=self.device
+        )
+        payload["proposal_step_id"] = torch.tensor(
+            [proposal_step_id], dtype=torch.int64, device=self.device
+        )
+
+        self._pending_proposal_payload = payload
+        self._pending_proposal_step_id = proposal_step_id
 
     def capture(
         self,
@@ -188,6 +279,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        self._start_proposal_trace(input_batch, dummy_run, is_profile)
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
@@ -270,7 +362,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         if self.num_speculative_steps == 1:
             # Early exit.
-            return self.draft_tokens[:num_reqs, :1]
+            draft_tokens = self.draft_tokens[:num_reqs, :1]
+            self._finish_proposal_trace(draft_tokens)
+            return draft_tokens
 
         # Prepare the inputs for the decode steps.
         prepare_decode_inputs(
@@ -303,7 +397,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
         )
 
-        return self.draft_tokens[:num_reqs]
+        draft_tokens = self.draft_tokens[:num_reqs]
+        self._finish_proposal_trace(draft_tokens)
+        return draft_tokens
 
     @torch.inference_mode()
     def _run_model(
@@ -375,6 +471,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
         idx_mapping = self.idx_mapping[:num_reqs]
+
+        self._record_proposal_input(last_token_indices)
 
         last_hidden_states, hidden_states = self._run_model(
             num_tokens,
@@ -458,6 +556,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> None:
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
+        self._record_proposal_input(self.req_indices[:num_reqs])
         # Run the draft model forward pass.
         last_hidden_states, hidden_states = self._run_model(
             num_tokens_padded,
