@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import threading
 import time
 
 import torch
@@ -118,6 +121,63 @@ def test_async_bridge_reset_drops_pending_observations() -> None:
     time.sleep(0.05)
 
     assert bridge.maybe_apply_pending_weights() is None
+
+    bridge.shutdown()
+
+
+def test_async_bridge_keeps_only_latest_snapshot() -> None:
+    model = _ToyEagle3Module()
+    trainer = Qwen3Eagle3CpuTrainer(model)
+    bridge = Qwen3Eagle3AsyncBridge(trainer, _train_step)
+
+    for step_id in range(3):
+        bridge.observe_step("req-1", step_id)
+
+    deadline = time.monotonic() + 5.0
+    snapshot = None
+    while time.monotonic() < deadline:
+        snapshot = bridge.maybe_apply_pending_weights()
+        if snapshot is not None and snapshot.version == 3:
+            break
+        time.sleep(0.01)
+
+    assert snapshot is not None
+    assert snapshot.version == 3
+    assert bridge.maybe_apply_pending_weights() is None
+
+    bridge.shutdown()
+
+
+def test_async_bridge_reset_skips_queued_observations() -> None:
+    model = _ToyEagle3Module()
+    trainer = Qwen3Eagle3CpuTrainer(model)
+    first_step_started = threading.Event()
+    release_first_step = threading.Event()
+    trained_step_ids: list[int] = []
+
+    def blocking_train_step(
+        trainer: Qwen3Eagle3CpuTrainer,
+        observations: tuple[TrainObservation, ...],
+    ) -> None:
+        trained_step_ids.extend(observation.step_id for observation in observations)
+        first_step_started.set()
+        if observations[0].step_id == 0:
+            assert release_first_step.wait(timeout=5.0)
+        _train_step(trainer, observations)
+
+    bridge = Qwen3Eagle3AsyncBridge(trainer, blocking_train_step)
+
+    bridge.observe_step("req-1", 0)
+    assert first_step_started.wait(timeout=5.0)
+    for step_id in range(1, 4):
+        bridge.observe_step("req-1", step_id)
+    bridge.reset_request("req-1")
+    release_first_step.set()
+
+    reset_snapshot = _wait_for_snapshot(bridge)
+
+    assert reset_snapshot.version == 0
+    assert trained_step_ids == [0]
 
     bridge.shutdown()
 

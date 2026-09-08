@@ -52,9 +52,11 @@ class Qwen3Eagle3AsyncBridge:
         self._update_interval = update_interval
         self._baseline_snapshot = trainer.snapshot()
         self._inbox: queue.SimpleQueue[TrainObservation | ResetRequest | None]
-        self._outbox: queue.SimpleQueue[TrainableWeightSnapshot]
         self._inbox = queue.SimpleQueue()
-        self._outbox = queue.SimpleQueue()
+        self._latest_snapshot: TrainableWeightSnapshot | None = None
+        self._outbox_lock = threading.Lock()
+        self._reset_request_ids: set[str] = set()
+        self._reset_lock = threading.Lock()
         self._closed = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -80,15 +82,16 @@ class Qwen3Eagle3AsyncBridge:
     def reset_request(self, request_id: str) -> None:
         if self._closed.is_set():
             return
+        with self._reset_lock:
+            self._reset_request_ids.add(request_id)
+        with self._outbox_lock:
+            self._latest_snapshot = None
         self._inbox.put(ResetRequest(request_id=request_id))
 
     def maybe_apply_pending_weights(self) -> TrainableWeightSnapshot | None:
-        latest: TrainableWeightSnapshot | None = None
-        while True:
-            try:
-                latest = self._outbox.get_nowait()
-            except queue.Empty:
-                break
+        with self._outbox_lock:
+            latest = self._latest_snapshot
+            self._latest_snapshot = None
         return latest
 
     def shutdown(self) -> None:
@@ -110,28 +113,66 @@ class Qwen3Eagle3AsyncBridge:
             if item is None or self._closed.is_set():
                 return
             if isinstance(item, ResetRequest):
-                pending_observations.clear()
+                pending_observations = [
+                    observation
+                    for observation in pending_observations
+                    if observation.request_id != item.request_id
+                ]
                 try:
                     self.trainer.restore_snapshot(self._baseline_snapshot)
-                    self._outbox.put(self.trainer.snapshot())
+                    self._publish_snapshot(self.trainer.snapshot())
                 except Exception:
                     logger.exception("Failed to reset online EAGLE3 draft weights")
+                finally:
+                    with self._reset_lock:
+                        self._reset_request_ids.discard(item.request_id)
+                continue
+
+            if self._is_reset_requested(item.request_id):
+                pending_observations = [
+                    observation
+                    for observation in pending_observations
+                    if observation.request_id != item.request_id
+                ]
                 continue
 
             pending_observations.append(item)
+            pending_observations = [
+                observation
+                for observation in pending_observations
+                if not self._is_reset_requested(observation.request_id)
+            ]
             if len(pending_observations) < self._update_interval:
                 continue
 
+            step_observations = tuple(pending_observations)
             try:
-                self._step_fn(self.trainer, tuple(pending_observations))
+                self._step_fn(self.trainer, step_observations)
             except Exception:
                 logger.exception("Failed to update online EAGLE3 draft weights")
                 self.trainer.zero_grad()
                 pending_observations.clear()
                 continue
             pending_observations.clear()
-            if not self._closed.is_set():
-                self._outbox.put(self.trainer.snapshot())
+            if not self._closed.is_set() and not self._has_reset_requested(
+                step_observations
+            ):
+                self._publish_snapshot(self.trainer.snapshot())
+
+    def _publish_snapshot(self, snapshot: TrainableWeightSnapshot) -> None:
+        with self._outbox_lock:
+            self._latest_snapshot = snapshot
+
+    def _is_reset_requested(self, request_id: str) -> bool:
+        with self._reset_lock:
+            return request_id in self._reset_request_ids
+
+    def _has_reset_requested(self, observations: Sequence[TrainObservation]) -> bool:
+        with self._reset_lock:
+            return any(
+                observation.request_id in self._reset_request_ids
+                for observation in observations
+            )
 
 
 class Qwen3Eagle3LazyBridge:
