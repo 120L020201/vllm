@@ -14,6 +14,12 @@ MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
 REQUEST_RATE=${REQUEST_RATE:-inf}
 SEED=${SEED:-0}
 SERVER_STOP_SLEEP=${SERVER_STOP_SLEEP:-5}
+USE_CHAT_TEMPLATE=${USE_CHAT_TEMPLATE:-0}
+
+BENCH_CHAT_TEMPLATE_ARGS=()
+if [[ "$USE_CHAT_TEMPLATE" != "1" ]]; then
+  BENCH_CHAT_TEMPLATE_ARGS+=(--skip-chat-template)
+fi
 
 case "$MODE" in
   baseline | online | both)
@@ -57,7 +63,7 @@ run_bench_one() {
     --request-rate "$REQUEST_RATE" \
     --seed "$SEED" \
     --disable-shuffle \
-    --skip-chat-template \
+    "${BENCH_CHAT_TEMPLATE_ARGS[@]}" \
     --ignore-eos \
     --temperature 0 \
     --disable-tqdm \
