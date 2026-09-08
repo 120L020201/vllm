@@ -158,7 +158,8 @@ def _model_device_and_dtype(model: torch.nn.Module) -> tuple[torch.device, torch
 
 
 def _cpu_long(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.detach().cpu().to(torch.long)
+    with torch.inference_mode(False):
+        return tensor.detach().cpu().clone().to(torch.long)
 
 
 def _cpu_float(
@@ -167,4 +168,5 @@ def _cpu_float(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    return tensor.detach().cpu().to(device=device, dtype=dtype)
+    with torch.inference_mode(False):
+        return tensor.detach().cpu().clone().to(device=device, dtype=dtype)

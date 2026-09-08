@@ -87,3 +87,41 @@ def test_ce_step_skips_when_verify_result_has_no_active_labels() -> None:
     assert torch.equal(
         before.state_dict["model.fc.weight"], after.state_dict["model.fc.weight"]
     )
+
+
+def test_ce_step_accepts_inference_mode_observation_tensors() -> None:
+    torch.manual_seed(0)
+    model = _ToyCpuDraft()
+    trainer = Qwen3Eagle3CpuTrainer(model)
+
+    with torch.inference_mode():
+        observation = _make_observation()
+
+    assert observation.payload["proposal_hidden_states"].is_inference()
+
+    qwen3_eagle3_ce_step(trainer, (observation,))
+
+    assert trainer.version == 1
+
+
+def test_ce_step_accepts_shorter_captured_proposal_trace() -> None:
+    torch.manual_seed(0)
+    model = _ToyCpuDraft()
+    trainer = Qwen3Eagle3CpuTrainer(model)
+    observation = _make_observation()
+
+    for key in (
+        "proposal_input_ids",
+        "proposal_input_embeds",
+        "proposal_positions",
+        "proposal_hidden_states",
+        "proposal_aux_hidden_states",
+    ):
+        observation.payload[key] = observation.payload[key][:1]
+    observation.payload["proposal_num_speculative_tokens"] = torch.tensor(
+        [1], dtype=torch.int32
+    )
+
+    qwen3_eagle3_ce_step(trainer, (observation,))
+
+    assert trainer.version == 1

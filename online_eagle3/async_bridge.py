@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import queue
 import threading
@@ -99,10 +100,8 @@ class Qwen3Eagle3AsyncBridge:
 
         if threading.current_thread() is not self._thread:
             self._thread.join()
-        try:
+        with contextlib.suppress(ValueError):
             atexit.unregister(self.shutdown)
-        except ValueError:
-            pass
 
     def _worker(self) -> None:
         pending_observations: list[TrainObservation] = []
@@ -133,3 +132,66 @@ class Qwen3Eagle3AsyncBridge:
             pending_observations.clear()
             if not self._closed.is_set():
                 self._outbox.put(self.trainer.snapshot())
+
+
+class Qwen3Eagle3LazyBridge:
+    """Defers CPU draft loading until the first trainable observation."""
+
+    def __init__(self, bridge_factory: Callable[[], Qwen3Eagle3AsyncBridge]) -> None:
+        self._bridge_factory = bridge_factory
+        self._bridge: Qwen3Eagle3AsyncBridge | None = None
+        self._lock = threading.Lock()
+        self._closed = threading.Event()
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._bridge is not None
+
+    @property
+    def trainer(self) -> Qwen3Eagle3CpuTrainer:
+        bridge = self._get_bridge(create=True)
+        if bridge is None:
+            raise RuntimeError("online EAGLE3 bridge is closed")
+        return bridge.trainer
+
+    def observe_step(
+        self,
+        request_id: str,
+        step_id: int,
+        payload: Mapping[str, torch.Tensor] | None = None,
+    ) -> None:
+        bridge = self._get_bridge(create=True)
+        if bridge is None:
+            return
+        bridge.observe_step(request_id, step_id, payload)
+
+    def reset_request(self, request_id: str) -> None:
+        bridge = self._get_bridge(create=False)
+        if bridge is None:
+            return
+        bridge.reset_request(request_id)
+
+    def maybe_apply_pending_weights(self) -> TrainableWeightSnapshot | None:
+        bridge = self._get_bridge(create=False)
+        if bridge is None:
+            return None
+        return bridge.maybe_apply_pending_weights()
+
+    def shutdown(self) -> None:
+        self._closed.set()
+        bridge = self._get_bridge(create=False)
+        if bridge is not None:
+            bridge.shutdown()
+
+    def _get_bridge(self, *, create: bool) -> Qwen3Eagle3AsyncBridge | None:
+        if self._closed.is_set():
+            return None
+        bridge = self._bridge
+        if bridge is not None or not create:
+            return bridge
+        with self._lock:
+            if self._closed.is_set():
+                return None
+            if self._bridge is None:
+                self._bridge = self._bridge_factory()
+            return self._bridge

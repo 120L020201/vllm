@@ -5,7 +5,11 @@ import time
 import torch
 import torch.nn as nn
 
-from online_eagle3.async_bridge import Qwen3Eagle3AsyncBridge, TrainObservation
+from online_eagle3.async_bridge import (
+    Qwen3Eagle3AsyncBridge,
+    Qwen3Eagle3LazyBridge,
+    TrainObservation,
+)
 from online_eagle3.qwen3_trainer import Qwen3Eagle3CpuTrainer
 
 
@@ -130,3 +134,33 @@ def test_async_bridge_shutdown_is_idempotent() -> None:
 
     assert not bridge._thread.is_alive()
     assert bridge.maybe_apply_pending_weights() is None
+
+
+def test_lazy_bridge_defers_loading_until_observation() -> None:
+    created_count = 0
+
+    def create_bridge() -> Qwen3Eagle3AsyncBridge:
+        nonlocal created_count
+        created_count += 1
+        return Qwen3Eagle3AsyncBridge(
+            Qwen3Eagle3CpuTrainer(_ToyEagle3Module()),
+            _train_step,
+        )
+
+    bridge = Qwen3Eagle3LazyBridge(create_bridge)
+
+    assert not bridge.is_loaded
+    assert bridge.maybe_apply_pending_weights() is None
+    bridge.reset_request("req-1")
+
+    assert not bridge.is_loaded
+    assert created_count == 0
+
+    bridge.observe_step("req-1", 0)
+    snapshot = _wait_for_snapshot(bridge)
+
+    assert bridge.is_loaded
+    assert created_count == 1
+    assert snapshot.version == 1
+
+    bridge.shutdown()

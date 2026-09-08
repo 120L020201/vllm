@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 
+from online_eagle3.weights import load_trainable_state_dict
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -23,7 +24,6 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     PrefillSpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from online_eagle3.weights import load_trainable_state_dict
 
 logger = init_logger(__name__)
 
@@ -208,18 +208,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             return
 
         payload = {
-            name: torch.cat(values, dim=0)
-            for name, values in trace.items()
-            if values
+            name: torch.cat(values, dim=0) for name, values in trace.items() if values
         }
         if not payload:
             return
 
+        num_trace_tokens = payload["proposal_input_ids"].shape[0]
         proposal_step_id = self._proposal_step_id
         self._proposal_step_id += 1
-        payload["proposal_draft_token_ids"] = draft_tokens[0].detach().clone()
+        payload["proposal_draft_token_ids"] = (
+            draft_tokens[0, :num_trace_tokens].detach().clone()
+        )
         payload["proposal_num_speculative_tokens"] = torch.tensor(
-            [draft_tokens.shape[1]], dtype=torch.int32, device=self.device
+            [num_trace_tokens], dtype=torch.int32, device=self.device
         )
         payload["proposal_step_id"] = torch.tensor(
             [proposal_step_id], dtype=torch.int64, device=self.device

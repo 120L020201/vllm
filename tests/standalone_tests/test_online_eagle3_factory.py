@@ -50,7 +50,27 @@ def test_factory_creates_bridge_when_enabled(monkeypatch, tmp_path) -> None:
     bridge = maybe_create_qwen3_eagle3_bridge(_make_vllm_config(tmp_path))
 
     assert bridge is not None
+    assert not bridge.is_loaded
     assert bridge.trainer.config.lr == 2e-5
+    assert bridge.is_loaded
+
+    bridge.shutdown()
+
+
+def test_factory_loads_normal_tensors_inside_inference_mode(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _write_model(tmp_path)
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
+
+    with torch.inference_mode():
+        bridge = maybe_create_qwen3_eagle3_bridge(_make_vllm_config(tmp_path))
+        assert bridge is not None
+        trainer = bridge.trainer
+
+    parameter = next(trainer.model.parameters())
+    assert not parameter.is_inference()
 
     bridge.shutdown()
 
