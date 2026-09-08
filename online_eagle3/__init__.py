@@ -9,6 +9,7 @@ from .async_bridge import (
     TrainObservation,
 )
 from .ce_step import qwen3_eagle3_ce_step
+from .factory import maybe_create_qwen3_eagle3_bridge
 from .observations import (
     IGNORE_LABEL,
     DraftTrainLabels,
@@ -55,4 +56,5 @@ __all__ = [
     "load_torch_eagle3_model",
     "load_trainable_state_dict",
     "map_target_to_draft_labels",
+    "maybe_create_qwen3_eagle3_bridge",
 ]

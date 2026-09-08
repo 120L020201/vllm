@@ -74,6 +74,9 @@ class BaseSpeculator(ABC):
     ) -> None:
         return None
 
+    def set_weight_update_bridge(self, bridge: Any | None) -> None:
+        return None
+
     def maybe_apply_pending_weights(self) -> None:
         return None
 

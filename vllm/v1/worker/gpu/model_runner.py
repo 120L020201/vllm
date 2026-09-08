@@ -293,6 +293,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.load_model(self.model)
+                if not load_dummy_weights:
+                    from online_eagle3.factory import (
+                        maybe_create_qwen3_eagle3_bridge,
+                    )
+
+                    bridge = maybe_create_qwen3_eagle3_bridge(self.vllm_config)
+                    if bridge is not None:
+                        self.speculator.set_weight_update_bridge(bridge)
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
