@@ -1263,9 +1263,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Run model.
-        profile_online_eagle3 = (
+        profile_eagle3_spec_decode = (
             self.speculator is not None
-            and getattr(self.speculator, "weight_update_bridge", None) is not None
+            and getattr(self.speculator, "method", None) == "eagle3"
         )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1273,7 +1273,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            if profile_online_eagle3:
+            if profile_eagle3_spec_decode:
                 with torch.profiler.record_function("online_eagle3.gpu_target_forward"):
                     model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
             else:
@@ -1302,7 +1302,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    if profile_online_eagle3:
+                    if profile_eagle3_spec_decode:
                         with torch.profiler.record_function(
                             "online_eagle3.gpu_target_forward"
                         ):
@@ -1315,7 +1315,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    if profile_online_eagle3:
+                    if profile_eagle3_spec_decode:
                         with torch.profiler.record_function(
                             "online_eagle3.gpu_target_forward"
                         ):
@@ -1389,11 +1389,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        profile_online_eagle3 = (
+        profile_eagle3_spec_decode = (
             self.speculator is not None
-            and getattr(self.speculator, "weight_update_bridge", None) is not None
+            and getattr(self.speculator, "method", None) == "eagle3"
         )
-        if profile_online_eagle3:
+        if profile_eagle3_spec_decode:
             with torch.profiler.record_function("online_eagle3.gpu_verify_sample"):
                 sampler_output, num_sampled, num_rejected = self.sample(
                     hidden_states, input_batch, grammar_output
