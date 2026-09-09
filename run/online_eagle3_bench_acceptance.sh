@@ -42,6 +42,8 @@ BENCH_ARGS=(
     --base-url "$BASE"
     --endpoint "$BENCH_ENDPOINT"
     --model "$MODEL_NAME"
+    --tokenizer "$MODEL"
+    --trust-remote-code
     --dataset-name custom
     --dataset-path "$DATA"
     --custom-output-len "$CUSTOM_OUTPUT_LEN"
