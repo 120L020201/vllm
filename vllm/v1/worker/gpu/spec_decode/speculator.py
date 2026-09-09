@@ -80,6 +80,9 @@ class BaseSpeculator(ABC):
     def reset_request(self, req_id: str) -> None:
         return None
 
+    def shutdown(self) -> None:
+        return None
+
 
 class DraftModelSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -171,6 +174,9 @@ class DraftModelSpeculator(BaseSpeculator):
             ).keys()
         )
         self.draft_attn_layer_names = all_attn_layers - target_attn_layer_names
+
+    def set_weight_update_bridge(self, bridge: Any | None) -> None:
+        return None
 
     def set_attn(
         self,

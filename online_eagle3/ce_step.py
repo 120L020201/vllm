@@ -23,6 +23,14 @@ def qwen3_eagle3_ce_step(
     observations: Sequence[TrainObservation],
 ) -> None:
     """Run one supervised CE update over completed draft-verify iterations."""
+    with torch.inference_mode(False), torch.enable_grad():
+        return _qwen3_eagle3_ce_step(trainer, observations)
+
+
+def _qwen3_eagle3_ce_step(
+    trainer: Qwen3Eagle3CpuTrainer,
+    observations: Sequence[TrainObservation],
+) -> None:
     losses: list[torch.Tensor] = []
     trainer.zero_grad()
 
@@ -35,7 +43,8 @@ def qwen3_eagle3_ce_step(
         trainer.zero_grad()
         return
 
-    torch.stack(losses).mean().backward()
+    with torch.profiler.record_function("online_eagle3.cpu_backward"):
+        torch.stack(losses).mean().backward()
     trainer.step()
 
 
@@ -92,12 +101,13 @@ def _loss_for_observation(
         dtype=model_dtype,
     )
 
-    output = trainer.model(
-        input_ids=input_ids.to(model_device),
-        positions=positions.to(model_device),
-        hidden_states=hidden_states,
-        inputs_embeds=input_embeds,
-    )
+    with torch.profiler.record_function("online_eagle3.cpu_forward"):
+        output = trainer.model(
+            input_ids=input_ids.to(model_device),
+            positions=positions.to(model_device),
+            hidden_states=hidden_states,
+            inputs_embeds=input_embeds,
+        )
     hidden_output = output[0] if isinstance(output, tuple) else output
 
     if target_to_draft is not None:
@@ -158,7 +168,7 @@ def _model_device_and_dtype(model: torch.nn.Module) -> tuple[torch.device, torch
 
 
 def _cpu_long(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.detach().cpu().to(torch.long)
+    return tensor.detach().cpu().clone().to(torch.long)
 
 
 def _cpu_float(
@@ -167,4 +177,4 @@ def _cpu_float(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    return tensor.detach().cpu().to(device=device, dtype=dtype)
+    return tensor.detach().cpu().clone().to(device=device, dtype=dtype)
