@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import platform
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -78,6 +81,15 @@ def maybe_create_qwen3_eagle3_sync_bridge(
         with torch.inference_mode(False), torch.enable_grad():
             cpu_model = load_torch_eagle3_model(draft_model_path, dtype=dtype)
             cpu_model.train()
+            runtime = _get_cpu_runtime(cpu_model)
+            logger.info(
+                "Online EAGLE3 CPU runtime: cpu_model=%s, "
+                "torch_num_threads=%d, cpu_draft_dtype=%s",
+                runtime["cpu_model"],
+                runtime["torch_num_threads"],
+                runtime["cpu_draft_dtype"],
+            )
+            _write_cpu_runtime_metadata(vllm_config, runtime)
             trainer = Qwen3Eagle3CpuTrainer(
                 cpu_model,
                 Qwen3Eagle3TrainerConfig(
@@ -92,6 +104,58 @@ def maybe_create_qwen3_eagle3_sync_bridge(
         )
 
     return Qwen3Eagle3LazySyncBridge(bridge_factory)
+
+
+def _get_cpu_runtime(model: torch.nn.Module) -> dict[str, str | int]:
+    model_dtype = next(
+        parameter.dtype
+        for parameter in model.parameters()
+        if parameter.is_floating_point()
+    )
+    return {
+        "cpu_model": _get_cpu_model(),
+        "torch_num_threads": torch.get_num_threads(),
+        "cpu_draft_dtype": _format_dtype(model_dtype),
+    }
+
+
+def _get_cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+            for line in cpuinfo:
+                if line.lower().startswith("model name") and ":" in line:
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+
+    return platform.processor() or platform.machine() or "unknown"
+
+
+def _format_dtype(dtype: torch.dtype) -> str:
+    if dtype is torch.float32:
+        return "FP32"
+    if dtype is torch.bfloat16:
+        return "BF16"
+    return str(dtype).removeprefix("torch.").upper()
+
+
+def _write_cpu_runtime_metadata(
+    vllm_config: VllmConfig,
+    runtime: dict[str, str | int],
+) -> None:
+    profiler_config = getattr(vllm_config, "profiler_config", None)
+    trace_dir = getattr(profiler_config, "torch_profiler_dir", "")
+    if not trace_dir or "://" in trace_dir:
+        return
+
+    metadata_path = Path(trace_dir) / "online_eagle3_cpu_runtime.json"
+    try:
+        metadata_path.write_text(
+            json.dumps(runtime, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.warning("Failed to write online EAGLE3 CPU runtime to %s", metadata_path)
 
 
 def _env_enabled(name: str) -> bool:

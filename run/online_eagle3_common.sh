@@ -96,7 +96,7 @@ online_eagle3_stop_server() {
 online_eagle3_scan_log() {
     local log_file=$1
     rg -n \
-        "Enabled synchronous online EAGLE3|Loading online EAGLE3 CPU draft|Completed first synchronous online EAGLE3 CPU update|Applied first online EAGLE3 GPU draft weight snapshot|Reset online EAGLE3 CPU draft|Failed to update online EAGLE3|Failed to reset online EAGLE3|EngineDead|out of memory|oom|SIGKILL|Traceback" \
+        "Enabled synchronous online EAGLE3|Loading online EAGLE3 CPU draft|Online EAGLE3 CPU runtime|Completed first synchronous online EAGLE3 CPU update|Applied first online EAGLE3 GPU draft weight snapshot|Reset online EAGLE3 CPU draft|Failed to update online EAGLE3|Failed to reset online EAGLE3|EngineDead|out of memory|oom|SIGKILL|Traceback" \
         "$log_file" || true
 }
 

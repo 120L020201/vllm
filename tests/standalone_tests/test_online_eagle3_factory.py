@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +83,34 @@ def test_factory_creates_lazy_sync_bridge(monkeypatch: pytest.MonkeyPatch) -> No
     assert trainer.config.lr == 0.25
     assert trainer.config.weight_decay == 0.5
     assert loaded == {"path": "/draft/from/env", "dtype": torch.bfloat16}
+
+
+def test_factory_writes_cpu_runtime_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    def _load_model(path: str, *, dtype: torch.dtype) -> _ToyEagle3Module:
+        return _ToyEagle3Module().to(dtype=dtype)
+
+    metadata_path = tmp_path / "online_eagle3_cpu_runtime.json"
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_DRAFT_MODEL", "/draft/from/env")
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_DTYPE", "bf16")
+    monkeypatch.setattr(factory_module, "load_torch_eagle3_model", _load_model)
+
+    config = _make_vllm_config()
+    config.profiler_config = SimpleNamespace(
+        torch_profiler_dir=str(tmp_path),
+    )
+    bridge = factory_module.maybe_create_qwen3_eagle3_sync_bridge(config)
+    assert bridge is not None
+    trainer = bridge.trainer
+    assert trainer.config.lr == 1e-5
+
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["cpu_model"]
+    assert metadata["torch_num_threads"] == torch.get_num_threads()
+    assert metadata["cpu_draft_dtype"] == "BF16"
 
 
 def test_factory_rejects_non_eagle3(monkeypatch: pytest.MonkeyPatch) -> None:

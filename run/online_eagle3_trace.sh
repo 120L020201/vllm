@@ -49,6 +49,7 @@ env \
     --profiler-config.profiler=torch \
     --profiler-config.torch_profiler_dir="$RESULT_DIR" \
     --profiler-config.torch_profiler_with_stack=false \
+    --profiler-config.torch_profiler_record_shapes=true \
     --profiler-config.ignore_frontend=true \
     --profiler-config.max_iterations="$TRACE_MAX_ITERATIONS" \
     >"$LOG" 2>&1 &
