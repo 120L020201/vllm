@@ -11,6 +11,7 @@ import torch.nn as nn
 
 QWEN3_EAGLE3_FROZEN_PREFIXES: tuple[str, ...] = (
     "model.embed_tokens",
+    "model.layers.0.self_attn.attn",
     "lm_head",
     "draft_id_to_target_id",
     "mask_hidden",

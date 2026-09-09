@@ -16,7 +16,7 @@ from .qwen3_trainer import Qwen3Eagle3CpuTrainer, Qwen3Eagle3TrainerConfig
 from .sync_bridge import Qwen3Eagle3LazySyncBridge, Qwen3Eagle3SyncBridge
 from .torch_eagle3 import load_torch_eagle3_model
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.online_eagle3.factory")
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _DTYPES = {

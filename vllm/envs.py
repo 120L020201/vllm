@@ -170,6 +170,13 @@ if TYPE_CHECKING:
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+    VLLM_ONLINE_EAGLE3: bool = False
+    VLLM_ONLINE_EAGLE3_DRAFT_MODEL: str | None = None
+    VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL: int = 1
+    VLLM_ONLINE_EAGLE3_LR: float = 1e-5
+    VLLM_ONLINE_EAGLE3_WEIGHT_DECAY: float = 0.0
+    VLLM_ONLINE_EAGLE3_DTYPE: Literal["float32", "fp32", "bfloat16", "bf16"] = "float32"
+    VLLM_ONLINE_EAGLE3_TORCH_THREADS: int | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
@@ -1405,6 +1412,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
     ),
+    "VLLM_ONLINE_EAGLE3": lambda: bool(int(os.getenv("VLLM_ONLINE_EAGLE3", "0"))),
+    "VLLM_ONLINE_EAGLE3_DRAFT_MODEL": lambda: os.getenv(
+        "VLLM_ONLINE_EAGLE3_DRAFT_MODEL", None
+    ),
+    "VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL": lambda: int(
+        os.getenv("VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL", "1")
+    ),
+    "VLLM_ONLINE_EAGLE3_LR": lambda: float(os.getenv("VLLM_ONLINE_EAGLE3_LR", "1e-5")),
+    "VLLM_ONLINE_EAGLE3_WEIGHT_DECAY": lambda: float(
+        os.getenv("VLLM_ONLINE_EAGLE3_WEIGHT_DECAY", "0")
+    ),
+    "VLLM_ONLINE_EAGLE3_DTYPE": env_with_choices(
+        "VLLM_ONLINE_EAGLE3_DTYPE",
+        "float32",
+        ["float32", "fp32", "bfloat16", "bf16"],
+        case_sensitive=False,
+    ),
+    "VLLM_ONLINE_EAGLE3_TORCH_THREADS": lambda: maybe_convert_int(
+        os.getenv("VLLM_ONLINE_EAGLE3_TORCH_THREADS", None)
+    ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
     # https://github.com/deepseek-ai/DeepEP/pull/341
@@ -2082,6 +2109,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_ONLINE_EAGLE3",
+        "VLLM_ONLINE_EAGLE3_DRAFT_MODEL",
+        "VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL",
+        "VLLM_ONLINE_EAGLE3_LR",
+        "VLLM_ONLINE_EAGLE3_WEIGHT_DECAY",
+        "VLLM_ONLINE_EAGLE3_DTYPE",
+        "VLLM_ONLINE_EAGLE3_TORCH_THREADS",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",

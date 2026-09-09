@@ -3,16 +3,17 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable, Mapping
 
 import torch
+
+from vllm.logger import init_logger
 
 from .async_bridge import Qwen3Eagle3StepFn, TrainObservation
 from .qwen3_trainer import Qwen3Eagle3CpuTrainer
 from .weights import TrainableWeightSnapshot
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.online_eagle3.sync_bridge")
 
 
 class Qwen3Eagle3SyncBridge:
@@ -34,6 +35,7 @@ class Qwen3Eagle3SyncBridge:
         self._pending_observations: list[TrainObservation] = []
         self._latest_snapshot: TrainableWeightSnapshot | None = None
         self._closed = False
+        self._logged_first_update = False
 
     def observe_step(
         self,
@@ -71,6 +73,14 @@ class Qwen3Eagle3SyncBridge:
 
         if self.trainer.version != version_before:
             self._latest_snapshot = self.trainer.snapshot()
+            if not self._logged_first_update:
+                logger.info(
+                    "Completed first synchronous online EAGLE3 CPU update: "
+                    "observations=%d, version=%d",
+                    len(observations),
+                    self.trainer.version,
+                )
+                self._logged_first_update = True
 
     def maybe_apply_pending_weights(self) -> TrainableWeightSnapshot | None:
         latest = self._latest_snapshot
@@ -93,6 +103,7 @@ class Qwen3Eagle3SyncBridge:
             ):
                 self.trainer.restore_snapshot(self._baseline_snapshot)
                 self._latest_snapshot = self.trainer.snapshot()
+            logger.info("Reset online EAGLE3 CPU draft for request %s", request_id)
         except Exception:
             logger.exception("Failed to reset online EAGLE3 CPU draft")
             self.trainer.zero_grad()

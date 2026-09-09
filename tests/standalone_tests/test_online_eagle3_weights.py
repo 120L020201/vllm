@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
 import torch
@@ -22,6 +24,18 @@ class _ToyEagle3Module(nn.Module):
             torch.zeros(8, dtype=torch.long), requires_grad=False
         )
         self.mask_hidden = nn.Parameter(torch.ones(1, 4), requires_grad=False)
+
+
+class _ToyGpuEagle3Module(_ToyEagle3Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        self.model.layers[0].self_attn = nn.Module()
+        self.model.layers[0].self_attn.attn = nn.Module()
+        self.model.layers[0].self_attn.attn.register_buffer(
+            "_q_scale",
+            torch.ones(1),
+        )
 
 
 def test_freeze_and_export_trainable_state() -> None:
@@ -74,6 +88,16 @@ def test_load_trainable_state_only_restores_trainable_weights() -> None:
                 assert torch.allclose(parameter, expected)
             else:
                 assert torch.equal(parameter, expected)
+
+
+def test_load_trainable_state_ignores_attention_backend_buffers() -> None:
+    cpu_model = _ToyEagle3Module()
+    gpu_model = _ToyGpuEagle3Module()
+    snapshot = export_trainable_state_dict(cpu_model)
+
+    load_trainable_state_dict(gpu_model, snapshot)
+
+    assert torch.equal(gpu_model.model.layers[0].self_attn.attn._q_scale, torch.ones(1))
 
 
 def test_cpu_trainer_tracks_version_and_trainable_names() -> None:

@@ -27,6 +27,8 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
 
+_INTERNAL_REQUEST_PREFIXES = ("_dummy_req_", "_warmup_")
+
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -59,6 +61,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._current_proposal_aux_hidden_states: torch.Tensor | None = None
         self._pending_proposal_payload: dict[str, torch.Tensor] | None = None
         self._pending_proposal_step_id: int | None = None
+        self._logged_first_weight_apply = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -112,6 +115,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         step_id: int,
         payload: dict[str, torch.Tensor] | None = None,
     ) -> None:
+        if request_id.startswith(_INTERNAL_REQUEST_PREFIXES):
+            self._pending_proposal_payload = None
+            self._pending_proposal_step_id = None
+            return
         if self.weight_update_bridge is None:
             return
         if self._pending_proposal_payload is None:
@@ -135,13 +142,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if pending is not None:
             with torch.profiler.record_function("online_eagle3.gpu_apply_weights"):
                 load_trainable_state_dict(self.model, pending.state_dict)
+            if not self._logged_first_weight_apply:
+                logger.info(
+                    "Applied first online EAGLE3 GPU draft weight snapshot: version=%d",
+                    pending.version,
+                )
+                self._logged_first_weight_apply = True
 
     def reset_request(self, req_id: str) -> None:
         self._current_proposal_trace = None
         self._current_proposal_aux_hidden_states = None
         self._pending_proposal_payload = None
         self._pending_proposal_step_id = None
-        if self.weight_update_bridge is None:
+        if self.weight_update_bridge is None or req_id.startswith(
+            _INTERNAL_REQUEST_PREFIXES
+        ):
             return
         self.weight_update_bridge.reset_request(req_id)
         self.maybe_apply_pending_weights()
@@ -165,6 +180,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             or dummy_run
             or is_profile
             or self.supports_mm_inputs
+            or any(
+                req_id.startswith(_INTERNAL_REQUEST_PREFIXES)
+                for req_id in input_batch.req_ids
+            )
         ):
             self._current_proposal_trace = None
             self._current_proposal_aux_hidden_states = None
