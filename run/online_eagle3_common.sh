@@ -70,7 +70,7 @@ online_eagle3_wait_for_server() {
     local log_file=$2
 
     for _ in $(seq 1 "$SERVER_WAIT_ATTEMPTS"); do
-        if curl -fsS "$BASE/v1/models" >/dev/null; then
+        if curl -fsS "$BASE/v1/models" >/dev/null 2>&1; then
             return 0
         fi
         if ! kill -0 "$server_pid" 2>/dev/null; then
