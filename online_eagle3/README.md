@@ -112,10 +112,11 @@ and clears CPU optimizer/history state before the next request.
 2. Capture teacher distributions before sampling transforms, proposal inputs,
    and target auxiliary features for the confirmed path.
 3. CPU evaluates the canvas in one causal forward using fixed GPU recurrent
-   inputs and its own detached historical KV.
+   inputs and its own detached historical KV. On the first update, bootstrap
+   the complete prefill KV with the initial weights under `no_grad` first.
 4. Compute forward KL and perform one AdamW step.
 5. With the updated weights and no gradients, append newly confirmed positions
-   to CPU history. Bootstrap the prompt here on the first update.
+   to CPU history. Keep the initial prefill KV unchanged, including its anchor.
 6. Publish the weight snapshot, apply it on GPU, then propose again.
 
 GPU KV refresh and rejection handling are unchanged. CPU persistent KV entries
@@ -131,9 +132,19 @@ so it has gradients without attending to itself twice. Its persistent entry
 remains unchanged. Earlier history has no gradient. Later canvas positions use
 detached `proposal_hidden_states` captured on GPU, not CPU recurrent outputs.
 The first position still uses the trainable CPU target-feature fusion. On the
-first round, the prompt and candidate suffix share one forward; subsequent rounds
-evaluate the boundary and candidate suffix together. Only the last K outputs
-contribute to the loss.
+first round, the complete prefill is evaluated under `no_grad` to initialize
+detached persistent KV, including the anchor. Training reads only the prefix
+before the anchor. The anchor and candidate suffix then share one training
+forward, just as in subsequent rounds. Only these K outputs contribute to the
+loss. A one-position prompt has an empty history prefix during training.
+
+Detaching the initial prefix preserves forward predictions and loss up to
+floating-point differences, but removes gradients through historical K/V
+generation. It changes the first update's gradient, not the attention context.
+The initial prefill KV is retained after training, not rebuilt with the updated
+weights. Only new confirmed positions use the updated weights. Temporary
+training KV, including the recomputed anchor, is discarded. This eliminates the
+post-update full-prompt forward as well as the historical gradient branch.
 
 This removes cross-step recurrent gradients but retains causal attention
 gradients through temporary K/V within the canvas. It is a different training
@@ -244,7 +255,11 @@ Existing profiler labels are preserved. New labels separate `cpu_load_model`,
 `cpu_prepare_batch`, `cpu_check_gradients` and `cpu_snapshot`. AdamW already has
 its native optimizer label. `gpu_apply_weights` on the CPU track is host wall
 time, not pure CUDA kernel time. CPU/GPU annotation tracks are reported separately.
+`cpu_prefill_kv` measures the first update's no-grad persistent prefill bootstrap,
+separately from `cpu_forward`, which now covers only the K training positions.
+`cpu_append_kv` covers only new confirmed positions, including on the first update.
 
-This refactor does not switch attention backends or detach the first prompt's
-training KV. Very long prompts still create quadratic CPU attention tensors;
+Attention backends are unchanged. Detaching the initial prefix reduces backward
+work and saved activations, but very long prompts still create quadratic CPU
+attention tensors during no-grad prefill;
 AMX accelerates suitable compute but does not remove that memory requirement.

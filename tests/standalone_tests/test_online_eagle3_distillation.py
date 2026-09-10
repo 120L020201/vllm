@@ -111,9 +111,10 @@ def test_teacher_projection_and_kl_gradient():
 
 
 @pytest.mark.parametrize("confirmed", [1, 3, 5])
-def test_append_uses_updated_weights_and_preserves_history(confirmed):
+@pytest.mark.parametrize("layers", [1, 2])
+def test_append_uses_updated_weights_and_preserves_history(confirmed, layers):
     torch.manual_seed(4)
-    trainer = Qwen3Eagle3CpuTrainer(_model(), Qwen3Eagle3TrainerConfig(lr=0.01))
+    trainer = Qwen3Eagle3CpuTrainer(_model(layers), Qwen3Eagle3TrainerConfig(lr=0.01))
     baseline = trainer.snapshot()
     observation = _observation(confirmed=confirmed)
     old_model = copy.deepcopy(trainer.model)
@@ -124,18 +125,6 @@ def test_append_uses_updated_weights_and_preserves_history(confirmed):
     payload = {k: v.clone() for k, v in observation.payload.items()}
     assert trainer.version == 1
     assert trainer.cache_length == 3 + confirmed
-    expected = ()
-    for prefix in ("prefill", "confirmed"):
-        expected = _append_reference(
-            trainer.model,
-            expected,
-            payload[f"{prefix}_positions"],
-            payload[f"{prefix}_input_embeds"],
-            payload[f"{prefix}_aux_hidden_states"],
-        )
-    for actual, reference in zip(trainer.kv_cache[0], expected[0]):
-        torch.testing.assert_close(actual, reference)
-        assert not actual.requires_grad and actual.grad_fn is None
     old_cache = _append_reference(
         old_model,
         (),
@@ -143,15 +132,39 @@ def test_append_uses_updated_weights_and_preserves_history(confirmed):
         payload["prefill_input_embeds"],
         payload["prefill_aux_hidden_states"],
     )
-    assert not torch.allclose(trainer.kv_cache[0][0][:, :3], old_cache[0][0])
+    expected = _append_reference(
+        trainer.model,
+        old_cache,
+        payload["confirmed_positions"],
+        payload["confirmed_input_embeds"],
+        payload["confirmed_aux_hidden_states"],
+    )
+    old_weight_append = _append_reference(
+        old_model,
+        old_cache,
+        payload["confirmed_positions"],
+        payload["confirmed_input_embeds"],
+        payload["confirmed_aux_hidden_states"],
+    )
+    for actual_layer, expected_layer, old_layer in zip(
+        trainer.kv_cache, expected, old_cache
+    ):
+        for actual, reference, old in zip(actual_layer, expected_layer, old_layer):
+            torch.testing.assert_close(actual, reference)
+            assert not actual.requires_grad and actual.grad_fn is None
+            assert torch.equal(actual[:, :3], old)
+    assert not torch.allclose(
+        trainer.kv_cache[0][0][:, 3:], old_weight_append[0][0][:, 3:]
+    )
 
     previous = tuple((k.clone(), v.clone()) for k, v in trainer.kv_cache)
     next_observation = _observation(start=3, prefill=confirmed, confirmed=1, step=1)
     qwen3_eagle3_distillation_step(trainer, [next_observation])
     assert trainer.version == 2
     assert trainer.cache_length == 4 + confirmed
-    for old, new in zip(previous[0], trainer.kv_cache[0]):
-        assert torch.equal(old, new[:, : old.shape[1]])
+    for old_layer, new_layer in zip(previous, trainer.kv_cache):
+        for old, new in zip(old_layer, new_layer):
+            assert torch.equal(old, new[:, : old.shape[1]])
     assert trainer.optimizer.state
     trainer.restore_snapshot(baseline)
     assert trainer.cache_length == 0 and trainer.request_id is None
@@ -245,7 +258,15 @@ def test_parallel_matches_sequential_fixed_inputs(layers, with_history, monkeypa
     payload["proposal_hidden_states"].requires_grad_()
     reference = copy.deepcopy(trainer.model)
     cache = tuple((k[:, :5], v[:, :5]) for k, v in trainer.kv_cache)
-    first = slice(-1, None) if with_history else slice(None)
+    if not with_history:
+        cache = _append_reference(
+            reference,
+            (),
+            payload["prefill_positions"][:-1],
+            payload["prefill_input_embeds"][:-1],
+            payload["prefill_aux_hidden_states"][:-1],
+        )
+    first = slice(-1, None)
     new_cache = []
     output, _ = reference(
         torch.zeros_like(payload["prefill_positions"][first]),
@@ -293,6 +314,82 @@ def test_parallel_matches_sequential_fixed_inputs(layers, with_history, monkeypa
         qwen3_eagle3_distillation_step(trainer, [observation])
     finally:
         handle.remove()
-    assert train_forward_sizes == [4 if with_history else 6]
+    assert train_forward_sizes == [4]
     assert trainer.last_loss == pytest.approx(expected_loss.item(), abs=1e-6)
     assert payload["proposal_hidden_states"].grad is None
+
+
+@pytest.mark.parametrize("layers", [1, 2])
+@pytest.mark.parametrize("prefill", [1, 3, 9])
+def test_first_update_detaches_prefix_but_trains_anchor(layers, prefill, monkeypatch):
+    torch.manual_seed(17)
+    trainer = Qwen3Eagle3CpuTrainer(_model(layers))
+    observation = _observation(prefill=prefill)
+    payload = observation.payload
+    reference = copy.deepcopy(trainer.model)
+    positions = torch.cat(
+        (payload["prefill_positions"], payload["proposal_positions"][1:])
+    )
+    output, _ = reference(
+        torch.zeros_like(positions),
+        positions,
+        torch.cat(
+            (
+                reference.combine_hidden_states(payload["prefill_aux_hidden_states"]),
+                payload["proposal_hidden_states"][1:],
+            )
+        ),
+        torch.cat(
+            (payload["prefill_input_embeds"], payload["proposal_input_embeds"][1:])
+        ),
+    )
+    full_loss = distillation_loss(
+        reference.compute_draft_logits(output[-4:]), payload["teacher_probs"]
+    )
+    full_loss.backward()
+    forwards = []
+    fused_anchors = []
+
+    def capture_forward(_module, _args, kwargs):
+        training = torch.is_grad_enabled()
+        forwards.append((training, kwargs["positions"].numel()))
+        if training:
+            for k, v in kwargs["past_key_values"]:
+                assert k.shape[1] == v.shape[1] == prefill - 1
+                assert not k.requires_grad and k.grad_fn is None
+                assert not v.requires_grad and v.grad_fn is None
+            assert len(kwargs["past_key_values"]) == layers
+
+    def capture_fusion(_module, _args, output):
+        if torch.is_grad_enabled():
+            assert output.shape == (1, 8)
+            output.retain_grad()
+            fused_anchors.append(output)
+
+    original_step = trainer.step
+
+    def check_step():
+        assert len(fused_anchors) == 1
+        grad = fused_anchors[0].grad
+        assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+        if prefill > 1:
+            assert not torch.allclose(
+                trainer.model.model.fc.weight.grad, reference.model.fc.weight.grad
+            )
+        else:
+            torch.testing.assert_close(
+                trainer.model.model.fc.weight.grad, reference.model.fc.weight.grad
+            )
+        original_step()
+
+    monkeypatch.setattr(trainer, "step", check_step)
+    handle = trainer.model.register_forward_pre_hook(capture_forward, with_kwargs=True)
+    fusion_handle = trainer.model.model.fc.register_forward_hook(capture_fusion)
+    try:
+        qwen3_eagle3_distillation_step(trainer, [observation])
+    finally:
+        handle.remove()
+        fusion_handle.remove()
+    assert forwards == [(False, prefill), (True, 4), (False, 3)]
+    assert trainer.last_loss == pytest.approx(full_loss.item(), abs=1e-6)
+    assert trainer.cache_length == prefill + 3

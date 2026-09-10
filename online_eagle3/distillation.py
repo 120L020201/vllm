@@ -48,20 +48,26 @@ def _step(trainer: Qwen3Eagle3CpuTrainer, observation: TrainObservation) -> None
     confirmed_embeds = batch.confirmed_input_embeds
     confirmed_auxiliary = batch.confirmed_aux_hidden_states
     depth = proposal_positions.numel()
+    history = trainer.kv_cache
     if trainer.cache_length:
         if trainer.cache_length != int(positions[-1]) + 1:
             raise ValueError("CPU history does not end at the proposal anchor")
-        # Recompute the boundary query with gradients, without replacing its
-        # persistent KV. Earlier history remains a detached conditioning input.
-        cache = cache_prefix(trainer.kv_cache, int(positions[-1]))
-        replay_positions = positions[-1:]
-        replay_embeds = embeds[-1:]
-        replay_auxiliary = auxiliary[-1:]
     else:
         if int(positions[0]) != 0:
             raise ValueError("First observation must include the full prompt prefill")
-        cache = ()
-        replay_positions, replay_embeds, replay_auxiliary = positions, embeds, auxiliary
+        # Keep the initial-weight prefill KV, including the anchor. Publish it
+        # only after training and the confirmed append complete successfully.
+        with (
+            torch.no_grad(),
+            torch.profiler.record_function("online_eagle3.cpu_prefill_kv"),
+        ):
+            history = append_confirmed(model, (), positions, embeds, auxiliary)
+    # Train the boundary query without replacing its persistent KV or attending
+    # to it twice. Earlier history is a detached conditioning input.
+    cache = cache_prefix(history, int(positions[-1]))
+    replay_positions = positions[-1:]
+    replay_embeds = embeds[-1:]
+    replay_auxiliary = auxiliary[-1:]
 
     trainer.zero_grad()
     with torch.profiler.record_function("online_eagle3.cpu_forward"):
@@ -95,11 +101,7 @@ def _step(trainer: Qwen3Eagle3CpuTrainer, observation: TrainObservation) -> None
     del cache, output, recurrent, logits, loss
 
     with torch.no_grad(), torch.profiler.record_function("online_eagle3.cpu_append_kv"):
-        # Only newly confirmed target-feature inputs enter persistent history.
-        # Both bootstrap and append run AFTER optimizer.step().
-        history = append_confirmed(
-            model, trainer.kv_cache, positions, embeds, auxiliary
-        )
+        # Only new confirmed positions use updated weights; all old KV stays.
         history = append_confirmed(
             model, history, confirmed_positions, confirmed_embeds, confirmed_auxiliary
         )

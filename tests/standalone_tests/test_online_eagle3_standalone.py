@@ -34,7 +34,7 @@ import online_eagle3
 
 torch.set_num_threads(2)
 tests = runpy.run_path("tests/standalone_tests/test_online_eagle3_distillation.py")
-tests["test_append_uses_updated_weights_and_preserves_history"](3)
+tests["test_append_uses_updated_weights_and_preserves_history"](3, 2)
 assert not any(n == "vllm" or n.startswith("vllm.") for n in sys.modules)
 print("standalone training, append and reset passed")
 """,
