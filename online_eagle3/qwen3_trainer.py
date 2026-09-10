@@ -3,26 +3,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 
+from .config import Qwen3Eagle3TrainerConfig
+from .torch_eagle3 import Eagle3KVCache
 from .weights import (
-    QWEN3_EAGLE3_FROZEN_PREFIXES,
     TrainableWeightSnapshot,
     export_trainable_state_dict,
     freeze_parameters,
     get_trainable_named_parameters,
     load_trainable_state_dict,
 )
-
-
-@dataclass(slots=True)
-class Qwen3Eagle3TrainerConfig:
-    frozen_prefixes: tuple[str, ...] = QWEN3_EAGLE3_FROZEN_PREFIXES
-    lr: float = 1e-5
-    weight_decay: float = 0.0
 
 
 class Qwen3Eagle3CpuTrainer:
@@ -49,18 +41,33 @@ class Qwen3Eagle3CpuTrainer:
             weight_decay=self.config.weight_decay,
         )
         self._version = 0
+        self.kv_cache: Eagle3KVCache = ()
+        self.request_id: str | None = None
+        self.last_step_id: int | None = None
+        self.last_loss: float | None = None
+
+    @property
+    def cache_length(self) -> int:
+        return self.kv_cache[0][0].shape[1] if self.kv_cache else 0
+
+    def clear_request_state(self) -> None:
+        self.kv_cache = ()
+        self.request_id = None
+        self.last_step_id = None
+        self.last_loss = None
 
     @property
     def version(self) -> int:
         return self._version
 
     def snapshot(self) -> TrainableWeightSnapshot:
-        return TrainableWeightSnapshot(
-            version=self._version,
-            state_dict=export_trainable_state_dict(
-                self.model, self.config.frozen_prefixes
-            ),
-        )
+        with torch.profiler.record_function("online_eagle3.cpu_snapshot"):
+            return TrainableWeightSnapshot(
+                version=self._version,
+                state_dict=export_trainable_state_dict(
+                    self.model, self.config.frozen_prefixes
+                ),
+            )
 
     def load_snapshot(
         self,
@@ -84,6 +91,7 @@ class Qwen3Eagle3CpuTrainer:
     ) -> None:
         self.load_snapshot(snapshot, strict=strict)
         self.clear_optimizer_state()
+        self.clear_request_state()
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)

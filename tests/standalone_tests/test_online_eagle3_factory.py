@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -12,8 +10,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from online_eagle3 import factory as factory_module
+from online_eagle3 import factory as cpu_factory
 from online_eagle3.sync_bridge import Qwen3Eagle3LazySyncBridge
+from vllm.v1.worker.gpu.spec_decode import online_eagle3_config as factory_module
 
 
 class _ToyEagle3Module(nn.Module):
@@ -42,6 +41,7 @@ def _make_vllm_config(
             draft_model_config=SimpleNamespace(model="/draft/from/config"),
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
@@ -58,6 +58,28 @@ def test_factory_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert bridge is None
 
 
+def test_factory_rejects_accumulation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL", "2")
+    with pytest.raises(ValueError, match="S=1"):
+        factory_module.maybe_create_qwen3_eagle3_sync_bridge(_make_vllm_config())
+
+
+@pytest.mark.parametrize("option", ["enable_chunked_prefill", "enable_prefix_caching"])
+def test_factory_requires_complete_prompt(monkeypatch, option):
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
+    config = _make_vllm_config()
+    config.cache_config = SimpleNamespace()
+    owner = (
+        config.scheduler_config
+        if option == "enable_chunked_prefill"
+        else config.cache_config
+    )
+    setattr(owner, option, True)
+    with pytest.raises(ValueError, match="requires --no-enable"):
+        factory_module.maybe_create_qwen3_eagle3_sync_bridge(config)
+
+
 def test_factory_creates_lazy_sync_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     loaded: dict[str, object] = {}
 
@@ -68,11 +90,11 @@ def test_factory_creates_lazy_sync_bridge(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3_DRAFT_MODEL", "/draft/from/env")
-    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL", "2")
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL", "1")
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3_LR", "0.25")
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3_WEIGHT_DECAY", "0.5")
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3_DTYPE", "bf16")
-    monkeypatch.setattr(factory_module, "load_torch_eagle3_model", _load_model)
+    monkeypatch.setattr(cpu_factory, "load_torch_eagle3_model", _load_model)
 
     bridge = factory_module.maybe_create_qwen3_eagle3_sync_bridge(_make_vllm_config())
 
@@ -96,7 +118,7 @@ def test_factory_writes_cpu_runtime_metadata(
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3_DRAFT_MODEL", "/draft/from/env")
     monkeypatch.setenv("VLLM_ONLINE_EAGLE3_DTYPE", "bf16")
-    monkeypatch.setattr(factory_module, "load_torch_eagle3_model", _load_model)
+    monkeypatch.setattr(cpu_factory, "load_torch_eagle3_model", _load_model)
 
     config = _make_vllm_config()
     config.profiler_config = SimpleNamespace(
@@ -138,3 +160,29 @@ def test_factory_rejects_tensor_parallel(monkeypatch: pytest.MonkeyPatch) -> Non
         factory_module.maybe_create_qwen3_eagle3_sync_bridge(
             _make_vllm_config(tensor_parallel_size=2)
         )
+
+
+def test_factory_passes_typed_config_without_loading(monkeypatch):
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_CHECK_GRADIENTS", "false")
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_DTYPE", "bf16")
+    captured = {}
+
+    def create(model_path, config, *, trace_dir):
+        captured.update(model_path=model_path, config=config)
+        return "bridge"
+
+    monkeypatch.setattr(factory_module, "create_cpu_bridge", create)
+    assert (
+        factory_module.maybe_create_qwen3_eagle3_sync_bridge(_make_vllm_config())
+        == "bridge"
+    )
+    assert captured["config"].dtype == torch.bfloat16
+    assert not captured["config"].check_gradients
+
+
+def test_factory_rejects_invalid_boolean(monkeypatch):
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3", "1")
+    monkeypatch.setenv("VLLM_ONLINE_EAGLE3_CHECK_GRADIENTS", "typo")
+    with pytest.raises(ValueError, match="boolean"):
+        factory_module.maybe_create_qwen3_eagle3_sync_bridge(_make_vllm_config())

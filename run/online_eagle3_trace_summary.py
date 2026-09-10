@@ -20,29 +20,35 @@ def main() -> int:
     with gzip.open(trace_path, "rt") as trace_file:
         trace = json.load(trace_file)
 
-    stats: dict[str, list[float]] = defaultdict(list)
+    stats: dict[tuple[str, str], list[float]] = defaultdict(list)
     for event in trace.get("traceEvents", []):
         name = event.get("name")
         duration_us = event.get("dur")
-        if not isinstance(name, str) or not name.startswith("online_eagle3."):
+        category = event.get("cat")
+        if category not in ("user_annotation", "gpu_user_annotation"):
             continue
-        if isinstance(duration_us, int | float):
-            stats[name].append(float(duration_us) / 1000.0)
-        else:
-            stats[name].append(0.0)
+        if not isinstance(name, str) or not (
+            name.startswith("online_eagle3.") or name.startswith("Optimizer.step#")
+        ):
+            continue
+        if event.get("ph") != "X" or not isinstance(duration_us, int | float):
+            continue
+        track = "cpu" if category == "user_annotation" else "gpu_range"
+        stats[track, name].append(float(duration_us) / 1000.0)
 
     print(f"trace: {trace_path}")
     if not stats:
         print("No online_eagle3.* markers found.")
         return 0
 
-    print("marker,count,total_ms,mean_ms,max_ms")
-    for name in sorted(stats):
-        values = stats[name]
+    print("CPU ranges are host wall time; GPU ranges may include gaps between kernels.")
+    print("track,marker,count,total_ms,mean_ms,max_ms")
+    for track, name in sorted(stats):
+        values = stats[track, name]
         total = sum(values)
         mean = total / len(values)
         max_value = max(values)
-        print(f"{name},{len(values)},{total:.3f},{mean:.3f},{max_value:.3f}")
+        print(f"{track},{name},{len(values)},{total:.3f},{mean:.3f},{max_value:.3f}")
     return 0
 
 

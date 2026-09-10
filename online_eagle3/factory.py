@@ -1,238 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from __future__ import annotations
-
-import json
-import os
-import platform
+import logging
 from pathlib import Path
-from typing import Any
 
 import torch
 
-from vllm.config import VllmConfig
-from vllm.logger import init_logger
-
-from .ce_step import qwen3_eagle3_ce_step
-from .qwen3_trainer import Qwen3Eagle3CpuTrainer, Qwen3Eagle3TrainerConfig
+from .checkpoint import load_torch_eagle3_model
+from .config import Qwen3Eagle3TrainerConfig
+from .data import Qwen3Eagle3StepFn
+from .distillation import qwen3_eagle3_distillation_step
+from .qwen3_trainer import Qwen3Eagle3CpuTrainer
+from .runtime import get_cpu_runtime, write_cpu_runtime
 from .sync_bridge import Qwen3Eagle3LazySyncBridge, Qwen3Eagle3SyncBridge
-from .torch_eagle3 import load_torch_eagle3_model
 
-logger = init_logger("vllm.online_eagle3.factory")
-
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-_DTYPES = {
-    "float32": torch.float32,
-    "fp32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-}
+logger = logging.getLogger(__name__)
 
 
-def maybe_create_qwen3_eagle3_sync_bridge(
-    vllm_config: VllmConfig,
-) -> Qwen3Eagle3LazySyncBridge | None:
-    if not _env_enabled("VLLM_ONLINE_EAGLE3"):
-        return None
+def create_cpu_bridge(
+    model_path: str,
+    config: Qwen3Eagle3TrainerConfig | None = None,
+    *,
+    step_fn: Qwen3Eagle3StepFn = qwen3_eagle3_distillation_step,
+    trace_dir: str | Path | None = None,
+) -> Qwen3Eagle3LazySyncBridge:
+    """Build request-local training without importing an inference engine."""
+    config = config or Qwen3Eagle3TrainerConfig()
 
-    speculative_config = vllm_config.speculative_config
-    if speculative_config is None or speculative_config.method != "eagle3":
-        raise ValueError("VLLM_ONLINE_EAGLE3 requires --speculative-config eagle3")
-
-    _require_single_request(vllm_config)
-    _require_single_parallel_worker(vllm_config)
-
-    draft_model_path = os.environ.get("VLLM_ONLINE_EAGLE3_DRAFT_MODEL")
-    if draft_model_path is None:
-        draft_model_path = getattr(
-            speculative_config.draft_model_config,
-            "model",
-            None,
-        )
-    if not draft_model_path:
-        raise ValueError(
-            "VLLM_ONLINE_EAGLE3 requires VLLM_ONLINE_EAGLE3_DRAFT_MODEL "
-            "or a draft model path in the speculative config"
-        )
-
-    update_interval = _get_int_env("VLLM_ONLINE_EAGLE3_UPDATE_INTERVAL", 1)
-    lr = _get_float_env("VLLM_ONLINE_EAGLE3_LR", 1e-5)
-    weight_decay = _get_float_env("VLLM_ONLINE_EAGLE3_WEIGHT_DECAY", 0.0)
-    dtype = _get_dtype_env("VLLM_ONLINE_EAGLE3_DTYPE", torch.float32)
-    torch_threads = _get_optional_int_env("VLLM_ONLINE_EAGLE3_TORCH_THREADS")
-
-    logger.info(
-        "Enabled synchronous online EAGLE3 updates: draft_model=%s, "
-        "update_interval=%d, lr=%s, weight_decay=%s, dtype=%s, "
-        "torch_threads=%s",
-        draft_model_path,
-        update_interval,
-        lr,
-        weight_decay,
-        dtype,
-        torch_threads,
-    )
-
-    def bridge_factory() -> Qwen3Eagle3SyncBridge:
-        if torch_threads is not None:
-            torch.set_num_threads(torch_threads)
-        logger.info("Loading online EAGLE3 CPU draft from %s", draft_model_path)
-        with torch.inference_mode(False), torch.enable_grad():
-            cpu_model = load_torch_eagle3_model(draft_model_path, dtype=dtype)
-            cpu_model.train()
-            runtime = _get_cpu_runtime(cpu_model)
+    def load() -> Qwen3Eagle3SyncBridge:
+        if config.torch_threads is not None:
+            torch.set_num_threads(config.torch_threads)
+        logger.info("Loading online EAGLE3 CPU draft from %s", model_path)
+        with (
+            torch.inference_mode(False),
+            torch.enable_grad(),
+            torch.profiler.record_function("online_eagle3.cpu_load_model"),
+        ):
+            model = load_torch_eagle3_model(model_path, dtype=config.dtype)
+            model.train()
+            runtime = get_cpu_runtime(model)
             logger.info(
-                "Online EAGLE3 CPU runtime: cpu_model=%s, "
-                "torch_num_threads=%d, cpu_draft_dtype=%s",
+                "Online EAGLE3 CPU runtime: cpu_model=%s, torch_num_threads=%d, "
+                "cpu_draft_dtype=%s",
                 runtime["cpu_model"],
                 runtime["torch_num_threads"],
                 runtime["cpu_draft_dtype"],
             )
-            _write_cpu_runtime_metadata(vllm_config, runtime)
-            trainer = Qwen3Eagle3CpuTrainer(
-                cpu_model,
-                Qwen3Eagle3TrainerConfig(
-                    lr=lr,
-                    weight_decay=weight_decay,
-                ),
-            )
+            write_cpu_runtime(trace_dir, runtime, config, model_path)
+            trainer = Qwen3Eagle3CpuTrainer(model, config)
         return Qwen3Eagle3SyncBridge(
-            trainer,
-            qwen3_eagle3_ce_step,
-            update_interval=update_interval,
+            trainer, step_fn, update_interval=config.update_interval, fail_on_error=True
         )
 
-    return Qwen3Eagle3LazySyncBridge(bridge_factory)
-
-
-def _get_cpu_runtime(model: torch.nn.Module) -> dict[str, str | int]:
-    model_dtype = next(
-        parameter.dtype
-        for parameter in model.parameters()
-        if parameter.is_floating_point()
-    )
-    return {
-        "cpu_model": _get_cpu_model(),
-        "torch_num_threads": torch.get_num_threads(),
-        "cpu_draft_dtype": _format_dtype(model_dtype),
-    }
-
-
-def _get_cpu_model() -> str:
-    try:
-        with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
-            for line in cpuinfo:
-                if line.lower().startswith("model name") and ":" in line:
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-
-    return platform.processor() or platform.machine() or "unknown"
-
-
-def _format_dtype(dtype: torch.dtype) -> str:
-    if dtype is torch.float32:
-        return "FP32"
-    if dtype is torch.bfloat16:
-        return "BF16"
-    return str(dtype).removeprefix("torch.").upper()
-
-
-def _write_cpu_runtime_metadata(
-    vllm_config: VllmConfig,
-    runtime: dict[str, str | int],
-) -> None:
-    profiler_config = getattr(vllm_config, "profiler_config", None)
-    trace_dir = getattr(profiler_config, "torch_profiler_dir", "")
-    if not trace_dir or "://" in trace_dir:
-        return
-
-    metadata_path = Path(trace_dir) / "online_eagle3_cpu_runtime.json"
-    try:
-        metadata_path.write_text(
-            json.dumps(runtime, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        logger.warning("Failed to write online EAGLE3 CPU runtime to %s", metadata_path)
-
-
-def _env_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
-
-
-def _get_int_env(name: str, default: int) -> int:
-    value = _get_optional_int_env(name)
-    if value is None:
-        return default
-    return value
-
-
-def _get_optional_int_env(name: str) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return None
-    value = int(raw)
-    if value < 1:
-        raise ValueError(f"{name} must be >= 1")
-    return value
-
-
-def _get_float_env(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return float(raw)
-
-
-def _get_dtype_env(name: str, default: torch.dtype) -> torch.dtype:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    dtype = _DTYPES.get(raw.strip().lower())
-    if dtype is None:
-        raise ValueError(f"{name} must be one of {sorted(_DTYPES)}")
-    return dtype
-
-
-def _require_single_request(vllm_config: VllmConfig) -> None:
-    _require_config_value(
-        vllm_config.scheduler_config,
-        "max_num_seqs",
-        1,
-        "VLLM_ONLINE_EAGLE3 currently supports only --max-num-seqs 1",
-    )
-
-
-def _require_single_parallel_worker(vllm_config: VllmConfig) -> None:
-    parallel_config = vllm_config.parallel_config
-    _require_config_value(
-        parallel_config,
-        "tensor_parallel_size",
-        1,
-        "VLLM_ONLINE_EAGLE3 currently supports only tensor_parallel_size=1",
-    )
-    _require_config_value(
-        parallel_config,
-        "pipeline_parallel_size",
-        1,
-        "VLLM_ONLINE_EAGLE3 currently supports only pipeline_parallel_size=1",
-    )
-    _require_config_value(
-        parallel_config,
-        "data_parallel_size",
-        1,
-        "VLLM_ONLINE_EAGLE3 currently supports only data_parallel_size=1",
-    )
-
-
-def _require_config_value(
-    config: Any,
-    name: str,
-    expected: int,
-    message: str,
-) -> None:
-    actual = getattr(config, name, expected)
-    if actual != expected:
-        raise ValueError(f"{message}; got {name}={actual}")
+    return Qwen3Eagle3LazySyncBridge(load)

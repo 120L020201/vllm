@@ -8,7 +8,7 @@ from collections.abc import Sequence
 import torch
 import torch.nn.functional as F
 
-from .async_bridge import TrainObservation
+from .data import TrainObservation
 from .observations import (
     DraftTrainLabels,
     build_target_to_draft_map,

@@ -3,14 +3,14 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+Eagle3KVCache = tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
 
 @dataclass(slots=True)
@@ -33,7 +33,7 @@ class TorchEagle3Config:
     fc_norm: bool = False
 
     @classmethod
-    def from_dict(cls, values: dict[str, Any]) -> "TorchEagle3Config":
+    def from_dict(cls, values: dict[str, Any]) -> TorchEagle3Config:
         eagle_config = values.get("eagle_config") or {}
         aux_layers = values.get("num_aux_hidden_states")
         if aux_layers is None:
@@ -55,9 +55,7 @@ class TorchEagle3Config:
             ),
             num_hidden_layers=int(values.get("num_hidden_layers", 1)),
             vocab_size=int(values["vocab_size"]),
-            draft_vocab_size=int(
-                values.get("draft_vocab_size", values["vocab_size"])
-            ),
+            draft_vocab_size=int(values.get("draft_vocab_size", values["vocab_size"])),
             rms_norm_eps=float(values.get("rms_norm_eps", 1e-6)),
             rope_theta=float(values.get("rope_theta", 10000.0)),
             attention_bias=bool(values.get("attention_bias", False)),
@@ -113,6 +111,8 @@ class TorchEagle3SelfAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_output: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q_size = self.num_heads * self.head_dim
@@ -125,6 +125,15 @@ class TorchEagle3SelfAttention(nn.Module):
         v = v.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1)
         q, k = self._apply_rotary(q, k, positions)
 
+        past_len = 0
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            past_len = past_k.shape[1]
+            k = torch.cat((past_k, k), dim=1)
+            v = torch.cat((past_v, v), dim=1)
+        if kv_output is not None:
+            kv_output.append((k, v))
+
         if self.num_heads != self.num_kv_heads:
             repeat = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeat, dim=0)
@@ -132,8 +141,10 @@ class TorchEagle3SelfAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-1, -2)) * (self.head_dim**-0.5)
         mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=scores.device),
-            diagonal=1,
+            torch.ones(
+                seq_len, past_len + seq_len, dtype=torch.bool, device=scores.device
+            ),
+            diagonal=past_len + 1,
         )
         scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
         attn = torch.softmax(scores.float(), dim=-1).to(v.dtype)
@@ -204,6 +215,8 @@ class TorchEagle3DecoderLayer(nn.Module):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_output: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.layer_idx == 0:
             embeds = self.input_layernorm(embeds)
@@ -214,7 +227,9 @@ class TorchEagle3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
             assert isinstance(hidden_states, torch.Tensor)
 
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(
+            positions, hidden_states, past_key_value, kv_output
+        )
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
             residual,
@@ -291,15 +306,21 @@ class TorchEagle3Model(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         input_embeds: torch.Tensor,
+        past_key_values: Eagle3KVCache = (),
+        kv_output: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del input_ids
         residual = None
-        for layer in self.layers:
+        if past_key_values and len(past_key_values) != len(self.layers):
+            raise ValueError("KV cache must have one entry per decoder layer")
+        for index, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions=positions,
                 embeds=input_embeds,
                 hidden_states=hidden_states,
                 residual=residual,
+                past_key_value=past_key_values[index] if past_key_values else None,
+                kv_output=kv_output,
             )
         hidden_states, hidden_prenorm = self.norm(hidden_states, residual)
         aux_output = hidden_states if self.norm_output else hidden_prenorm
@@ -327,8 +348,17 @@ class TorchEagle3ForCausalLM(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor,
+        past_key_values: Eagle3KVCache = (),
+        kv_output: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.model(input_ids, positions, hidden_states, inputs_embeds)
+        return self.model(
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds,
+            past_key_values,
+            kv_output,
+        )
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(hidden_states)
@@ -351,67 +381,6 @@ class TorchEagle3ForCausalLM(nn.Module):
         valid = (target_ids >= 0) & (target_ids < self.config.vocab_size)
         full_logits[:, target_ids[valid]] = logits[:, valid]
         return full_logits
-
-
-def load_torch_eagle3_model(
-    model_path: str | Path,
-    *,
-    dtype: torch.dtype = torch.float32,
-) -> TorchEagle3ForCausalLM:
-    path = Path(model_path)
-    with (path / "config.json").open() as config_file:
-        config = TorchEagle3Config.from_dict(json.load(config_file))
-
-    model = TorchEagle3ForCausalLM(config).to(dtype=dtype)
-    state = torch.load(
-        path / "pytorch_model.bin",
-        map_location="cpu",
-        weights_only=True,
-    )
-    if "state_dict" in state:
-        state = state["state_dict"]
-    converted = convert_eagle3_checkpoint_state(state)
-    model.load_state_dict(converted, strict=True)
-    return model
-
-
-def convert_eagle3_checkpoint_state(
-    checkpoint_state: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    state = dict(checkpoint_state)
-    converted: dict[str, torch.Tensor] = {
-        "draft_id_to_target_id": state["d2t"],
-        "model.layers.0.self_attn.o_proj.weight": state[
-            "midlayer.self_attn.o_proj.weight"
-        ],
-        "model.layers.0.mlp.down_proj.weight": state["midlayer.mlp.down_proj.weight"],
-        "model.layers.0.hidden_norm.weight": state["midlayer.hidden_norm.weight"],
-        "model.layers.0.input_layernorm.weight": state[
-            "midlayer.input_layernorm.weight"
-        ],
-        "model.layers.0.post_attention_layernorm.weight": state[
-            "midlayer.post_attention_layernorm.weight"
-        ],
-        "model.norm.weight": state["norm.weight"],
-        "model.fc.weight": state["fc.weight"],
-        "lm_head.weight": state["lm_head.weight"],
-    }
-    converted["model.layers.0.self_attn.qkv_proj.weight"] = torch.cat(
-        [
-            state["midlayer.self_attn.q_proj.weight"],
-            state["midlayer.self_attn.k_proj.weight"],
-            state["midlayer.self_attn.v_proj.weight"],
-        ],
-        dim=0,
-    )
-    converted["model.layers.0.mlp.gate_up_proj.weight"] = torch.cat(
-        [
-            state["midlayer.mlp.gate_proj.weight"],
-            state["midlayer.mlp.up_proj.weight"],
-        ],
-        dim=0,
-    )
-    return converted
 
 
 def _rotate_half(

@@ -28,7 +28,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from online_eagle3.factory import maybe_create_qwen3_eagle3_sync_bridge
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -106,6 +105,9 @@ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
+)
+from vllm.v1.worker.gpu.spec_decode.online_eagle3_config import (
+    maybe_create_qwen3_eagle3_sync_bridge,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -1049,6 +1051,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        if self.speculator is not None and input_batch.num_draft_tokens > 0:
+            self.speculator.capture_teacher_logits(logits)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1451,25 +1455,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
 
-            if len(input_batch.req_ids) == 1:
-                observation_payload: dict[str, torch.Tensor] = {
-                    "hidden_states": spec_hidden_states,
-                    "sampled_token_ids": sampler_output.sampled_token_ids,
-                    "num_sampled": num_sampled,
-                    "num_rejected": num_rejected,
-                    "temperature": self.sampler.sampling_states.temperature.gpu,
-                    "seeds": self.sampler.sampling_states.seeds.gpu,
-                }
-                if aux_hidden_states is not None:
-                    for idx, aux_hidden_state in enumerate(aux_hidden_states):
-                        observation_payload[f"aux_hidden_states_{idx}"] = (
-                            aux_hidden_state
-                        )
-                self.speculator.observe_step(
-                    input_batch.req_ids[0],
-                    0,
-                    observation_payload,
-                )
+            self.speculator.observe_verify(
+                input_batch,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                aux_hidden_states,
+            )
             self.speculator.maybe_apply_pending_weights()
             draft_tokens = self.speculator.propose(
                 input_batch,

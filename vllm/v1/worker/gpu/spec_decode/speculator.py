@@ -66,11 +66,15 @@ class BaseSpeculator(ABC):
     ) -> torch.Tensor:
         pass
 
-    def observe_step(
+    def capture_teacher_logits(self, logits: torch.Tensor) -> None:
+        return None
+
+    def observe_verify(
         self,
-        request_id: str,
-        step_id: int,
-        payload: dict[str, torch.Tensor] | None = None,
+        input_batch: InputBatch,
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        auxiliary: list[torch.Tensor] | None,
     ) -> None:
         return None
 

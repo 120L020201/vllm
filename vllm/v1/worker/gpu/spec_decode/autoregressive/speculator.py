@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from online_eagle3.weights import load_trainable_state_dict
+from online_eagle3.data import WeightUpdateBridge
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -23,11 +23,10 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     DecodeSpeculatorCudaGraphManager,
     PrefillSpeculatorCudaGraphManager,
 )
+from vllm.v1.worker.gpu.spec_decode.online_eagle3 import OnlineEagle3Adapter
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
-
-_INTERNAL_REQUEST_PREFIXES = ("_dummy_req_", "_warmup_")
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
@@ -55,13 +54,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.prefill_cudagraph_manager: PrefillSpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeSpeculatorCudaGraphManager | None = None
-        self.weight_update_bridge: Any | None = None
-        self._proposal_step_id = 0
-        self._current_proposal_trace: dict[str, list[torch.Tensor]] | None = None
-        self._current_proposal_aux_hidden_states: torch.Tensor | None = None
-        self._pending_proposal_payload: dict[str, torch.Tensor] | None = None
-        self._pending_proposal_step_id: int | None = None
-        self._logged_first_weight_apply = False
+        self.online_training: OnlineEagle3Adapter | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -106,149 +99,40 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             decode_query_len=1,
         )
 
-    def set_weight_update_bridge(self, bridge: Any | None) -> None:
-        self.weight_update_bridge = bridge
+    def set_weight_update_bridge(self, bridge: WeightUpdateBridge | None) -> None:
+        if bridge is not None:
+            self.online_training = OnlineEagle3Adapter(
+                self.model, bridge, self.num_speculative_steps
+            )
 
-    def observe_step(
-        self,
-        request_id: str,
-        step_id: int,
-        payload: dict[str, torch.Tensor] | None = None,
-    ) -> None:
-        if request_id.startswith(_INTERNAL_REQUEST_PREFIXES):
-            self._pending_proposal_payload = None
-            self._pending_proposal_step_id = None
-            return
-        if self.weight_update_bridge is None:
-            return
-        if self._pending_proposal_payload is None:
-            return
+    def capture_teacher_logits(self, logits: torch.Tensor) -> None:
+        if self.online_training is not None:
+            self.online_training.capture_teacher_logits(logits)
 
-        observation_payload = dict(self._pending_proposal_payload)
-        observation_payload.update(payload or {})
-        proposal_step_id = self._pending_proposal_step_id
-        self._pending_proposal_payload = None
-        self._pending_proposal_step_id = None
-        self.weight_update_bridge.observe_step(
-            request_id,
-            proposal_step_id if proposal_step_id is not None else step_id,
-            observation_payload,
-        )
-
-    def maybe_apply_pending_weights(self) -> None:
-        if self.weight_update_bridge is None or not hasattr(self, "model"):
-            return
-        pending = self.weight_update_bridge.maybe_apply_pending_weights()
-        if pending is not None:
-            with torch.profiler.record_function("online_eagle3.gpu_apply_weights"):
-                load_trainable_state_dict(self.model, pending.state_dict)
-            if not self._logged_first_weight_apply:
-                logger.info(
-                    "Applied first online EAGLE3 GPU draft weight snapshot: version=%d",
-                    pending.version,
-                )
-                self._logged_first_weight_apply = True
-
-    def reset_request(self, req_id: str) -> None:
-        self._current_proposal_trace = None
-        self._current_proposal_aux_hidden_states = None
-        self._pending_proposal_payload = None
-        self._pending_proposal_step_id = None
-        if self.weight_update_bridge is None or req_id.startswith(
-            _INTERNAL_REQUEST_PREFIXES
-        ):
-            return
-        self.weight_update_bridge.reset_request(req_id)
-        self.maybe_apply_pending_weights()
-
-    def shutdown(self) -> None:
-        bridge = self.weight_update_bridge
-        self.weight_update_bridge = None
-        if bridge is not None and hasattr(bridge, "shutdown"):
-            bridge.shutdown()
-
-    def _start_proposal_trace(
+    def observe_verify(
         self,
         input_batch: InputBatch,
-        aux_hidden_states: torch.Tensor | None,
-        dummy_run: bool,
-        is_profile: bool,
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        auxiliary: list[torch.Tensor] | None,
     ) -> None:
-        if (
-            self.weight_update_bridge is None
-            or input_batch.num_reqs != 1
-            or dummy_run
-            or is_profile
-            or self.supports_mm_inputs
-            or any(
-                req_id.startswith(_INTERNAL_REQUEST_PREFIXES)
-                for req_id in input_batch.req_ids
+        if self.online_training is not None:
+            self.online_training.observe_verify(
+                input_batch, sampled_token_ids, num_sampled, auxiliary
             )
-        ):
-            self._current_proposal_trace = None
-            self._current_proposal_aux_hidden_states = None
-            return
 
-        self._current_proposal_trace = {
-            "proposal_input_ids": [],
-            "proposal_input_embeds": [],
-            "proposal_positions": [],
-            "proposal_hidden_states": [],
-        }
-        self._current_proposal_aux_hidden_states = aux_hidden_states
+    def maybe_apply_pending_weights(self) -> None:
+        if self.online_training is not None:
+            self.online_training.apply_weights()
 
-    def _record_proposal_input(self, indices: torch.Tensor) -> None:
-        trace = self._current_proposal_trace
-        if trace is None:
-            return
+    def reset_request(self, req_id: str) -> None:
+        if self.online_training is not None:
+            self.online_training.reset_request(req_id)
 
-        input_ids = self.input_buffers.input_ids[indices]
-        input_embeds = self.model.embed_input_ids(input_ids)
-        trace["proposal_input_ids"].append(input_ids.detach().clone())
-        trace["proposal_input_embeds"].append(input_embeds.detach().clone())
-        trace["proposal_positions"].append(
-            self.input_buffers.positions[indices].detach().clone()
-        )
-        trace["proposal_hidden_states"].append(
-            self.hidden_states[indices].detach().clone()
-        )
-        if self._current_proposal_aux_hidden_states is not None:
-            trace["proposal_aux_hidden_states"] = [
-                self._current_proposal_aux_hidden_states[indices].detach().clone()
-            ]
-            self._current_proposal_aux_hidden_states = None
-
-    def _finish_proposal_trace(
-        self,
-        draft_tokens: torch.Tensor,
-    ) -> None:
-        trace = self._current_proposal_trace
-        self._current_proposal_trace = None
-        self._current_proposal_aux_hidden_states = None
-        if trace is None:
-            return
-
-        payload = {
-            name: torch.cat(values, dim=0) for name, values in trace.items() if values
-        }
-        if not payload:
-            return
-
-        proposal_step_id = self._proposal_step_id
-        self._proposal_step_id += 1
-        num_trace_tokens = payload["proposal_input_ids"].shape[0]
-        payload["proposal_draft_token_ids"] = (
-            draft_tokens[0, :num_trace_tokens].detach().clone()
-        )
-        payload["proposal_num_speculative_tokens"] = torch.tensor(
-            [num_trace_tokens], dtype=torch.int32, device=self.device
-        )
-        payload["proposal_step_id"] = torch.tensor(
-            [proposal_step_id], dtype=torch.int64, device=self.device
-        )
-
-        self._pending_proposal_payload = payload
-        self._pending_proposal_step_id = proposal_step_id
+    def shutdown(self) -> None:
+        if self.online_training is not None:
+            self.online_training.shutdown()
+            self.online_training = None
 
     def capture(
         self,
@@ -339,12 +223,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             hidden_states = self.model.combine_hidden_states(raw_aux_hidden_states)
         else:
             hidden_states = last_hidden_states
-        self._start_proposal_trace(
-            input_batch,
-            raw_aux_hidden_states,
-            dummy_run,
-            is_profile,
-        )
+        if self.online_training is not None:
+            self.online_training.start_proposal(
+                input_batch,
+                raw_aux_hidden_states,
+                skip=dummy_run or is_profile or self.supports_mm_inputs,
+            )
         self.hidden_states[:num_tokens].copy_(hidden_states)
 
         self._copy_request_inputs(
@@ -386,6 +270,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             need_eager=is_profile,
         )
 
+        # Capture outside graph replay: Python callbacks inside a captured
+        # forward do not run again on subsequent replays.
+        if self.online_training is not None:
+            self.online_training.record_prefill(
+                self.input_buffers.input_ids,
+                self.input_buffers.positions,
+                self.hidden_states,
+                self.last_token_indices[:num_reqs],
+            )
         with torch.profiler.record_function("online_eagle3.gpu_draft_prefill"):
             if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
                 # Replay the full graph for draft prefill.
@@ -408,7 +301,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if self.num_speculative_steps == 1:
             # Early exit.
             draft_tokens = self.draft_tokens[:num_reqs, :1]
-            self._finish_proposal_trace(draft_tokens)
+            if self.online_training is not None:
+                self.online_training.finish_proposal()
             return draft_tokens
 
         # Prepare the inputs for the decode steps.
@@ -444,7 +338,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
         draft_tokens = self.draft_tokens[:num_reqs]
-        self._finish_proposal_trace(draft_tokens)
+        if self.online_training is not None:
+            self.online_training.finish_proposal()
         return draft_tokens
 
     @torch.inference_mode()
@@ -518,8 +413,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         positions = self.input_buffers.positions[last_token_indices]
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        self._record_proposal_input(last_token_indices)
-
         last_hidden_states, hidden_states = self._run_model(
             num_tokens,
             attn_metadata,
@@ -578,6 +471,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.current_draft_step.fill_(step)
 
             # Generate draft tokens for the current step.
+            if self.online_training is not None:
+                self.online_training.record_step(
+                    self.input_buffers.input_ids,
+                    self.input_buffers.positions,
+                    self.hidden_states,
+                    self.req_indices[:num_reqs],
+                )
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.decode_cudagraph_manager is not None
                 self.decode_cudagraph_manager.run_fullgraph(batch_desc)
@@ -602,7 +502,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> None:
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
-        self._record_proposal_input(self.req_indices[:num_reqs])
         # Run the draft model forward pass.
         last_hidden_states, hidden_states = self._run_model(
             num_tokens_padded,

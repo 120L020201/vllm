@@ -25,6 +25,8 @@ ONLINE_EAGLE3_REPO_ROOT=$(cd -- "$ONLINE_EAGLE3_SCRIPT_DIR/.." && pwd)
 : "${SERVER_WAIT_ATTEMPTS:=180}"
 : "${SERVER_WAIT_SECONDS:=2}"
 : "${RESULT_ROOT:=runs}"
+: "${ONLINE_EAGLE3_WEIGHT_DECAY:=0}"
+: "${ONLINE_EAGLE3_CHECK_GRADIENTS:=1}"
 
 if [[ -z "${SPECULATIVE_CONFIG:-}" ]]; then
     SPECULATIVE_CONFIG=$(printf \
@@ -40,6 +42,8 @@ SERVER_ARGS=(
     --port "$PORT"
     --max-model-len "$MAX_MODEL_LEN"
     --max-num-seqs "$MAX_NUM_SEQS"
+    --no-enable-prefix-caching
+    --no-enable-chunked-prefill
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
@@ -61,8 +65,21 @@ online_eagle3_cd_repo() {
 
 online_eagle3_result_dir() {
     local name=$1
+    local base_dir
+    local result_dir
+    local suffix=1
     mkdir -p "$ONLINE_EAGLE3_REPO_ROOT/$RESULT_ROOT"
-    mktemp -d "$ONLINE_EAGLE3_REPO_ROOT/$RESULT_ROOT/${name}_XXXXXXXX"
+    base_dir="$ONLINE_EAGLE3_REPO_ROOT/$RESULT_ROOT/${name}_$(date +%Y%m%d_%H%M%S)"
+    result_dir=$base_dir
+    while ! mkdir "$result_dir" 2>/dev/null; do
+        if [[ ! -d "$result_dir" ]]; then
+            echo "Cannot create result directory: $result_dir" >&2
+            return 1
+        fi
+        suffix=$((suffix + 1))
+        result_dir="${base_dir}_${suffix}"
+    done
+    printf '%s\n' "$result_dir"
 }
 
 online_eagle3_wait_for_server() {

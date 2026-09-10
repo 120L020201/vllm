@@ -5,24 +5,14 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 
+from .data import Qwen3Eagle3StepFn, TrainObservation
 from .qwen3_trainer import Qwen3Eagle3CpuTrainer
 from .weights import TrainableWeightSnapshot
-
-Qwen3Eagle3StepFn = Callable[
-    [Qwen3Eagle3CpuTrainer, Sequence["TrainObservation"]], None
-]
-
-
-@dataclass(slots=True)
-class TrainObservation:
-    request_id: str
-    step_id: int
-    payload: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

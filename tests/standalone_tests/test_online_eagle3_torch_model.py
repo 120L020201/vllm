@@ -1,14 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from __future__ import annotations
 
 import json
 
 import torch
 
+from online_eagle3.checkpoint import (
+    convert_eagle3_checkpoint_state,
+    load_torch_eagle3_model,
+)
 from online_eagle3.torch_eagle3 import (
     TorchEagle3Config,
     TorchEagle3ForCausalLM,
-    convert_eagle3_checkpoint_state,
-    load_torch_eagle3_model,
 )
 
 
