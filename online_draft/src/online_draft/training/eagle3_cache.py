@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING
+
 import torch
 from online_draft.models.qwen3_eagle3 import (
     Eagle3KVCache,
@@ -9,6 +11,11 @@ from online_draft.models.qwen3_eagle3 import (
 from online_draft.training.eagle3_batch import (
     Eagle3DistillationBatch,
 )
+
+if TYPE_CHECKING:
+    from online_draft.training.eagle3_window import (
+        Eagle3TrainingWindow,
+    )
 
 PersistentEagle3KVCache = Eagle3KVCache | None
 
@@ -201,6 +208,115 @@ def append_confirmed_to_persistent_cache(
         raise RuntimeError("confirmed append did not create a cache")
 
     return updated_cache
+
+
+def append_confirmed_window_to_persistent_cache(
+    model: Qwen3Eagle3ForCausalLM,
+    window: "Eagle3TrainingWindow",
+    persistent_cache: PersistentEagle3KVCache,
+) -> Eagle3KVCache:
+    """Append a window's confirmed path under updated model weights.
+
+    Existing persistent KV remains fixed. When history is empty, the
+    first round must contain the full prompt. All new prompt and confirmed
+    positions are submitted in one no-grad model forward.
+
+    Args:
+        model: CPU EAGLE3 model after the optimizer update.
+        window: Consecutive verification rounds in the completed update.
+        persistent_cache: Detached history through the first anchor, or
+            None for the first window.
+
+    Returns:
+        Detached persistent history through the window's final confirmed
+        token.
+
+    Raises:
+        ValueError: If history, batches, or positions are inconsistent.
+    """
+    for round_batch in window.rounds:
+        _validate_batch(model, round_batch)
+
+    first_round = window.rounds[0]
+    history_length = persistent_cache_length(persistent_cache)
+    first_anchor_position = window.start_anchor_position
+
+    if history_length not in (
+        0,
+        first_anchor_position + 1,
+    ):
+        raise ValueError("persistent history must be empty or end at the first anchor")
+
+    position_parts: list[torch.Tensor] = []
+    input_embed_parts: list[torch.Tensor] = []
+    auxiliary_hidden_state_parts: list[torch.Tensor] = []
+
+    if history_length == 0:
+        first_position = int(first_round.prefill_positions[0].item())
+        if first_position != 0:
+            raise ValueError("first observation must contain the full prompt")
+
+        position_parts.append(first_round.prefill_positions)
+        input_embed_parts.append(first_round.prefill_input_embeds)
+        auxiliary_hidden_state_parts.append(first_round.prefill_aux_hidden_states)
+
+    for round_batch in window.rounds:
+        position_parts.append(round_batch.confirmed_positions)
+        input_embed_parts.append(round_batch.confirmed_input_embeds)
+        auxiliary_hidden_state_parts.append(round_batch.confirmed_aux_hidden_states)
+
+    updated_cache = _append_fixed_inputs(
+        model=model,
+        cache=persistent_cache,
+        positions=torch.cat(position_parts, dim=0),
+        input_embeds=torch.cat(input_embed_parts, dim=0),
+        auxiliary_hidden_states=torch.cat(
+            auxiliary_hidden_state_parts,
+            dim=0,
+        ),
+    )
+
+    expected_length = window.end_confirmed_position + 1
+    if persistent_cache_length(updated_cache) != expected_length:
+        raise RuntimeError(
+            "persistent history does not end at the window's final confirmed token"
+        )
+
+    if updated_cache is None:
+        raise RuntimeError("confirmed window append did not create a cache")
+
+    return updated_cache
+
+
+def prepare_training_window_spine(
+    model: Qwen3Eagle3ForCausalLM,
+    window: "Eagle3TrainingWindow",
+    persistent_cache: PersistentEagle3KVCache,
+) -> Eagle3KVCache:
+    """Build detached confirmed history for packed training branches.
+
+    The current pre-update weights build every confirmed position in the
+    window. The resulting cache is temporary: both window objectives use
+    branch masks that expose only positions before each branch anchor, and
+    the cache is discarded after the differentiable forward.
+
+    Args:
+        model: CPU EAGLE3 model before the window optimizer update.
+        window: Consecutive verification rounds in the pending update.
+        persistent_cache: Detached history through the first anchor, or
+            None for the first window.
+
+    Returns:
+        Detached confirmed history through the window's final token.
+
+    Raises:
+        ValueError: If history, batches, or positions are inconsistent.
+    """
+    return append_confirmed_window_to_persistent_cache(
+        model,
+        window,
+        persistent_cache,
+    )
 
 
 def _append_fixed_inputs(

@@ -69,6 +69,74 @@ def forward_kl_loss(
         TypeError: If rejection_position is not an integer or None.
         ValueError: If inputs or rejection_position are invalid.
     """
+    _validate_distillation_inputs(
+        student_logits,
+        teacher_probabilities,
+    )
+
+    draft_length = student_logits.shape[0]
+    position_weights = _make_position_weights(
+        draft_length=draft_length,
+        rejection_position=rejection_position,
+        device=student_logits.device,
+    )
+
+    return _compute_weighted_forward_kl(
+        student_logits=student_logits,
+        teacher_probabilities=teacher_probabilities,
+        position_weights=position_weights,
+    )
+
+
+def window_forward_kl_loss(
+    student_logits: torch.Tensor,
+    teacher_probabilities: torch.Tensor,
+    rejection_target_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute forward KL for selected targets from multiple rounds.
+
+    The caller selects supervised hidden-state rows before the LM head,
+    so student and teacher rows are already aligned. Multiple positions
+    may be marked as rejected because one window may contain many rounds.
+
+    Args:
+        student_logits: Selected draft logits shaped
+            [target_count, draft_vocab_size].
+        teacher_probabilities: Teacher probabilities with the same shape.
+        rejection_target_mask: Boolean rejection markers shaped
+            [target_count].
+
+    Returns:
+        A scalar FP32 rejection-weighted forward-KL loss.
+
+    Raises:
+        ValueError: If tensor shapes, dtypes, or devices are invalid.
+    """
+    _validate_distillation_inputs(
+        student_logits,
+        teacher_probabilities,
+    )
+
+    if rejection_target_mask.shape != student_logits.shape[:1]:
+        raise ValueError("rejection_target_mask must match the student token count")
+    if rejection_target_mask.dtype != torch.bool:
+        raise ValueError("rejection_target_mask must use torch.bool")
+    if rejection_target_mask.device != student_logits.device:
+        raise ValueError("rejection mask and student logits must use the same device")
+
+    position_weights = _make_masked_position_weights(rejection_target_mask)
+
+    return _compute_weighted_forward_kl(
+        student_logits=student_logits,
+        teacher_probabilities=teacher_probabilities,
+        position_weights=position_weights,
+    )
+
+
+def _validate_distillation_inputs(
+    student_logits: torch.Tensor,
+    teacher_probabilities: torch.Tensor,
+) -> None:
     if (
         student_logits.ndim != 2
         or student_logits.shape != teacher_probabilities.shape
@@ -76,7 +144,7 @@ def forward_kl_loss(
     ):
         raise ValueError(
             "student and teacher must have matching nonempty "
-            "[draft_length, vocabulary] shapes"
+            "[tokens, vocabulary] shapes"
         )
     if not student_logits.is_floating_point():
         raise ValueError("student_logits must be floating point")
@@ -87,13 +155,13 @@ def forward_kl_loss(
             "student logits and teacher probabilities must use the same device"
         )
 
-    draft_length = student_logits.shape[0]
-    position_weights = _make_position_weights(
-        draft_length=draft_length,
-        rejection_position=rejection_position,
-        device=student_logits.device,
-    )
 
+def _compute_weighted_forward_kl(
+    *,
+    student_logits: torch.Tensor,
+    teacher_probabilities: torch.Tensor,
+    position_weights: torch.Tensor,
+) -> torch.Tensor:
     teacher = teacher_probabilities.detach().float()
 
     if not torch.isfinite(teacher).all():
@@ -138,14 +206,27 @@ def _make_position_weights(
         if not 0 <= rejection_position < draft_length:
             raise ValueError("rejection_position must be within the draft sequence")
 
-    weights = torch.full(
+    rejection_target_mask = torch.zeros(
         (draft_length,),
-        _POSITION_WEIGHT,
-        dtype=torch.float32,
+        dtype=torch.bool,
         device=device,
     )
 
     if rejection_position is not None:
-        weights[rejection_position] = _REJECTION_POSITION_WEIGHT
+        rejection_target_mask[rejection_position] = True
+
+    return _make_masked_position_weights(rejection_target_mask)
+
+
+def _make_masked_position_weights(
+    rejection_target_mask: torch.Tensor,
+) -> torch.Tensor:
+    weights = torch.full(
+        rejection_target_mask.shape,
+        _POSITION_WEIGHT,
+        dtype=torch.float32,
+        device=rejection_target_mask.device,
+    )
+    weights[rejection_target_mask] = _REJECTION_POSITION_WEIGHT
 
     return weights
