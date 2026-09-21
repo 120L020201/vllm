@@ -2,13 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+class Eagle3AttentionBackend(StrEnum):
+    """Attention implementations supported by the CPU training model."""
+
+    EAGER = "eager"
+    FLASH_ATTENTION = "flash_attention"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +38,7 @@ class Qwen3Eagle3Config:
     norm_output: bool = False
     num_aux_hidden_states: int = 3
     fc_norm: bool = False
+    attention_backend: Eagle3AttentionBackend = Eagle3AttentionBackend.EAGER
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -63,6 +73,8 @@ class Qwen3Eagle3Config:
             raise ValueError("rms_norm_eps must be greater than zero")
         if self.rope_theta <= 0:
             raise ValueError("rope_theta must be greater than zero")
+        if not isinstance(self.attention_backend, Eagle3AttentionBackend):
+            raise TypeError("attention_backend must be an Eagle3AttentionBackend")
 
     @classmethod
     def from_dict(
@@ -127,6 +139,12 @@ class Qwen3Eagle3Config:
                     values.get("fc_norm", False),
                 )
             ),
+            attention_backend=_parse_attention_backend(
+                values.get(
+                    "attention_backend",
+                    Eagle3AttentionBackend.EAGER,
+                )
+            ),
         )
 
 
@@ -148,6 +166,21 @@ def _get_num_aux_hidden_states(
     if not isinstance(aux_layer_ids, (list, tuple)):
         raise TypeError("eagle_aux_hidden_state_layer_ids must be a list or tuple")
     return len(aux_layer_ids)
+
+
+def _parse_attention_backend(
+    value: object,
+) -> Eagle3AttentionBackend:
+    if isinstance(value, Eagle3AttentionBackend):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("attention_backend must be a string")
+
+    try:
+        return Eagle3AttentionBackend(value)
+    except ValueError as error:
+        supported = ", ".join(backend.value for backend in Eagle3AttentionBackend)
+        raise ValueError(f"attention_backend must be one of: {supported}") from error
 
 
 class Qwen3Eagle3RMSNorm(nn.Module):
@@ -270,6 +303,7 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.rope_theta = config.rope_theta
+        self.attention_backend = config.attention_backend
 
         query_size = self.num_attention_heads * self.head_dim
         key_value_size = self.num_key_value_heads * self.head_dim
@@ -291,6 +325,7 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         past_key_value: Eagle3LayerKVCache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, Eagle3LayerKVCache]:
         if hidden_states.ndim != 2:
             raise ValueError("hidden_states must have shape [tokens, input_size]")
@@ -362,35 +397,31 @@ class Qwen3Eagle3SelfAttention(nn.Module):
             attention_key = key
             attention_value = value
 
-        attention_scores = torch.matmul(
-            query,
-            attention_key.transpose(-1, -2),
-        )
-        attention_scores = attention_scores * (self.head_dim**-0.5)
-
         total_key_length = past_length + sequence_length
-        causal_mask = torch.triu(
-            torch.ones(
-                sequence_length,
-                total_key_length,
-                dtype=torch.bool,
-                device=attention_scores.device,
-            ),
-            diagonal=past_length + 1,
-        )
-        attention_scores = attention_scores.masked_fill(
-            causal_mask,
-            torch.finfo(attention_scores.dtype).min,
-        )
+        if attention_mask is None:
+            blocked_attention_mask = torch.triu(
+                torch.ones(
+                    sequence_length,
+                    total_key_length,
+                    dtype=torch.bool,
+                    device=query.device,
+                ),
+                diagonal=past_length + 1,
+            )
+        else:
+            self._validate_attention_mask(
+                attention_mask,
+                sequence_length=sequence_length,
+                total_key_length=total_key_length,
+                device=query.device,
+            )
+            blocked_attention_mask = attention_mask
 
-        attention_weights = torch.softmax(
-            attention_scores.float(),
-            dim=-1,
-        ).to(dtype=attention_value.dtype)
-
-        attention_output = torch.matmul(
-            attention_weights,
-            attention_value,
+        attention_output = self._compute_attention(
+            query=query,
+            key=attention_key,
+            value=attention_value,
+            blocked_attention_mask=blocked_attention_mask,
         )
         attention_output = attention_output.transpose(
             0,
@@ -398,6 +429,77 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         ).reshape(sequence_length, self.hidden_size)
 
         return self.o_proj(attention_output), present_key_value
+
+    def _compute_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        blocked_attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION:
+            # SDPA uses the opposite boolean convention: True entries are
+            # visible. A batch dimension is required by the fused kernel.
+            allowed_attention_mask = ~blocked_attention_mask
+
+            try:
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    output = F.scaled_dot_product_attention(
+                        query.unsqueeze(0),
+                        key.unsqueeze(0),
+                        value.unsqueeze(0),
+                        attn_mask=allowed_attention_mask,
+                        dropout_p=0.0,
+                    )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    "flash attention is unavailable for the current "
+                    "device, dtype, or mask"
+                ) from error
+
+            return output.squeeze(0)
+
+        attention_scores = torch.matmul(
+            query,
+            key.transpose(-1, -2),
+        )
+        attention_scores = attention_scores * (self.head_dim**-0.5)
+        attention_scores = attention_scores.masked_fill(
+            blocked_attention_mask,
+            torch.finfo(attention_scores.dtype).min,
+        )
+        attention_weights = torch.softmax(
+            attention_scores.float(),
+            dim=-1,
+        ).to(dtype=value.dtype)
+
+        return torch.matmul(
+            attention_weights,
+            value,
+        )
+
+    def _validate_attention_mask(
+        self,
+        attention_mask: torch.Tensor,
+        *,
+        sequence_length: int,
+        total_key_length: int,
+        device: torch.device,
+    ) -> None:
+        if attention_mask.shape != (
+            sequence_length,
+            total_key_length,
+        ):
+            raise ValueError(
+                "attention_mask must have shape [query_tokens, key_tokens]"
+            )
+        if attention_mask.dtype != torch.bool:
+            raise ValueError("attention_mask must use torch.bool")
+        if attention_mask.device != device:
+            raise ValueError("attention_mask must use the attention device")
+        if not torch.all((~attention_mask).any(dim=-1)):
+            raise ValueError("every attention query must have at least one visible key")
 
     def _validate_past_key_value(
         self,
@@ -506,6 +608,7 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         past_key_value: Eagle3LayerKVCache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -547,6 +650,7 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
             hidden_states,
             positions,
             past_key_value,
+            attention_mask,
         )
 
         normalized = self.post_attention_layernorm(
@@ -714,6 +818,7 @@ class Qwen3Eagle3Model(nn.Module):
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         past_key_values: Eagle3KVCache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> Eagle3ForwardOutput:
         self._validate_inputs(
             positions,
@@ -737,6 +842,7 @@ class Qwen3Eagle3Model(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 past_key_value=past_key_value,
+                attention_mask=attention_mask,
             )
             present_key_values.append(present_key_value)
 
@@ -816,12 +922,14 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         past_key_values: Eagle3KVCache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> Eagle3ForwardOutput:
         return self.model(
             positions=positions,
             input_embeds=input_embeds,
             hidden_states=hidden_states,
             past_key_values=past_key_values,
+            attention_mask=attention_mask,
         )
 
     def combine_hidden_states(
@@ -941,12 +1049,15 @@ def load_qwen3_eagle3_checkpoint(
     model_directory: str | Path,
     *,
     dtype: torch.dtype = torch.float32,
+    attention_backend: Eagle3AttentionBackend | str | None = None,
 ) -> Qwen3Eagle3ForCausalLM:
     """Load an AngelSlim Qwen3 EAGLE3 checkpoint.
 
     Args:
         model_directory: Directory containing config.json and model weights.
         dtype: Floating-point dtype used by the loaded model.
+        attention_backend: Optional runtime override for the attention
+            implementation stored in config.json.
 
     Returns:
         A model with converted checkpoint weights.
@@ -962,6 +1073,12 @@ def load_qwen3_eagle3_checkpoint(
         raise TypeError("config.json must contain a JSON object")
 
     config = Qwen3Eagle3Config.from_dict(raw_config)
+    if attention_backend is not None:
+        config = replace(
+            config,
+            attention_backend=_parse_attention_backend(attention_backend),
+        )
+
     model = Qwen3Eagle3ForCausalLM(config)
     model.to(dtype=dtype)
 

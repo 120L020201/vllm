@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .qwen3_eagle3 import (
+    Eagle3AttentionBackend,
     Eagle3ForwardOutput,
     Eagle3KVCache,
     Qwen3Eagle3Config,
@@ -11,6 +12,7 @@ from .qwen3_eagle3 import (
 )
 
 __all__ = [
+    "Eagle3AttentionBackend",
     "Eagle3ForwardOutput",
     "Eagle3KVCache",
     "Qwen3Eagle3Config",

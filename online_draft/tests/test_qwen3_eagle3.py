@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 from online_draft.models.qwen3_eagle3 import (
+    Eagle3AttentionBackend,
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
     convert_angelslim_eagle3_state_dict,
@@ -67,6 +68,25 @@ def test_config_from_dict() -> None:
     assert config.num_aux_hidden_states == 3
     assert config.target_vocab_size == 151936
     assert config.draft_vocab_size == 32000
+    assert config.attention_backend is Eagle3AttentionBackend.EAGER
+
+
+def test_config_parses_flash_attention_backend() -> None:
+    config = Qwen3Eagle3Config.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 2,
+            "num_hidden_layers": 1,
+            "vocab_size": 10,
+            "draft_vocab_size": 6,
+            "attention_backend": "flash_attention",
+        }
+    )
+
+    assert config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
 
 
 def test_checkpoint_conversion() -> None:
@@ -291,3 +311,11 @@ def test_load_checkpoint_from_directory(tmp_path: Path) -> None:
             loaded_state_dict[name],
             expected_tensor,
         )
+
+    flash_model = load_qwen3_eagle3_checkpoint(
+        tmp_path,
+        attention_backend="flash_attention",
+    )
+    assert (
+        flash_model.config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
+    )
