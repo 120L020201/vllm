@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 import torch
 from online_draft.models.qwen3_eagle3 import (
     Eagle3AttentionBackend,
@@ -11,6 +12,7 @@ from online_draft.models.qwen3_eagle3 import (
     convert_angelslim_eagle3_state_dict,
     load_qwen3_eagle3_checkpoint,
 )
+from safetensors.torch import save_file
 
 
 def _make_config() -> Qwen3Eagle3Config:
@@ -87,6 +89,31 @@ def test_config_parses_flash_attention_backend() -> None:
     )
 
     assert config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
+
+
+def test_attention_supports_query_width_different_from_hidden_size() -> None:
+    config = Qwen3Eagle3Config(
+        hidden_size=4,
+        intermediate_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_hidden_layers=1,
+        target_vocab_size=10,
+        draft_vocab_size=6,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+    )
+    model = Qwen3Eagle3ForCausalLM(config)
+    attention = model.model.layers[0].self_attn
+
+    assert attention.o_proj.weight.shape == (4, 8)
+    output = model(
+        positions=torch.arange(2),
+        input_embeds=torch.randn(2, 4),
+        hidden_states=torch.randn(2, 4),
+    )
+    assert output.hidden_states.shape == (2, 4)
 
 
 def test_checkpoint_conversion() -> None:
@@ -273,7 +300,8 @@ def test_bfloat16_training_step() -> None:
         assert state["step"].dtype == torch.float32
 
 
-def test_load_checkpoint_from_directory(tmp_path: Path) -> None:
+@pytest.mark.parametrize("checkpoint_format", ["bin", "safetensors"])
+def test_load_checkpoint_from_directory(tmp_path: Path, checkpoint_format: str) -> None:
     torch.manual_seed(3)
 
     raw_config = {
@@ -294,10 +322,10 @@ def test_load_checkpoint_from_directory(tmp_path: Path) -> None:
         json.dumps(raw_config),
         encoding="utf-8",
     )
-    torch.save(
-        source_state_dict,
-        tmp_path / "pytorch_model.bin",
-    )
+    if checkpoint_format == "safetensors":
+        save_file(source_state_dict, tmp_path / "model.safetensors")
+    else:
+        torch.save(source_state_dict, tmp_path / "pytorch_model.bin")
 
     model = load_qwen3_eagle3_checkpoint(tmp_path)
     expected_state_dict = convert_angelslim_eagle3_state_dict(source_state_dict)

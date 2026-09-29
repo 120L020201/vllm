@@ -176,7 +176,19 @@ def _compute_weighted_forward_kl(
         atol=1e-5,
         rtol=1e-5,
     ):
-        raise ValueError("teacher probabilities must sum to one")
+        bad = ~torch.isclose(
+            probability_sums,
+            torch.ones_like(probability_sums),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        raise ValueError(
+            "teacher probabilities must sum to one: "
+            f"bad_rows={bad.nonzero().flatten().tolist()}, "
+            f"bad_sums={probability_sums[bad].tolist()}, "
+            f"bad_sums64={teacher.sum(dim=-1, dtype=torch.float64)[bad].tolist()}, "
+            f"shape={tuple(teacher.shape)}, dtype={teacher.dtype}"
+        )
 
     elementwise_kl = F.kl_div(
         F.log_softmax(student_logits.float(), dim=-1),

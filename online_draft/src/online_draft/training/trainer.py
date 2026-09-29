@@ -8,6 +8,11 @@ import torch
 import torch.nn as nn
 
 
+@torch.compile(fullgraph=True)
+def _gradients_are_finite(gradients: list[torch.Tensor]) -> torch.Tensor:
+    return torch.stack([torch.isfinite(gradient).all() for gradient in gradients]).all()
+
+
 @dataclass(frozen=True, slots=True)
 class TrainerConfig:
     """Settings for one online draft trainer."""
@@ -109,11 +114,13 @@ class DraftTrainer:
                 raise ValueError("loss is not connected to any trainable parameter")
 
             if self.config.check_gradients:
-                nonfinite_names = self._nonfinite_gradient_names()
-                if nonfinite_names:
-                    raise ValueError(
-                        "nonfinite gradients: " + ", ".join(nonfinite_names)
-                    )
+                gradients = [
+                    parameter.grad
+                    for _, parameter in self._trainable_named_parameters
+                    if parameter.grad is not None
+                ]
+                if gradients and not _gradients_are_finite(gradients).item():
+                    raise ValueError("nonfinite gradients")
 
             self.optimizer.step()
         except Exception:

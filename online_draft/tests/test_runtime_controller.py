@@ -364,7 +364,8 @@ def test_finish_discards_tail_and_reused_id_requires_new_generation() -> None:
     assert controller.request_state.request_generation == 1
 
 
-def test_controller_executes_real_training_stack() -> None:
+@pytest.mark.parametrize("window_size", [1, 2, 3])
+def test_controller_executes_real_training_stack(window_size: int) -> None:
     model = Qwen3Eagle3ForCausalLM(
         Qwen3Eagle3Config(
             hidden_size=HIDDEN_SIZE,
@@ -388,32 +389,32 @@ def test_controller_executes_real_training_stack() -> None:
     )
     controller = Eagle3SyncController(
         executor,
-        Eagle3ControllerConfig(window_size=2),
+        Eagle3ControllerConfig(window_size=window_size),
     )
     controller.start_request(
         request_id="request-1",
         request_generation=0,
     )
 
-    first_result = controller.observe(
-        _make_observation(
-            step_id=0,
-            anchor_position=1,
-            full_prompt=True,
+    results = [
+        controller.observe(
+            _make_observation(
+                step_id=step,
+                anchor_position=step + 1,
+                full_prompt=step == 0,
+                source_weight_version=0,
+            )
         )
-    )
-    result = controller.observe(
-        _make_observation(
-            step_id=1,
-            anchor_position=2,
-        )
-    )
+        for step in range(window_size)
+    ]
 
-    assert first_result is None
+    assert results[:-1] == [None] * (window_size - 1)
+    result = results[-1]
     assert result is not None
     assert result.status is Eagle3TrainStatus.SUCCEEDED
     assert result.cpu_start_version == 0
     assert result.cpu_end_version == 1
+    assert result.source_weight_versions == (0,) * window_size
     assert controller.request_state is not None
-    assert controller.request_state.last_consumed_step_id == 1
-    assert controller.request_state.cache_length == 4
+    assert controller.request_state.last_consumed_step_id == window_size - 1
+    assert controller.request_state.cache_length == window_size + 2

@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
@@ -61,8 +62,6 @@ class Qwen3Eagle3Config:
             raise ValueError("draft_vocab_size must not exceed target_vocab_size")
         if self.num_aux_hidden_states <= 0:
             raise ValueError("num_aux_hidden_states must be greater than zero")
-        if self.hidden_size != self.num_attention_heads * self.head_dim:
-            raise ValueError("hidden_size must equal num_attention_heads * head_dim")
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
                 "num_attention_heads must be divisible by num_key_value_heads"
@@ -315,7 +314,7 @@ class Qwen3Eagle3SelfAttention(nn.Module):
             bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            self.hidden_size,
+            query_size,
             self.hidden_size,
             bias=False,
         )
@@ -426,7 +425,7 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         attention_output = attention_output.transpose(
             0,
             1,
-        ).reshape(sequence_length, self.hidden_size)
+        ).reshape(sequence_length, query_size)
 
         return self.o_proj(attention_output), present_key_value
 
@@ -1064,7 +1063,7 @@ def load_qwen3_eagle3_checkpoint(
     """
     model_path = Path(model_directory)
     config_path = model_path / "config.json"
-    checkpoint_path = model_path / "pytorch_model.bin"
+    safetensors_path = model_path / "model.safetensors"
 
     with config_path.open(encoding="utf-8") as config_file:
         raw_config = json.load(config_file)
@@ -1082,12 +1081,15 @@ def load_qwen3_eagle3_checkpoint(
     model = Qwen3Eagle3ForCausalLM(config)
     model.to(dtype=dtype)
 
-    source_state_dict = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=True,
-        mmap=True,
-    )
+    if safetensors_path.is_file():
+        source_state_dict = load_file(safetensors_path, device="cpu")
+    else:
+        source_state_dict = torch.load(
+            model_path / "pytorch_model.bin",
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
     if not isinstance(source_state_dict, Mapping):
         raise TypeError("checkpoint must contain a state dictionary")
 
