@@ -90,3 +90,30 @@ the next request; on this machine the 8B draft can add tens of seconds at that
 boundary. `--update-stride` trades adaptation frequency for lower CPU cost.
 
 Tests: `.venv/bin/python -m pytest methods/tests -v`.
+
+## `script/run.sh` compatibility
+
+The repository also includes `script/run.sh` for the long-running `nohup env ...`
+workflow. It accepts `base`, `eagle3`, `tts`, and `ospec`, starts the server,
+waits for `/health`, sends every prompt in `BENCHMARKS` to the completions API,
+and writes incremental JSONL output. The benchmark files are read as
+`$DATA_DIR/<benchmark>.jsonl`.
+
+The names in the example command are supported directly when these files are
+present: `aime2025.jsonl`, `gpqa_diamond.jsonl`, and
+`livecodebench_v6_hard.jsonl`. The local prepared datasets use different names
+(`aime2026`, `livecodebench_lite`), so set `BENCHMARKS` to the files you have.
+
+The script maps `TTS_UPDATE_STRIDE`, `TTS_LEARNING_RATE`,
+`TTS_RESET_PER_REQUEST`, and `CHUNK_SIZE` to the method launcher. `D_TEMPERATURE`
+is accepted for command compatibility but EAGLE3 drafts remain greedy. Online
+training is intentionally single-request ordered; `BATCH_SIZE=2` is recorded as
+a warning rather than enabling two concurrent requests. `OSPEC_TRAIN_MAX_LEN`
+and `UPDATE_DELAY` are also accepted with warnings because the current runtime
+does not truncate training prompts or defer updates.
+
+Every `script/run.sh` mode enforces the same GPU policy: `MAX_GPU_MEMORY_GIB`
+defaults to 24, with `GPU_MEMORY_HEADROOM_GIB=2` reserved for CUDA/runtime
+overhead. `MONITOR=1` writes periodic `nvidia-smi` samples to
+`<output>.gpu.csv`; `NSYS` is accepted but profiler wrapping is not implemented.
+Use `DRY_RUN=1` to inspect the resolved server command without starting it.
