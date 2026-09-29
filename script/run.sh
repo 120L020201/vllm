@@ -17,7 +17,7 @@ EA_MODEL_PATH_1=${EA_MODEL_PATH_1:-$SPEC_MODEL}
 PORT=${PORT:-8000}
 HOST=${HOST:-127.0.0.1}
 MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS:-32768}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-49152}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-$MAX_MODEL_LEN}
 MAX_PROMPT_TOKENS=${MAX_PROMPT_TOKENS:-$((MAX_MODEL_LEN - MAX_OUTPUT_TOKENS))}
 SPEC_TOKENS=${SPEC_TOKENS:-7}
@@ -25,7 +25,7 @@ TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:-20}
 D_TEMPERATURE=${D_TEMPERATURE:-0}
-MAX_GPU_MEMORY_GIB=${MAX_GPU_MEMORY_GIB:-24}
+MAX_GPU_MEMORY_GIB=${MAX_GPU_MEMORY_GIB:-}
 GPU_MEMORY_HEADROOM_GIB=${GPU_MEMORY_HEADROOM_GIB:-2}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 MONITOR=${MONITOR:-0}
@@ -70,6 +70,14 @@ MODEL=${MODEL:-$BASE_MODEL_PATH}
 BASE_MODEL_PATH=${BASE_MODEL_PATH:-$MODEL}
 [[ -d "$MODEL" ]] || die "model directory does not exist: $MODEL"
 [[ -d "$DATA_DIR" ]] || die "DATA_DIR does not exist: $DATA_DIR"
+model_name=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
+if [[ -z "$MAX_GPU_MEMORY_GIB" ]]; then
+  case "$model_name" in
+    *4b*) MAX_GPU_MEMORY_GIB=24 ;;
+    *8b*) MAX_GPU_MEMORY_GIB=32 ;;
+    *) die "cannot infer 4B/8B memory limit from MODEL; set MAX_GPU_MEMORY_GIB" ;;
+  esac
+fi
 [[ "$MAX_GPU_MEMORY_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "MAX_GPU_MEMORY_GIB must be numeric"
 [[ "$GPU_MEMORY_HEADROOM_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "GPU_MEMORY_HEADROOM_GIB must be numeric"
 ((MAX_PROMPT_TOKENS > 0)) || die "MAX_MODEL_LEN must exceed MAX_OUTPUT_TOKENS"
@@ -95,6 +103,10 @@ if [[ -n "$OSPEC_TRAIN_MAX_LEN" ]]; then
 fi
 if [[ "$D_TEMPERATURE" != 0 && "$METHOD" != base ]]; then
   echo "warning: D_TEMPERATURE=$D_TEMPERATURE is ignored; the EAGLE3 draft sampler is greedy" >&2
+fi
+if ((MAX_MODEL_LEN > 40960)); then
+  export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+  echo "warning: using Qwen3 RoPE extrapolation from 40960 to $MAX_MODEL_LEN tokens" >&2
 fi
 
 mkdir -p "$OUTPUT_DIR"

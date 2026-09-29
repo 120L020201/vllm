@@ -21,9 +21,9 @@ Each command runs one server in the foreground. Use the same OpenAI-compatible
 Use `--model-size 4b` or `--model-size 8b` to select a prepared target/draft
 pair. `--target` and `--draft` override either checkpoint location. Defaults
 are the 8B pair under `methods/artifacts`, BF16, seven draft tokens, context
-length 4176, and one concurrent request. The launcher caps vLLM at 24 GiB of
-the first visible GPU by default, even if `--gpu-memory-utilization` requests
-more. The vLLM budget reserves 2 GiB below that cap for CUDA runtime overhead;
+length 4176, and one concurrent request. The launcher caps Qwen3-4B at 24 GiB
+and Qwen3-8B at 32 GiB by default, even if `--gpu-memory-utilization` requests
+more. The vLLM budget reserves 2 GiB below either cap for CUDA runtime overhead;
 lower the cap with `--max-gpu-memory-gib` when needed. `--dry-run` displays the
 command without starting the server. For training, CPU snapshots are published
 to the GPU draft between decoding steps. CPU training uses up to 20 PyTorch
@@ -129,10 +129,11 @@ the base method. `updates` is the number of completed CPU optimizer steps,
 `tokens` is the completion token count, and time includes waiting for queued
 CPU updates belonging to the request.
 
-With the default `MAX_OUTPUT_TOKENS=32768`, the run script uses Qwen3's 40960
-token context and left-truncates prompts to 8192 tokens. This still evaluates
-all 503 LongBench v2 examples; increase `MAX_MODEL_LEN`/`MAX_PROMPT_TOKENS` only
-when the selected model and the 24 GiB memory limit permit it.
+With the default `MAX_OUTPUT_TOKENS=32768`, the run script uses a 49152-token
+context and left-truncates prompts to 16384 tokens. Qwen3 natively declares
+40960 tokens, so the extra 8192 tokens use vLLM's explicit long-context override
+and RoPE extrapolation. This evaluates all 503 LongBench v2 examples; quality in
+the extrapolated region must be confirmed by the benchmark results.
 
 The script maps `TTS_UPDATE_STRIDE`, `TTS_LEARNING_RATE`,
 `TTS_RESET_PER_REQUEST`, and `CHUNK_SIZE` to the method launcher. `D_TEMPERATURE`
@@ -142,8 +143,10 @@ a warning rather than enabling two concurrent requests. `OSPEC_TRAIN_MAX_LEN`
 and `UPDATE_DELAY` are also accepted with warnings because the current runtime
 does not truncate training prompts or defer updates.
 
-Every `script/run.sh` mode enforces the same GPU policy: `MAX_GPU_MEMORY_GIB`
-defaults to 24, with `GPU_MEMORY_HEADROOM_GIB=2` reserved for CUDA/runtime
-overhead. `MONITOR=1` writes periodic `nvidia-smi` samples to
+Every `script/run.sh` mode enforces a model-sized GPU policy: Qwen3-4B defaults
+to a 24 GiB hard limit and Qwen3-8B defaults to 32 GiB. In both cases,
+`GPU_MEMORY_HEADROOM_GIB=2` is reserved for CUDA/runtime overhead. Override
+`MAX_GPU_MEMORY_GIB` explicitly for nonstandard model directory names.
+`MONITOR=1` writes periodic `nvidia-smi` samples to
 `<output>.gpu.csv`; `NSYS` is accepted but profiler wrapping is not implemented.
 Use `DRY_RUN=1` to inspect the resolved server command without starting it.

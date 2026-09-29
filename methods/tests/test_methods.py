@@ -130,6 +130,26 @@ class LauncherTest(unittest.TestCase):
 
         self.assertEqual(utilization, 22 / 48)
 
+    def test_model_size_selects_memory_limit(self):
+        properties = SimpleNamespace(total_memory=48 * 2**30)
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_properties", return_value=properties),
+        ):
+            args_4b = build_parser().parse_args(
+                ("eagle", "--model-size", "4b", "--dry-run")
+            )
+            args_8b = build_parser().parse_args(
+                ("eagle", "--model-size", "8b", "--dry-run")
+            )
+            command_4b, _ = configure(args_4b)
+            command_8b, _ = configure(args_8b)
+
+        index_4b = command_4b.index("--gpu-memory-utilization") + 1
+        index_8b = command_8b.index("--gpu-memory-utilization") + 1
+        self.assertEqual(float(command_4b[index_4b]), 22 / 48)
+        self.assertEqual(float(command_8b[index_8b]), 30 / 48)
+
     def test_warmup_with_no_preemptions_has_no_resets(self):
         scheduler_output = SimpleNamespace(
             finished_req_ids=set(),

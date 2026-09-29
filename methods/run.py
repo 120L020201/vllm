@@ -36,7 +36,7 @@ def build_parser():
     parser.add_argument("--spec-tokens", type=int, default=7)
     parser.add_argument("--max-model-len", type=int, default=4176)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--max-gpu-memory-gib", type=float, default=24.0)
+    parser.add_argument("--max-gpu-memory-gib", type=float)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--torch-threads", type=int, default=DEFAULT_TORCH_THREADS)
     parser.add_argument("--update-stride", type=int, default=1)
@@ -71,7 +71,10 @@ def configure(args):
         raise ValueError("learning rate must be positive and epsilon nonnegative")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu memory utilization must be in (0,1]")
-    if not math.isfinite(args.max_gpu_memory_gib) or args.max_gpu_memory_gib <= 0:
+    max_gpu_memory_gib = args.max_gpu_memory_gib or (
+        24.0 if args.model_size == "4b" else 32.0
+    )
+    if not math.isfinite(max_gpu_memory_gib) or max_gpu_memory_gib <= 0:
         raise ValueError("max GPU memory must be finite and positive")
     rates = [float(rate) for rate in args.ensemble_lrs.split(",")]
     if len(rates) != 3 or any(not math.isfinite(rate) or rate <= 0 for rate in rates):
@@ -88,7 +91,7 @@ def configure(args):
                 raise FileNotFoundError(path)
     gpu_memory_utilization = _capped_gpu_memory_utilization(
         args.gpu_memory_utilization,
-        args.max_gpu_memory_gib,
+        max_gpu_memory_gib,
         require_gpu=not args.dry_run,
     )
     env = os.environ.copy()
