@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from online_draft.models.qwen3_eagle3 import (
@@ -34,6 +35,12 @@ from methods.run import (
     configure,
 )
 from methods.utils.factory import _request_ids_to_reset
+from methods.utils.stats import WorkerStats
+from script.benchmark import (
+    _acceptance_length,
+    _completion_tokens,
+    _fetch_spec_metrics,
+)
 
 
 def _make_trainer(learning_rate=1e-2):
@@ -233,6 +240,49 @@ class PreparationTest(unittest.TestCase):
         self.assertEqual(calls[0]["revision"], "def")
         self.assertEqual(calls[0]["max_workers"], 2)
         self.assertIn('"repo_id": "example/model"', manifest)
+
+
+class BenchmarkLoggingTest(unittest.TestCase):
+    def test_acceptance_length_uses_counter_delta(self):
+        before = {"drafts": 10, "draft_tokens": 70, "accepted_tokens": 20}
+        after = {"drafts": 18, "draft_tokens": 126, "accepted_tokens": 35}
+
+        self.assertEqual(_acceptance_length(before, after), 2.875)
+        self.assertEqual(_acceptance_length(None, None), 1.0)
+
+    def test_completion_tokens_uses_api_usage(self):
+        response = {"usage": {"completion_tokens": 24987}}
+
+        self.assertEqual(_completion_tokens(response), 24987)
+
+    def test_worker_stats_are_written_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stats.json"
+            with patch.dict(os.environ, {"OSD_STATS_FILE": str(path)}):
+                stats = WorkerStats()
+                stats.enqueue()
+                stats.complete(3)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload, {"pending": 0, "updates": 3})
+
+    def test_metrics_parser_ignores_per_position_counters(self):
+        metrics = """\
+vllm:spec_decode_num_drafts_total{engine="0"} 8
+vllm:spec_decode_num_draft_tokens_total{engine="0"} 56
+vllm:spec_decode_num_accepted_tokens_total{engine="0"} 15
+vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 7
+"""
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = metrics.encode()
+
+        with patch("urllib.request.urlopen", return_value=response):
+            parsed = _fetch_spec_metrics("http://example")
+
+        self.assertEqual(
+            parsed,
+            {"drafts": 8, "draft_tokens": 56, "accepted_tokens": 15},
+        )
 
 
 class PolicyTest(unittest.TestCase):

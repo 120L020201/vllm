@@ -9,7 +9,7 @@ cd "$ROOT_DIR"
 METHOD=${1:-}
 PYTHON_BIN=${PYTHON_BIN:-${VIRTUAL_ENV:-$ROOT_DIR/.venv}/bin/python}
 DATA_DIR=${DATA_DIR:-$ROOT_DIR/methods/artifacts/datasets}
-BENCHMARKS=${BENCHMARKS:-aime2026 gpqa_diamond livecodebench_lite}
+BENCHMARKS=${BENCHMARKS:-aime2026 gpqa_diamond mmlu-pro-computer_science livecodebench-lite LongBench-v2}
 MODEL=${MODEL:-}
 SPEC_MODEL=${SPEC_MODEL:-}
 BASE_MODEL_PATH=${BASE_MODEL_PATH:-$MODEL}
@@ -17,8 +17,9 @@ EA_MODEL_PATH_1=${EA_MODEL_PATH_1:-$SPEC_MODEL}
 PORT=${PORT:-8000}
 HOST=${HOST:-127.0.0.1}
 MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS:-32768}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-$MAX_MODEL_LEN}
+MAX_PROMPT_TOKENS=${MAX_PROMPT_TOKENS:-$((MAX_MODEL_LEN - MAX_OUTPUT_TOKENS))}
 SPEC_TOKENS=${SPEC_TOKENS:-7}
 TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.95}
@@ -33,6 +34,7 @@ NSYS=${NSYS:-0}
 OUTPUT_DIR=${OUTPUT_DIR:-results}
 OUTPUT_FILE=${OUTPUT_FILE:-$OUTPUT_DIR/${METHOD:-run}.jsonl}
 SERVER_LOG=${SERVER_LOG:-$OUTPUT_DIR/${METHOD:-run}.server.log}
+STATS_FILE=${STATS_FILE:-$OUTPUT_DIR/${METHOD:-run}.stats.json}
 UPDATE_DELAY=${UPDATE_DELAY:-0}
 BATCH_SIZE=${BATCH_SIZE:-1}
 OSPEC_TRAIN_MAX_LEN=${OSPEC_TRAIN_MAX_LEN:-}
@@ -70,6 +72,7 @@ BASE_MODEL_PATH=${BASE_MODEL_PATH:-$MODEL}
 [[ -d "$DATA_DIR" ]] || die "DATA_DIR does not exist: $DATA_DIR"
 [[ "$MAX_GPU_MEMORY_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "MAX_GPU_MEMORY_GIB must be numeric"
 [[ "$GPU_MEMORY_HEADROOM_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "GPU_MEMORY_HEADROOM_GIB must be numeric"
+((MAX_PROMPT_TOKENS > 0)) || die "MAX_MODEL_LEN must exceed MAX_OUTPUT_TOKENS"
 
 if [[ "$METHOD" != base ]]; then
   [[ -n "$SPEC_MODEL" || -n "$EA_MODEL_PATH_1" ]] || die "SPEC_MODEL is required"
@@ -96,6 +99,7 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$(dirname "$OUTPUT_FILE")" "$(dirname "$SERVER_LOG")"
+rm -f "$STATS_FILE"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   total_gpu_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
@@ -127,6 +131,7 @@ if [[ "$METHOD" == base ]]; then
     "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL"
     "${common_server_args[@]}"
   )
+  export OSD_STATS_FILE="$STATS_FILE"
 else
   methods_method=$METHOD
   [[ "$METHOD" == eagle3 ]] && methods_method=eagle
@@ -210,7 +215,9 @@ PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" "$ROOT_DIR/scrip
   --data-dir "$DATA_DIR" \
   --benchmarks "$BENCHMARKS" \
   --max-output-tokens "$MAX_OUTPUT_TOKENS" \
+  --max-prompt-tokens "$MAX_PROMPT_TOKENS" \
   --temperature "$TEMPERATURE" \
   --top-p "$TOP_P" \
   --top-k "$TOP_K" \
+  --stats-file "$STATS_FILE" \
   --output "$OUTPUT_FILE"

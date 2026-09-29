@@ -99,10 +99,40 @@ waits for `/health`, sends every prompt in `BENCHMARKS` to the completions API,
 and writes incremental JSONL output. The benchmark files are read as
 `$DATA_DIR/<benchmark>.jsonl`.
 
-The names in the example command are supported directly when these files are
-present: `aime2025.jsonl`, `gpqa_diamond.jsonl`, and
-`livecodebench_v6_hard.jsonl`. The local prepared datasets use different names
-(`aime2026`, `livecodebench_lite`), so set `BENCHMARKS` to the files you have.
+Prepare the complete benchmark files with:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+  .venv/bin/python script/prepare_datasets.py --output-dir /srv/Datasets/TTS
+```
+
+The command validates the complete official row counts and writes
+`aime2026.jsonl` (30), `gpqa_diamond.jsonl` (198),
+`mmlu-pro-computer_science.jsonl` (410), `livecodebench-lite.jsonl` (1055),
+and `LongBench-v2.jsonl` (503). It refuses to overwrite existing files unless
+`--force` is supplied.
+
+The default benchmark list is:
+
+```text
+aime2026 gpqa_diamond mmlu-pro-computer_science livecodebench-lite LongBench-v2
+```
+
+After every request the foreground experiment log prints:
+
+```text
+aime2026-10: AL=2.825, updates=1105, tokens=24987, time=720.8s, tokens/s=34.67
+```
+
+`AL` is `1 + accepted draft tokens / speculative rounds`, and is `1.000` for
+the base method. `updates` is the number of completed CPU optimizer steps,
+`tokens` is the completion token count, and time includes waiting for queued
+CPU updates belonging to the request.
+
+With the default `MAX_OUTPUT_TOKENS=32768`, the run script uses Qwen3's 40960
+token context and left-truncates prompts to 8192 tokens. This still evaluates
+all 503 LongBench v2 examples; increase `MAX_MODEL_LEN`/`MAX_PROMPT_TOKENS` only
+when the selected model and the 24 GiB memory limit permit it.
 
 The script maps `TTS_UPDATE_STRIDE`, `TTS_LEARNING_RATE`,
 `TTS_RESET_PER_REQUEST`, and `CHUNK_SIZE` to the method launcher. `D_TEMPERATURE`

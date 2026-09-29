@@ -27,6 +27,7 @@ from methods.ospec_common.ensemble import (
 )
 from methods.random_sampling.gating import BernoulliGate
 from methods.tts_common.step import train_batches
+from methods.utils.stats import WorkerStats
 
 logger = logging.getLogger(__name__)
 _DEFAULT_TORCH_THREADS = min(
@@ -113,6 +114,7 @@ class PolicyBridge:
         self._persistent_cache: Eagle3KVCache | None = None
         self._current_request: list[Eagle3DistillationBatch] = []
         self._chunk_requests: list[tuple[Eagle3DistillationBatch, ...]] = []
+        self.stats = WorkerStats()
         self._thread = threading.Thread(
             target=self._work,
             daemon=True,
@@ -133,6 +135,7 @@ class PolicyBridge:
     ) -> None:
         self._check_error()
         if not self._closed:
+            self.stats.enqueue()
             self._inbox.put(TrainObservation(request_id, step_id, batch))
 
     def reset_request(self, request_id: str) -> None:
@@ -160,21 +163,25 @@ class PolicyBridge:
             item = self._inbox.get()
             if item is None:
                 return
+            completed_updates = 0
             try:
                 if torch.get_num_threads() != self.torch_threads:
                     torch.set_num_threads(self.torch_threads)
                 if isinstance(item, TrainObservation):
-                    self._observe(item)
+                    completed_updates = self._observe(item)
                 else:
                     self._reset(item.request_id)
             except Exception as error:
                 logger.exception("%s CPU training failed", self.method)
                 self._error = error
             finally:
+                if isinstance(item, TrainObservation):
+                    self.stats.complete(completed_updates)
                 if isinstance(item, ResetRequest):
                     item.done.set()
 
-    def _observe(self, observation: TrainObservation) -> None:
+    def _observe(self, observation: TrainObservation) -> int:
+        completed_updates = 0
         if self._request_id is None:
             self._request_id = observation.request_id
         if observation.request_id != self._request_id:
@@ -188,7 +195,7 @@ class PolicyBridge:
 
         if self.ensemble is not None:
             self._current_request.append(observation.batch)
-            return
+            return 0
 
         should_train = self._rounds % self.stride == 0
         if self.gate is not None:
@@ -199,6 +206,7 @@ class PolicyBridge:
                 (observation.batch,),
                 persistent_cache=self._persistent_cache,
             )
+            completed_updates = 1
             self._publish(
                 WeightSnapshot(
                     version=self.trainer.version,
@@ -211,6 +219,7 @@ class PolicyBridge:
                 Eagle3TrainingWindow(rounds=(observation.batch,)),
                 self._persistent_cache,
             )
+        return completed_updates
 
     def _reset(self, request_id: str) -> None:
         if self._request_id is not None and request_id != self._request_id:
@@ -225,6 +234,8 @@ class PolicyBridge:
                 snapshot = self.ensemble.update(tuple(self._chunk_requests))
                 if snapshot is not None:
                     self._publish(snapshot)
+                    self.stats.updates += self.ensemble.last_update_steps
+                    self.stats.write()
                 self._chunk_requests.clear()
         elif os.environ.get("OSD_KEEP_WEIGHTS", "0") != "1":
             _load_trainable_state(

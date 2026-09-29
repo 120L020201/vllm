@@ -56,6 +56,7 @@ class ChunkEnsemble:
         self.epsilon = epsilon
         self.cumulative_losses = torch.zeros(3, dtype=torch.float64)
         self.version = 0
+        self.last_update_steps = 0
 
     def update(
         self,
@@ -63,6 +64,9 @@ class ChunkEnsemble:
     ) -> WeightSnapshot | None:
         if not requests:
             return None
+        self.last_update_steps = len(self.learners) * sum(
+            len(batches) for batches in requests
+        )
         for index, learner in enumerate(self.learners):
             for batches in requests:
                 _, losses = train_batches(learner, batches)
