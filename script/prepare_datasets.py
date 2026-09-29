@@ -35,7 +35,7 @@ EXPECTED_ROWS = {
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, default=Path("/srv/Datasets/TTS"))
+    parser.add_argument("--output-dir", type=Path, default=Path("/srv/Datasets"))
     parser.add_argument(
         "--hf-endpoint",
         default=os.environ.get("HF_ENDPOINT", "https://huggingface.co"),

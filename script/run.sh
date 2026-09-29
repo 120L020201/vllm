@@ -8,7 +8,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 METHOD=${1:-}
 PYTHON_BIN=${PYTHON_BIN:-${VIRTUAL_ENV:-$ROOT_DIR/.venv}/bin/python}
-DATA_DIR=${DATA_DIR:-$ROOT_DIR/methods/artifacts/datasets}
+DATA_DIR=${DATA_DIR:-/srv/Datasets}
 BENCHMARKS=${BENCHMARKS:-aime2026 gpqa_diamond mmlu-pro-computer_science livecodebench-lite LongBench-v2}
 MODEL=${MODEL:-}
 SPEC_MODEL=${SPEC_MODEL:-}

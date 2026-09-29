@@ -103,7 +103,7 @@ Prepare the complete benchmark files with:
 
 ```bash
 HF_ENDPOINT=https://hf-mirror.com \
-  .venv/bin/python script/prepare_datasets.py --output-dir /srv/Datasets/TTS
+  .venv/bin/python script/prepare_datasets.py --output-dir /srv/Datasets
 ```
 
 The command validates the complete official row counts and writes
