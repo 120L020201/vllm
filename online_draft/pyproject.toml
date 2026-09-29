@@ -7,7 +7,7 @@ name = "vllm-online-draft"
 version = "0.1.0"
 description = "Standalone online draft training components"
 requires-python = ">=3.10"
-dependencies = ["torch"]
+dependencies = ["safetensors>=0.6.2", "torch"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

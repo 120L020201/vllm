@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors.torch import load_file as load_safetensors_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
@@ -1064,7 +1065,8 @@ def load_qwen3_eagle3_checkpoint(
     """
     model_path = Path(model_directory)
     config_path = model_path / "config.json"
-    checkpoint_path = model_path / "pytorch_model.bin"
+    pytorch_checkpoint_path = model_path / "pytorch_model.bin"
+    safetensors_checkpoint_path = model_path / "model.safetensors"
 
     with config_path.open(encoding="utf-8") as config_file:
         raw_config = json.load(config_file)
@@ -1082,12 +1084,19 @@ def load_qwen3_eagle3_checkpoint(
     model = Qwen3Eagle3ForCausalLM(config)
     model.to(dtype=dtype)
 
-    source_state_dict = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=True,
-        mmap=True,
-    )
+    if pytorch_checkpoint_path.is_file():
+        source_state_dict = torch.load(
+            pytorch_checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+    elif safetensors_checkpoint_path.is_file():
+        source_state_dict = load_safetensors_file(safetensors_checkpoint_path)
+    else:
+        raise FileNotFoundError(
+            "checkpoint directory must contain pytorch_model.bin or model.safetensors"
+        )
     if not isinstance(source_state_dict, Mapping):
         raise TypeError("checkpoint must contain a state dictionary")
 
