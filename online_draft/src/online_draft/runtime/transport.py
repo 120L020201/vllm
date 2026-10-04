@@ -8,16 +8,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from queue import Full, Queue
+from queue import Queue
 from threading import Lock, Thread
 
 import torch
-
-MAX_PENDING_CAPTURE = 200
-
-
-class CaptureQueueFullError(RuntimeError):
-    """The bounded capture queue is full."""
 
 
 @dataclass(slots=True)
@@ -104,12 +98,12 @@ class _FinishRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class _ReleasePending:
+class _CloseEpoch:
     request_id: str
 
 
 class Eagle3CaptureQueue:
-    """Transfer bounded GPU packet chunks to the CPU worker."""
+    """Transfer GPU packet chunks to the CPU worker in FIFO order."""
 
     def __init__(
         self,
@@ -120,7 +114,8 @@ class Eagle3CaptureQueue:
             None,
         ],
         on_finish: Callable[[str], None],
-        on_release: Callable[[str], None],
+        on_close_epoch: Callable[[str], None],
+        on_queue_size: Callable[[int], None] | None = None,
     ) -> None:
         if transfer_chunk_size <= 0:
             raise ValueError("transfer_chunk_size must be positive")
@@ -128,8 +123,9 @@ class Eagle3CaptureQueue:
         self._transfer_chunk_size = transfer_chunk_size
         self._consume_chunk = consume_chunk
         self._on_finish = on_finish
-        self._on_release = on_release
-        self._queue: Queue[object] = Queue(MAX_PENDING_CAPTURE)
+        self._on_close_epoch = on_close_epoch
+        self._on_queue_size = on_queue_size
+        self._queue: Queue[object] = Queue()
         self._stop = object()
 
         self._error: BaseException | None = None
@@ -142,37 +138,23 @@ class Eagle3CaptureQueue:
         )
         self._worker.start()
 
-    def submit(self, packet: Eagle3CapturePacket) -> None:
+    def submit(self, packet: Eagle3CapturePacket) -> int:
         self.raise_if_failed()
-        try:
-            self._queue.put_nowait(packet)
-        except Full as error:
-            queue_error = CaptureQueueFullError(
-                f"capture queue is full ({MAX_PENDING_CAPTURE} packets)"
-            )
-            self._set_error(queue_error)
-            raise queue_error from error
+        self._queue.put_nowait(packet)
+        queue_size = self._queue.qsize()
+
+        if self._on_queue_size is not None:
+            self._on_queue_size(queue_size)
+
+        return queue_size
+
+    def close_epoch(self, request_id: str) -> None:
+        self.raise_if_failed()
+        self._queue.put_nowait(_CloseEpoch(request_id))
 
     def finish_request(self, request_id: str) -> None:
-        try:
-            self._queue.put_nowait(_FinishRequest(request_id))
-        except Full as error:
-            queue_error = CaptureQueueFullError(
-                f"capture queue is full ({MAX_PENDING_CAPTURE} packets)"
-            )
-            self._set_error(queue_error)
-            raise queue_error from error
-
-    def release_pending(self, request_id: str) -> None:
         self.raise_if_failed()
-        try:
-            self._queue.put_nowait(_ReleasePending(request_id))
-        except Full as error:
-            queue_error = CaptureQueueFullError(
-                f"capture queue is full ({MAX_PENDING_CAPTURE} packets)"
-            )
-            self._set_error(queue_error)
-            raise queue_error from error
+        self._queue.put_nowait(_FinishRequest(request_id))
 
     def close(self) -> None:
         self._queue.put(self._stop)
@@ -188,7 +170,7 @@ class Eagle3CaptureQueue:
 
     def _run(self) -> None:
         chunk: list[Eagle3CapturePacket] = []
-        request_id: str | None = None
+        active_request_id: str | None = None
 
         def consume_chunk() -> None:
             if not chunk:
@@ -206,22 +188,33 @@ class Eagle3CaptureQueue:
                     return
 
                 if isinstance(item, _FinishRequest):
-                    chunk.clear()
-                    request_id = None
+                    if (
+                        active_request_id is not None
+                        and active_request_id != item.request_id
+                    ):
+                        raise RuntimeError(
+                            "finished request does not match active request"
+                        )
+
+                    consume_chunk()
                     self._on_finish(item.request_id)
+                    active_request_id = None
                     continue
 
-                if isinstance(item, _ReleasePending):
+                if isinstance(item, _CloseEpoch):
+                    if active_request_id != item.request_id:
+                        raise RuntimeError("closed epoch does not match active request")
+
                     consume_chunk()
-                    self._on_release(item.request_id)
+                    self._on_close_epoch(item.request_id)
                     continue
 
                 packet = item
                 assert isinstance(packet, Eagle3CapturePacket)
 
-                if request_id is None:
-                    request_id = packet.request_id
-                elif packet.request_id != request_id:
+                if active_request_id is None:
+                    active_request_id = packet.request_id
+                elif packet.request_id != active_request_id:
                     raise RuntimeError(
                         "capture queue received multiple active requests"
                     )
@@ -236,6 +229,7 @@ class Eagle3CaptureQueue:
             except Exception as error:
                 chunk.clear()
                 self._set_error(error)
+                return
             finally:
                 self._queue.task_done()
 

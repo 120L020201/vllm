@@ -159,6 +159,12 @@ class Eagle3VllmCaptureAdapter:
         self._step_id = 0
         return 0
 
+    def close_epoch(self, request_id: str) -> None:
+        if request_id != self._request_id:
+            raise RuntimeError("request does not match active capture")
+
+        self._runtime.close_epoch(request_id)
+
     def close(self) -> None:
         self._runtime.close()
 

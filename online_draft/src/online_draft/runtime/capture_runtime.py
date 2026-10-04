@@ -40,23 +40,16 @@ class Eagle3CaptureRuntime:
         draft_vocab_size: int,
         feature_dtype: torch.dtype,
         transfer_chunk_size: int,
-        train_window_size: int | None,
-        on_window: Callable[
-            [tuple[Eagle3PreparedRound, ...]],
-            None,
-        ],
+        on_round: Callable[[Eagle3PreparedRound], None],
+        on_epoch_close: Callable[[str], None],
+        on_queue_size: Callable[[int], None] | None = None,
     ) -> None:
         self._hidden_size = hidden_size
         self._num_aux_hidden_states = num_aux_hidden_states
         self._draft_vocab_size = draft_vocab_size
         self._feature_dtype = feature_dtype
-        self._on_window = on_window
-
-        if train_window_size is not None and train_window_size <= 0:
-            raise ValueError("train_window_size must be positive or None")
-
-        self._train_window_size = train_window_size
-        self._pending_rounds: list[Eagle3PreparedRound] = []
+        self._on_round = on_round
+        self._on_epoch_close_callback = on_epoch_close
 
         self._request_id: str | None = None
         self._last_confirmed_input_embeds: torch.Tensor | None = None
@@ -67,17 +60,18 @@ class Eagle3CaptureRuntime:
             transfer_chunk_size=transfer_chunk_size,
             consume_chunk=self._consume_chunk,
             on_finish=self._reset_request,
-            on_release=self._release_pending,
+            on_close_epoch=self._handle_epoch_close,
+            on_queue_size=on_queue_size,
         )
 
-    def submit(self, packet: Eagle3CapturePacket) -> None:
-        self._queue.submit(packet)
+    def submit(self, packet: Eagle3CapturePacket) -> int:
+        return self._queue.submit(packet)
+
+    def close_epoch(self, request_id: str) -> None:
+        self._queue.close_epoch(request_id)
 
     def finish_request(self, request_id: str) -> None:
         self._queue.finish_request(request_id)
-
-    def notify_install_complete(self, request_id: str) -> None:
-        self._queue.release_pending(request_id)
 
     def close(self) -> None:
         self._queue.close()
@@ -89,30 +83,14 @@ class Eagle3CaptureRuntime:
         self,
         packets: tuple[Eagle3CapturePacket, ...],
     ) -> None:
-        rounds = tuple(self._build_round(packet) for packet in packets)
-        self._pending_rounds.extend(rounds)
+        for packet in packets:
+            self._on_round(self._build_round(packet))
 
-        if self._train_window_size is None:
-            return
-
-        while len(self._pending_rounds) >= self._train_window_size:
-            window = tuple(self._pending_rounds[: self._train_window_size])
-            del self._pending_rounds[: self._train_window_size]
-            self._on_window(window)
-
-    def _release_pending(self, request_id: str) -> None:
+    def _handle_epoch_close(self, request_id: str) -> None:
         if self._request_id != request_id:
-            return
+            raise RuntimeError("closed epoch does not match active request")
 
-        if self._train_window_size is not None:
-            return
-
-        if not self._pending_rounds:
-            return
-
-        rounds = tuple(self._pending_rounds)
-        self._pending_rounds.clear()
-        self._on_window(rounds)
+        self._on_epoch_close_callback(request_id)
 
     def _build_round(
         self,
@@ -246,10 +224,9 @@ class Eagle3CaptureRuntime:
             raise RuntimeError("capture runtime received multiple active requests")
 
     def _reset_request(self, request_id: str) -> None:
-        if self._request_id != request_id:
+        if self._request_id is not None and self._request_id != request_id:
             raise RuntimeError("finished request does not match active request")
 
-        self._pending_rounds.clear()
         self._request_id = None
         self._last_confirmed_input_embeds = None
         self._last_confirmed_aux_hidden_states = None
