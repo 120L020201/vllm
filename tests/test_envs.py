@@ -29,6 +29,19 @@ def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
     assert not hasattr(envs.__getattr__, "cache_info")
 
 
+def test_online_draft_train_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    disable_envs_cache()
+
+    monkeypatch.delenv("VLLM_ONLINE_DRAFT_TRAIN", raising=False)
+    assert environment_variables["VLLM_ONLINE_DRAFT_TRAIN"]() is False
+
+    monkeypatch.setenv("VLLM_ONLINE_DRAFT_TRAIN", "1")
+    assert environment_variables["VLLM_ONLINE_DRAFT_TRAIN"]() is True
+
+    monkeypatch.setenv("VLLM_ONLINE_DRAFT_TRAIN", "0")
+    assert environment_variables["VLLM_ONLINE_DRAFT_TRAIN"]() is False
+
+
 def test_nixl_side_channel_host_is_not_compile_factor(
     monkeypatch: pytest.MonkeyPatch,
 ):
