@@ -41,6 +41,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.inputs_embeds: torch.Tensor | None = None
         self.explicit_input_embeds = False
         self.last_input_embeds: torch.Tensor | None = None
+        self.last_prefill_input_embeds: torch.Tensor | None = None
+        self.last_prefill_positions: torch.Tensor | None = None
+        self.last_prefill_length: torch.Tensor | None = None
+        self.last_draft_token_input_embeds: list[torch.Tensor] = []
+        self.last_draft_recurrent_hidden_states: list[torch.Tensor] = []
 
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
@@ -63,6 +68,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     # any state they toggle (e.g. attention flags baked into a CUDA graph) is
     # identical at capture time and replay time.
     def on_prefill_begin(self, num_reqs: int) -> None: ...
+
+    def on_prefill_input_embeds_ready(self, num_reqs: int) -> None: ...
 
     def on_prefill_end(self, num_reqs: int) -> None: ...
 
@@ -230,6 +237,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens = input_batch.num_tokens
         num_tokens_padded = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
+
+        if self.explicit_input_embeds:
+            self.last_draft_token_input_embeds.clear()
+            self.last_draft_recurrent_hidden_states.clear()
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
@@ -244,12 +255,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # seq_lens) of the target model.
         if aux_hidden_states:
             assert self.method == "eagle3"
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            hidden_states = torch.cat(aux_hidden_states, dim=-1)
         else:
             hidden_states = last_hidden_states
-        self.hidden_states[:num_tokens_padded].copy_(hidden_states)
+
+        if not self.explicit_input_embeds:
+            if aux_hidden_states:
+                hidden_states = self.model.combine_hidden_states(hidden_states)
+            self.hidden_states[:num_tokens_padded].copy_(hidden_states)
 
         self._copy_request_inputs(
             num_reqs,
@@ -299,9 +312,36 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             assert self.prefill_cudagraph_manager is not None
             self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
         else:
-            # The target model's attention metadata and slot mappings
-            # can directly be used for draft prefill, because of the
-            # identical batch shape and KV cache layout.
+            # Prepare embeddings before the draft model forward so the capture
+            # boundary can install new weights before FC and attention.
+            prefill_input_embeds = None
+            if self.explicit_input_embeds:
+                prefill_input_embeds = self._prepare_input_embeds(
+                    prefill_batch_desc.num_tokens,
+                    mm_inputs,
+                )
+                assert prefill_input_embeds is not None
+
+                self.last_prefill_input_embeds = prefill_input_embeds
+                self.last_prefill_positions = (
+                    self.input_buffers.positions[: prefill_batch_desc.num_tokens]
+                    .detach()
+                    .clone()
+                )
+                self.last_prefill_length = torch.tensor(
+                    prefill_batch_desc.num_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+
+                self.on_prefill_input_embeds_ready(num_reqs)
+
+                if aux_hidden_states:
+                    hidden_states = self.model.combine_hidden_states(hidden_states)
+                self.hidden_states[:num_tokens_padded].copy_(hidden_states)
+
+            # The target model's attention metadata and slot mappings can directly
+            # be used for draft prefill.
             self._prefill(
                 num_reqs,
                 prefill_batch_desc.num_tokens,
@@ -310,6 +350,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
+                inputs_embeds=prefill_input_embeds,
             )
         self.on_prefill_end(num_reqs)
 
@@ -358,6 +399,35 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         return self.draft_tokens[:num_reqs]
 
+    def _prepare_input_embeds(
+        self,
+        num_tokens: int,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor | None:
+        input_ids = self.input_buffers.input_ids[:num_tokens]
+        self.last_input_embeds = None
+
+        if self.explicit_input_embeds:
+            inputs_embeds = self.model.embed_input_ids(input_ids)
+            self.last_input_embeds = inputs_embeds
+            return inputs_embeds
+
+        if not self.supports_mm_inputs:
+            return None
+
+        assert self.inputs_embeds is not None
+
+        mm_embeds, is_mm_embed = mm_inputs or (None, None)
+        num_input_tokens = (
+            is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
+        )
+        self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
+            input_ids[:num_input_tokens],
+            multimodal_embeddings=mm_embeds,
+            is_multimodal=is_mm_embed,
+        )
+        return self.inputs_embeds[:num_tokens]
+
     @torch.inference_mode()
     def _run_model(
         self,
@@ -367,6 +437,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -379,25 +450,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             batch_descriptor=batch_descriptor,
         ):
             input_ids = self.input_buffers.input_ids[:num_tokens]
-            inputs_embeds = None
-            self.last_input_embeds = None
-
-            if self.explicit_input_embeds:
-                inputs_embeds = self.model.embed_input_ids(input_ids)
-                self.last_input_embeds = inputs_embeds
-            elif self.supports_mm_inputs:
-                assert self.inputs_embeds is not None
-                # Merge multimodal embeddings with input ids.
-                mm_embeds, is_mm_embed = mm_inputs or (None, None)
-                num_input_tokens = (
-                    is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
-                )
-                self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
-                    input_ids[:num_input_tokens],
-                    multimodal_embeddings=mm_embeds,
-                    is_multimodal=is_mm_embed,
-                )
-                inputs_embeds = self.inputs_embeds[:num_tokens]
+            if inputs_embeds is None:
+                inputs_embeds = self._prepare_input_embeds(num_tokens, mm_inputs)
 
             model_inputs = dict(
                 input_ids=input_ids,
@@ -433,6 +487,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> None:
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
@@ -445,6 +500,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            inputs_embeds=inputs_embeds,
         )
         sample_hidden_states = last_hidden_states[last_token_indices]
 
@@ -623,6 +679,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+
+        if self.explicit_input_embeds:
+            assert self.last_input_embeds is not None
+            self.last_draft_token_input_embeds.append(self.last_input_embeds[:num_reqs])
+            self.last_draft_recurrent_hidden_states.append(hidden_states[:num_reqs])
+
         last_hidden_states = last_hidden_states[:num_reqs]
 
         sample_positions = positions
