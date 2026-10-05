@@ -19,6 +19,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.online_draft_training_enabled = envs.VLLM_ONLINE_DRAFT_TRAIN
+        self.explicit_input_embeds = self.online_draft_training_enabled
         self.draft_weight_slots: Eagle3WeightSlots | None = None
 
     def load_draft_model(

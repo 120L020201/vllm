@@ -39,6 +39,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         self.inputs_embeds: torch.Tensor | None = None
+        self.explicit_input_embeds = False
+        self.last_input_embeds: torch.Tensor | None = None
 
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
@@ -286,7 +288,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             uniform_token_count,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            need_eager=is_profile or self.explicit_input_embeds,
         )
 
         self._prepare_eplb_forward(num_tokens)
@@ -335,7 +337,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             uniform_token_count=1,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            need_eager=is_profile or self.explicit_input_embeds,
         )
 
         self.on_multi_step_decode_begin(num_reqs)
@@ -376,8 +378,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
+            input_ids = self.input_buffers.input_ids[:num_tokens]
             inputs_embeds = None
-            if self.supports_mm_inputs:
+            self.last_input_embeds = None
+
+            if self.explicit_input_embeds:
+                inputs_embeds = self.model.embed_input_ids(input_ids)
+                self.last_input_embeds = inputs_embeds
+            elif self.supports_mm_inputs:
                 assert self.inputs_embeds is not None
                 # Merge multimodal embeddings with input ids.
                 mm_embeds, is_mm_embed = mm_inputs or (None, None)
@@ -385,14 +393,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
                 )
                 self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
-                    self.input_buffers.input_ids[:num_input_tokens],
+                    input_ids[:num_input_tokens],
                     multimodal_embeddings=mm_embeds,
                     is_multimodal=is_mm_embed,
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
 
             model_inputs = dict(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
+                input_ids=input_ids,
                 positions=self.input_buffers.positions[:num_tokens],
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
