@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -26,6 +27,17 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 logger = init_logger(__name__)
 
 
+@dataclass(slots=True)
+class DraftProposalSnapshot:
+    """GPU tensors captured from one completed draft proposal."""
+
+    prefill_input_embeds: torch.Tensor
+    prefill_positions: torch.Tensor
+    prefill_length: torch.Tensor
+    draft_token_input_embeds: torch.Tensor
+    draft_recurrent_hidden_states: torch.Tensor
+
+
 class AutoRegressiveSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
@@ -44,8 +56,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.last_prefill_input_embeds: torch.Tensor | None = None
         self.last_prefill_positions: torch.Tensor | None = None
         self.last_prefill_length: torch.Tensor | None = None
-        self.last_draft_token_input_embeds: list[torch.Tensor] = []
-        self.last_draft_recurrent_hidden_states: list[torch.Tensor] = []
+        self._draft_capture_input_embeds: torch.Tensor | None = None
+        self._draft_capture_recurrent_hidden_states: torch.Tensor | None = None
+        self._draft_capture_length = 0
 
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
@@ -53,6 +66,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+
+        if self.explicit_input_embeds:
+            self._ensure_draft_capture_buffers(self.max_num_reqs)
+
         if not self.supports_mm_inputs:
             return
 
@@ -63,19 +80,86 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             device=self.device,
         )
 
+    def _ensure_draft_capture_buffers(self, num_reqs: int) -> None:
+        capacity = (self.num_speculative_steps - 1) * num_reqs
+
+        if (
+            self._draft_capture_input_embeds is not None
+            and self._draft_capture_input_embeds.shape[0] >= capacity
+        ):
+            return
+
+        shape = (capacity, self.hidden_size)
+        self._draft_capture_input_embeds = torch.empty(
+            shape,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._draft_capture_recurrent_hidden_states = torch.empty(
+            shape,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def get_proposal_snapshot(self) -> DraftProposalSnapshot:
+        if self.last_prefill_input_embeds is None:
+            raise RuntimeError("draft prefill has not run")
+        if self.last_prefill_positions is None:
+            raise RuntimeError("draft prefill positions are missing")
+        if self.last_prefill_length is None:
+            raise RuntimeError("draft prefill length is missing")
+
+        if self._draft_capture_input_embeds is None:
+            token_input_embeds = self.last_prefill_input_embeds.new_empty(
+                (0, self.hidden_size)
+            )
+            recurrent_hidden_states = self.last_prefill_input_embeds.new_empty(
+                (0, self.hidden_size)
+            )
+        else:
+            assert self._draft_capture_recurrent_hidden_states is not None
+            token_input_embeds = self._draft_capture_input_embeds[
+                : self._draft_capture_length
+            ]
+            recurrent_hidden_states = self._draft_capture_recurrent_hidden_states[
+                : self._draft_capture_length
+            ]
+
+        return DraftProposalSnapshot(
+            prefill_input_embeds=self.last_prefill_input_embeds,
+            prefill_positions=self.last_prefill_positions,
+            prefill_length=self.last_prefill_length,
+            draft_token_input_embeds=token_input_embeds,
+            draft_recurrent_hidden_states=recurrent_hidden_states,
+        )
+
     # Lifecycle hooks for model-specific optimizations. Subclasses override
     # the ones they need. These fire in both `capture` and `propose` so that
     # any state they toggle (e.g. attention flags baked into a CUDA graph) is
     # identical at capture time and replay time.
     def on_prefill_begin(self, num_reqs: int) -> None: ...
 
-    def on_prefill_input_embeds_ready(self, num_reqs: int) -> None: ...
+    def on_prefill_input_embeds_ready(
+        self,
+        num_reqs: int,
+        input_batch: InputBatch,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        capture_enabled: bool,
+    ) -> None: ...
 
     def on_prefill_end(self, num_reqs: int) -> None: ...
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None: ...
 
     def on_multi_step_decode_end(self, num_reqs: int) -> None: ...
+
+    def on_proposal_ready(
+        self,
+        input_batch: InputBatch,
+        aux_hidden_states: list[torch.Tensor] | None,
+        capture_enabled: bool,
+    ) -> None: ...
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -238,9 +322,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_padded = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
 
+        capture_enabled = (
+            self.explicit_input_embeds and not dummy_run and not is_profile
+        )
         if self.explicit_input_embeds:
-            self.last_draft_token_input_embeds.clear()
-            self.last_draft_recurrent_hidden_states.clear()
+            self._ensure_draft_capture_buffers(num_reqs)
+            self._draft_capture_length = 0
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
@@ -253,15 +340,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions. By doing so,
         # we can also reuse the attention metadata (e.g., query_start_loc,
         # seq_lens) of the target model.
+        hidden_states = last_hidden_states
         if aux_hidden_states:
             assert self.method == "eagle3"
-            hidden_states = torch.cat(aux_hidden_states, dim=-1)
-        else:
-            hidden_states = last_hidden_states
 
         if not self.explicit_input_embeds:
             if aux_hidden_states:
-                hidden_states = self.model.combine_hidden_states(hidden_states)
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
             self.hidden_states[:num_tokens_padded].copy_(hidden_states)
 
         self._copy_request_inputs(
@@ -334,10 +421,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     device=self.device,
                 )
 
-                self.on_prefill_input_embeds_ready(num_reqs)
+                self.on_prefill_input_embeds_ready(
+                    num_reqs=num_reqs,
+                    input_batch=input_batch,
+                    aux_hidden_states=aux_hidden_states,
+                    num_sampled=num_sampled,
+                    capture_enabled=capture_enabled,
+                )
 
                 if aux_hidden_states:
-                    hidden_states = self.model.combine_hidden_states(hidden_states)
+                    hidden_states = self.model.combine_hidden_states(
+                        torch.cat(aux_hidden_states, dim=-1)
+                    )
                 self.hidden_states[:num_tokens_padded].copy_(hidden_states)
 
             # The target model's attention metadata and slot mappings can directly
@@ -355,7 +450,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.on_prefill_end(num_reqs)
 
         if self.num_speculative_steps == 1:
-            # Early exit.
+            self.on_proposal_ready(
+                input_batch=input_batch,
+                aux_hidden_states=aux_hidden_states,
+                capture_enabled=capture_enabled,
+            )
             return self.draft_tokens[:num_reqs, :1]
 
         # Prepare the inputs for the decode steps.
@@ -396,6 +495,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.seq_lens_cpu_upper_bound,
         )
         self.on_multi_step_decode_end(num_reqs)
+
+        self.on_proposal_ready(
+            input_batch=input_batch,
+            aux_hidden_states=aux_hidden_states,
+            capture_enabled=capture_enabled,
+        )
 
         return self.draft_tokens[:num_reqs]
 
@@ -682,8 +787,20 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         if self.explicit_input_embeds:
             assert self.last_input_embeds is not None
-            self.last_draft_token_input_embeds.append(self.last_input_embeds[:num_reqs])
-            self.last_draft_recurrent_hidden_states.append(hidden_states[:num_reqs])
+            assert self._draft_capture_input_embeds is not None
+            assert self._draft_capture_recurrent_hidden_states is not None
+
+            start = self._draft_capture_length
+            end = start + num_reqs
+
+            self._draft_capture_input_embeds[start:end].copy_(
+                self.last_input_embeds[:num_reqs]
+            )
+            self._draft_capture_recurrent_hidden_states[start:end].copy_(
+                hidden_states[:num_reqs]
+            )
+
+            self._draft_capture_length = end
 
         last_hidden_states = last_hidden_states[:num_reqs]
 

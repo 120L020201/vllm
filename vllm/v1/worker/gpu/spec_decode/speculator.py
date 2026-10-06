@@ -38,6 +38,9 @@ class BaseSpeculator(ABC):
     def capture(self) -> None:
         pass
 
+    def on_target_logits_ready(self, logits: torch.Tensor) -> None:
+        return
+
     @abstractmethod
     def propose(
         self,

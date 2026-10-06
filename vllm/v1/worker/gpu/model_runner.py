@@ -1338,6 +1338,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        if self.speculator is not None:
+            self.speculator.on_target_logits_ready(logits)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None

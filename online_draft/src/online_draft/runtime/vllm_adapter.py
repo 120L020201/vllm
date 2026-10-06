@@ -75,18 +75,38 @@ class Eagle3VllmCaptureAdapter:
         request_id: str,
         verify_row_indices: torch.Tensor,
         target_aux_hidden_states: Sequence[torch.Tensor],
-        num_sampled: torch.Tensor | int,
         proposal: Any,
     ) -> None:
-        """Capture the first proposal or complete one verified round."""
+        """Save a completed proposal for a later verification round."""
 
         if self._proposal is None:
             self._request_id = request_id
-            self._proposal = self._save_proposal(
-                proposal=proposal,
-                target_aux_hidden_states=target_aux_hidden_states,
-                aux_row_indices=self._initial_aux_rows(target_aux_hidden_states),
-            )
+            aux_row_indices = self._initial_aux_rows(target_aux_hidden_states)
+        else:
+            if request_id != self._request_id:
+                raise RuntimeError("another request is already being captured")
+            aux_row_indices = verify_row_indices
+
+        self._proposal = self._save_proposal(
+            proposal=proposal,
+            target_aux_hidden_states=target_aux_hidden_states,
+            aux_row_indices=aux_row_indices,
+        )
+
+    def capture_prefill(
+        self,
+        *,
+        request_id: str,
+        verify_row_indices: torch.Tensor,
+        target_aux_hidden_states: Sequence[torch.Tensor],
+        num_sampled: torch.Tensor | int,
+        prefill_input_embeds: torch.Tensor,
+        prefill_positions: torch.Tensor,
+        prefill_length: torch.Tensor,
+    ) -> None:
+        """Submit the previous proposal when the next prefill is ready."""
+
+        if self._proposal is None:
             return
 
         if request_id != self._request_id:
@@ -95,13 +115,7 @@ class Eagle3VllmCaptureAdapter:
         if self._teacher_logits is None:
             raise RuntimeError("teacher logits are missing")
 
-        next_proposal = self._save_proposal(
-            proposal=proposal,
-            target_aux_hidden_states=target_aux_hidden_states,
-            aux_row_indices=verify_row_indices,
-        )
-
-        device = next_proposal.prefill_input_embeds.device
+        device = prefill_input_embeds.device
         sampled = self._as_device_scalar(num_sampled, device)
 
         prompt_context = None
@@ -118,6 +132,9 @@ class Eagle3VllmCaptureAdapter:
         captured_target_aux_hidden_states = tuple(
             tensor.detach().clone() for tensor in target_aux_hidden_states
         )
+        confirmed_input_embeds = prefill_input_embeds.detach().clone()
+        confirmed_positions = prefill_positions.detach().clone()
+        confirmed_length = prefill_length.detach().clone()
 
         ready = None
         if device.type == "cuda":
@@ -135,15 +152,14 @@ class Eagle3VllmCaptureAdapter:
             verify_row_indices=captured_verify_row_indices,
             target_aux_hidden_states=captured_target_aux_hidden_states,
             num_sampled=sampled,
-            confirmed_prefill_input_embeds=(next_proposal.prefill_input_embeds),
-            confirmed_prefill_positions=(next_proposal.prefill_positions),
-            confirmed_prefill_length=next_proposal.prefill_length,
+            confirmed_prefill_input_embeds=confirmed_input_embeds,
+            confirmed_prefill_positions=confirmed_positions,
+            confirmed_prefill_length=confirmed_length,
             ready=ready,
         )
 
         self._runtime.submit(packet)
 
-        self._proposal = next_proposal
         self._teacher_logits = None
         self._step_id += 1
 
