@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -102,6 +102,8 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
 
 
 if TYPE_CHECKING:
+    from online_draft.training.trainer import DraftTrainer
+
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -175,6 +177,7 @@ class Worker(WorkerBase):
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         self._weight_update_is_draft = False
+        self._online_draft_trainer: DraftTrainer | None = None
 
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -463,6 +466,59 @@ class Worker(WorkerBase):
                 self.device,
                 self.model_runner.get_model(),
             )
+        if envs.VLLM_ONLINE_DRAFT_TRAIN and not load_dummy_weights:
+            self._load_online_draft_model()
+
+    def _load_online_draft_model(self) -> None:
+        from online_draft.models import (
+            load_qwen3_eagle3_checkpoint,
+            validate_qwen3_eagle3_weights,
+        )
+        from online_draft.training.trainer import (
+            DraftTrainer,
+            TrainerConfig,
+        )
+
+        from vllm.v1.worker.gpu.model_runner import (
+            GPUModelRunner as GPUModelRunnerV2,
+        )
+        from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
+            EagleSpeculator,
+        )
+
+        assert self.use_v2_model_runner
+
+        speculative_config = self.speculative_config
+        assert speculative_config is not None
+
+        draft_model_config = speculative_config.draft_model_config
+        assert draft_model_config is not None
+
+        gpu_draft_model = self.get_draft_model()
+        assert gpu_draft_model is not None
+
+        cpu_model = load_qwen3_eagle3_checkpoint(
+            draft_model_config.model,
+            dtype=self.vllm_config.model_config.dtype,
+        )
+        validate_qwen3_eagle3_weights(
+            cpu_model,
+            gpu_draft_model.state_dict(),
+        )
+
+        trainer = DraftTrainer(
+            cpu_model,
+            TrainerConfig(),
+        )
+
+        model_runner = cast(GPUModelRunnerV2, self.model_runner)
+        speculator = model_runner.speculator
+        assert isinstance(speculator, EagleSpeculator)
+
+        speculator.configure_online_training(
+            trainer.trainable_parameter_names,
+        )
+        self._online_draft_trainer = trainer
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)

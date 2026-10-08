@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -24,7 +25,9 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         super().__init__(vllm_config, device)
         self.online_draft_training_enabled = envs.VLLM_ONLINE_DRAFT_TRAIN
         self.explicit_input_embeds = self.online_draft_training_enabled
+        self._online_target_model: nn.Module | None = None
         self.draft_weight_slots: Eagle3WeightSlots | None = None
+        self.draft_weight_installer: DraftWeightInstaller | None = None
         self.capture_adapter: Any | None = None
 
     def set_capture_adapter(self, adapter: Any) -> None:
@@ -42,17 +45,26 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         eagle_model = load_eagle_model(target_model, self.vllm_config)
 
         if self.online_draft_training_enabled:
-            slots = Eagle3WeightSlots.from_models(
-                target_model=target_model,
-                draft_model=eagle_model,
-            )
-            self.draft_weight_slots = slots
-            self.draft_weight_installer = DraftWeightInstaller(
-                slots=slots.slots,
-                mutable_names=slots.owned_names,
-            )
+            self._online_target_model = target_model
 
         return eagle_model
+
+    def configure_online_training(
+        self,
+        mutable_names: Iterable[str],
+    ) -> None:
+        assert self._online_target_model is not None
+
+        slots = Eagle3WeightSlots.from_models(
+            target_model=self._online_target_model,
+            draft_model=self.model,
+            mutable_names=mutable_names,
+        )
+        self.draft_weight_slots = slots
+        self.draft_weight_installer = DraftWeightInstaller(
+            slots=slots.slots,
+            mutable_names=slots.owned_names,
+        )
 
     def on_prefill_input_embeds_ready(
         self,

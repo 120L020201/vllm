@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -10,7 +10,7 @@ import torch.nn as nn
 
 @dataclass(slots=True)
 class Eagle3WeightSlots:
-    """Own two GPU copies of draft-only parameters."""
+    """Own two GPU copies of mutable draft-only parameters."""
 
     model: nn.Module
     slots: tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]
@@ -20,17 +20,22 @@ class Eagle3WeightSlots:
         cls,
         target_model: nn.Module,
         draft_model: nn.Module,
+        mutable_names: Iterable[str],
     ) -> "Eagle3WeightSlots":
+        mutable_names = tuple(mutable_names)
         target_parameter_ids = {
             id(parameter) for parameter in target_model.parameters()
         }
-
-        slot_a = {
-            name: parameter.detach()
+        draft_parameters = {
+            name: parameter
             for name, parameter in draft_model.named_parameters()
             if id(parameter) not in target_parameter_ids
         }
 
+        if not set(mutable_names).issubset(draft_parameters):
+            raise ValueError("mutable parameters must be draft-owned")
+
+        slot_a = {name: draft_parameters[name].detach() for name in mutable_names}
         slot_b = {name: torch.empty_like(tensor) for name, tensor in slot_a.items()}
 
         for name, tensor in slot_a.items():

@@ -1097,3 +1097,22 @@ def load_qwen3_eagle3_checkpoint(
     model.load_state_dict(converted_state_dict, strict=True)
 
     return model
+
+
+def validate_qwen3_eagle3_weights(
+    model: Qwen3Eagle3ForCausalLM,
+    source_state_dict: Mapping[str, torch.Tensor],
+) -> None:
+    """Validate CPU weights against the loaded vLLM draft model."""
+
+    for name, cpu_tensor in model.state_dict().items():
+        source_tensor = source_state_dict[name]
+
+        if source_tensor.shape != cpu_tensor.shape:
+            raise ValueError(f"EAGLE3 weight shape mismatch: {name}")
+
+        if source_tensor.dtype != cpu_tensor.dtype:
+            raise ValueError(f"EAGLE3 weight dtype mismatch: {name}")
+
+        if not torch.equal(cpu_tensor, source_tensor.detach().cpu()):
+            raise ValueError(f"EAGLE3 weight value mismatch: {name}")

@@ -11,6 +11,7 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3ForCausalLM,
     convert_angelslim_eagle3_state_dict,
     load_qwen3_eagle3_checkpoint,
+    validate_qwen3_eagle3_weights,
 )
 from safetensors.torch import save_file
 
@@ -347,3 +348,27 @@ def test_load_checkpoint_from_directory(tmp_path: Path, checkpoint_format: str) 
     assert (
         flash_model.config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
     )
+
+
+def test_validate_qwen3_eagle3_weights() -> None:
+    model = Qwen3Eagle3ForCausalLM(_make_config())
+
+    validate_qwen3_eagle3_weights(
+        model,
+        model.state_dict(),
+    )
+
+
+def test_validate_qwen3_eagle3_weights_rejects_different_values() -> None:
+    model = Qwen3Eagle3ForCausalLM(_make_config())
+    source_state_dict = dict(model.state_dict())
+
+    weight = source_state_dict["model.fc.weight"].clone()
+    weight.view(-1)[0] += 1
+    source_state_dict["model.fc.weight"] = weight
+
+    with pytest.raises(ValueError, match="value mismatch"):
+        validate_qwen3_eagle3_weights(
+            model,
+            source_state_dict,
+        )

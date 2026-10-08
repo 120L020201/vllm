@@ -9,19 +9,26 @@ from vllm.v1.worker.gpu.spec_decode.eagle.weight_slots import (
 )
 
 
-def test_target_shared_embedding_is_excluded() -> None:
+def test_only_selected_draft_owned_parameters_receive_slots() -> None:
     target = nn.Module()
     target.embed_tokens = nn.Embedding(4, 3)
 
     draft = nn.Module()
     draft.embed_tokens = target.embed_tokens
     draft.projection = nn.Linear(3, 2)
+    draft.lm_head = nn.Linear(3, 4, bias=False)
 
-    slots = Eagle3WeightSlots.from_models(target, draft)
+    mutable_names = (
+        "projection.weight",
+        "projection.bias",
+    )
+    slots = Eagle3WeightSlots.from_models(
+        target,
+        draft,
+        mutable_names,
+    )
 
-    assert "embed_tokens.weight" not in slots.owned_names
-    assert "projection.weight" in slots.owned_names
-    assert "projection.bias" in slots.owned_names
+    assert slots.owned_names == mutable_names
 
     for name in slots.owned_names:
         assert torch.equal(slots.slots[0][name], slots.slots[1][name])
@@ -35,7 +42,14 @@ def test_bind_switches_draft_owned_parameters() -> None:
     draft.embed_tokens = target.embed_tokens
     draft.projection = nn.Linear(3, 2)
 
-    slots = Eagle3WeightSlots.from_models(target, draft)
+    slots = Eagle3WeightSlots.from_models(
+        target,
+        draft,
+        (
+            "projection.weight",
+            "projection.bias",
+        ),
+    )
 
     new_weight = torch.full_like(
         slots.slots[1]["projection.weight"],
