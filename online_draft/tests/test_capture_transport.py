@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
 
+import pytest
 import torch
 from online_draft.runtime.capture_runtime import Eagle3CaptureRuntime
 from online_draft.runtime.transport import (
@@ -23,21 +24,24 @@ class _CaptureRuntime:
         return len(self.packets)
 
 
-def _packet(step_id: int) -> Eagle3CapturePacket:
+def _packet(
+    step_id: int,
+    device: torch.device | str = "cpu",
+) -> Eagle3CapturePacket:
     return Eagle3CapturePacket(
         request_id="request-0",
         step_id=step_id,
         source_weight_version=0,
         prompt_context=None,
-        proposal_token_input_embeds=torch.zeros(1, 2),
-        proposal_recurrent_hidden_states=torch.zeros(1, 2),
-        teacher_logits=torch.zeros(2, 3),
-        verify_row_indices=torch.tensor([0]),
-        target_aux_hidden_states=(torch.zeros(1, 2),),
-        num_sampled=torch.tensor(1),
-        confirmed_prefill_input_embeds=torch.zeros(1, 2),
-        confirmed_prefill_positions=torch.tensor([0]),
-        confirmed_prefill_length=torch.tensor(1),
+        proposal_token_input_embeds=torch.zeros(1, 2, device=device),
+        proposal_recurrent_hidden_states=torch.zeros(1, 2, device=device),
+        teacher_logits=torch.zeros(2, 3, device=device),
+        verify_row_indices=torch.tensor([0], device=device),
+        target_aux_hidden_states=(torch.zeros(1, 2, device=device),),
+        num_sampled=torch.tensor(1, device=device),
+        confirmed_prefill_input_embeds=torch.zeros(1, 2, device=device),
+        confirmed_prefill_positions=torch.tensor([0], device=device),
+        confirmed_prefill_length=torch.tensor(1, device=device),
     )
 
 
@@ -69,6 +73,50 @@ def test_close_epoch_flushes_packets_before_marker() -> None:
             ("rounds", [0]),
             ("close", "request-0"),
         ]
+    finally:
+        queue.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="requires CUDA",
+)
+def test_cuda_packet_uses_pinned_d2h_buffers() -> None:
+    consumed: list[Eagle3CapturePacket] = []
+    copied = Event()
+
+    def consume(
+        packets: tuple[Eagle3CapturePacket, ...],
+    ) -> None:
+        consumed.extend(packets)
+        copied.set()
+
+    packet = _packet(0, "cuda")
+    packet.ready = torch.cuda.Event()
+    packet.ready.record(torch.cuda.current_stream())
+
+    queue = Eagle3CaptureQueue(
+        transfer_chunk_size=1,
+        consume_chunk=consume,
+        on_finish=lambda request_id: None,
+        on_close_epoch=lambda request_id: None,
+    )
+
+    try:
+        queue.submit(packet)
+
+        assert copied.wait(timeout=5)
+        assert len(consumed) == 1
+
+        cpu_packet = consumed[0]
+        assert cpu_packet.ready is None
+        assert cpu_packet.teacher_logits.device.type == "cpu"
+        assert cpu_packet.teacher_logits.is_pinned()
+        assert cpu_packet.verify_row_indices.is_pinned()
+        assert torch.equal(
+            cpu_packet.teacher_logits,
+            torch.zeros(2, 3),
+        )
     finally:
         queue.close()
 

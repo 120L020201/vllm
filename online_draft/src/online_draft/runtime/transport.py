@@ -14,6 +14,23 @@ from threading import Event, Lock, Thread
 import torch
 
 
+def _copy_to_cpu(
+    tensor: torch.Tensor,
+    *,
+    non_blocking: bool,
+) -> torch.Tensor:
+    cpu_tensor = torch.empty_like(
+        tensor,
+        device="cpu",
+        pin_memory=non_blocking,
+    )
+    cpu_tensor.copy_(
+        tensor.detach(),
+        non_blocking=non_blocking,
+    )
+    return cpu_tensor
+
+
 @dataclass(slots=True)
 class Eagle3PromptContext:
     """Prompt data transferred once for one request."""
@@ -24,19 +41,36 @@ class Eagle3PromptContext:
     prefill_aux_hidden_states: tuple[torch.Tensor, ...]
     prefill_aux_row_indices: torch.Tensor
 
-    def to_cpu(self) -> Eagle3PromptContext:
-        def copy(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.detach().to(device="cpu", copy=True)
-
+    def to_cpu(
+        self,
+        *,
+        non_blocking: bool = False,
+    ) -> Eagle3PromptContext:
         return replace(
             self,
-            prefill_input_embeds=copy(self.prefill_input_embeds),
-            prefill_positions=copy(self.prefill_positions),
-            prefill_length=copy(self.prefill_length),
-            prefill_aux_hidden_states=tuple(
-                copy(tensor) for tensor in self.prefill_aux_hidden_states
+            prefill_input_embeds=_copy_to_cpu(
+                self.prefill_input_embeds,
+                non_blocking=non_blocking,
             ),
-            prefill_aux_row_indices=copy(self.prefill_aux_row_indices),
+            prefill_positions=_copy_to_cpu(
+                self.prefill_positions,
+                non_blocking=non_blocking,
+            ),
+            prefill_length=_copy_to_cpu(
+                self.prefill_length,
+                non_blocking=non_blocking,
+            ),
+            prefill_aux_hidden_states=tuple(
+                _copy_to_cpu(
+                    tensor,
+                    non_blocking=non_blocking,
+                )
+                for tensor in self.prefill_aux_hidden_states
+            ),
+            prefill_aux_row_indices=_copy_to_cpu(
+                self.prefill_aux_row_indices,
+                non_blocking=non_blocking,
+            ),
         )
 
 
@@ -64,30 +98,61 @@ class Eagle3CapturePacket:
 
     ready: torch.cuda.Event | None = None
 
-    def to_cpu(self) -> Eagle3CapturePacket:
-        def copy(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.detach().to(device="cpu", copy=True)
-
+    def to_cpu(
+        self,
+        *,
+        non_blocking: bool = False,
+    ) -> Eagle3CapturePacket:
         prompt_context = (
-            None if self.prompt_context is None else self.prompt_context.to_cpu()
+            None
+            if self.prompt_context is None
+            else self.prompt_context.to_cpu(
+                non_blocking=non_blocking,
+            )
         )
 
         return replace(
             self,
             prompt_context=prompt_context,
-            proposal_token_input_embeds=copy(self.proposal_token_input_embeds),
-            proposal_recurrent_hidden_states=copy(
-                self.proposal_recurrent_hidden_states
+            proposal_token_input_embeds=_copy_to_cpu(
+                self.proposal_token_input_embeds,
+                non_blocking=non_blocking,
             ),
-            teacher_logits=copy(self.teacher_logits),
-            verify_row_indices=copy(self.verify_row_indices),
+            proposal_recurrent_hidden_states=_copy_to_cpu(
+                self.proposal_recurrent_hidden_states,
+                non_blocking=non_blocking,
+            ),
+            teacher_logits=_copy_to_cpu(
+                self.teacher_logits,
+                non_blocking=non_blocking,
+            ),
+            verify_row_indices=_copy_to_cpu(
+                self.verify_row_indices,
+                non_blocking=non_blocking,
+            ),
             target_aux_hidden_states=tuple(
-                copy(tensor) for tensor in self.target_aux_hidden_states
+                _copy_to_cpu(
+                    tensor,
+                    non_blocking=non_blocking,
+                )
+                for tensor in self.target_aux_hidden_states
             ),
-            num_sampled=copy(self.num_sampled),
-            confirmed_prefill_input_embeds=copy(self.confirmed_prefill_input_embeds),
-            confirmed_prefill_positions=copy(self.confirmed_prefill_positions),
-            confirmed_prefill_length=copy(self.confirmed_prefill_length),
+            num_sampled=_copy_to_cpu(
+                self.num_sampled,
+                non_blocking=non_blocking,
+            ),
+            confirmed_prefill_input_embeds=_copy_to_cpu(
+                self.confirmed_prefill_input_embeds,
+                non_blocking=non_blocking,
+            ),
+            confirmed_prefill_positions=_copy_to_cpu(
+                self.confirmed_prefill_positions,
+                non_blocking=non_blocking,
+            ),
+            confirmed_prefill_length=_copy_to_cpu(
+                self.confirmed_prefill_length,
+                non_blocking=non_blocking,
+            ),
             ready=None,
         )
 
@@ -180,12 +245,37 @@ class Eagle3CaptureQueue:
     def _run(self) -> None:
         chunk: list[Eagle3CapturePacket] = []
         active_request_id: str | None = None
+        d2h_stream: torch.cuda.Stream | None = None
 
         def consume_chunk() -> None:
+            nonlocal d2h_stream
+
             if not chunk:
                 return
 
-            cpu_chunk = tuple(packet.to_cpu() for packet in chunk)
+            if chunk[0].ready is None:
+                cpu_chunk = tuple(packet.to_cpu() for packet in chunk)
+            else:
+                if d2h_stream is None:
+                    d2h_stream = torch.cuda.Stream(
+                        device=chunk[0].proposal_token_input_embeds.device,
+                    )
+
+                cpu_packets: list[Eagle3CapturePacket] = []
+                with torch.cuda.stream(d2h_stream):
+                    for packet in chunk:
+                        assert packet.ready is not None
+                        d2h_stream.wait_event(packet.ready)
+                        cpu_packets.append(
+                            packet.to_cpu(non_blocking=True),
+                        )
+
+                    copy_done = torch.cuda.Event()
+                    copy_done.record(d2h_stream)
+
+                copy_done.synchronize()
+                cpu_chunk = tuple(cpu_packets)
+
             self._consume_chunk(cpu_chunk)
             chunk.clear()
 
@@ -227,9 +317,6 @@ class Eagle3CaptureQueue:
                     raise RuntimeError(
                         "capture queue received multiple active requests"
                     )
-
-                if packet.ready is not None:
-                    packet.ready.synchronize()
 
                 chunk.append(packet)
 
