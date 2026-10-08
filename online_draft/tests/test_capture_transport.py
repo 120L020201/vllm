@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
 
 import torch
+from online_draft.runtime.capture_runtime import Eagle3CaptureRuntime
 from online_draft.runtime.transport import (
     Eagle3CapturePacket,
     Eagle3CaptureQueue,
@@ -69,6 +71,68 @@ def test_close_epoch_flushes_packets_before_marker() -> None:
         ]
     finally:
         queue.close()
+
+
+def test_finish_discards_tail_and_waits_for_callback() -> None:
+    consumed: list[tuple[Eagle3CapturePacket, ...]] = []
+    finished: list[str] = []
+    callback_started = Event()
+    release_callback = Event()
+
+    def on_finish(request_id: str) -> None:
+        callback_started.set()
+        release_callback.wait(timeout=5)
+        finished.append(request_id)
+
+    queue = Eagle3CaptureQueue(
+        transfer_chunk_size=8,
+        consume_chunk=consumed.append,
+        on_finish=on_finish,
+        on_close_epoch=lambda request_id: None,
+    )
+
+    try:
+        queue.submit(_packet(0))
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                queue.finish_request,
+                "request-0",
+            )
+
+            assert callback_started.wait(timeout=5)
+            assert not result.done()
+
+            release_callback.set()
+            result.result(timeout=5)
+
+        assert consumed == []
+        assert finished == ["request-0"]
+    finally:
+        release_callback.set()
+        queue.close()
+
+
+def test_capture_runtime_forwards_finish() -> None:
+    finished: list[str] = []
+
+    runtime = Eagle3CaptureRuntime(
+        hidden_size=2,
+        num_aux_hidden_states=1,
+        draft_vocab_size=3,
+        feature_dtype=torch.float32,
+        transfer_chunk_size=8,
+        on_round=lambda prepared_round: None,
+        on_epoch_close=lambda request_id: None,
+        on_finish=finished.append,
+    )
+
+    try:
+        runtime.finish_request("request-0")
+
+        assert finished == ["request-0"]
+    finally:
+        runtime.close()
 
 
 def test_next_prefill_submits_previous_proposal() -> None:

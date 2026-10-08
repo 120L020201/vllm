@@ -22,13 +22,24 @@ DRAFT_VOCAB_SIZE = 3
 class _FakeTrainer:
     model: nn.Module
     version: int = 0
+    reset_count: int = 0
 
     @property
     def trainable_parameter_names(self) -> tuple[str, ...]:
         return tuple(name for name, _ in self.model.named_parameters())
 
+    def reset(self) -> None:
+        self.version = 0
+        self.reset_count += 1
 
-def _make_round(step_id: int, anchor: int, *, prompt: bool) -> Eagle3PreparedRound:
+
+def _make_round(
+    step_id: int,
+    anchor: int,
+    *,
+    prompt: bool,
+    request_id: str = "request-0",
+) -> Eagle3PreparedRound:
     prefill_positions = (
         torch.tensor([0, anchor], dtype=torch.long)
         if prompt
@@ -56,7 +67,7 @@ def _make_round(step_id: int, anchor: int, *, prompt: bool) -> Eagle3PreparedRou
         rejection_position=0,
     )
     return Eagle3PreparedRound(
-        request_id="request-0",
+        request_id=request_id,
         step_id=step_id,
         source_weight_version=0,
         batch=batch,
@@ -148,6 +159,52 @@ def test_queue_size_is_reported_while_training_is_busy() -> None:
         assert queue_sizes[-1] == queue_size
     finally:
         release.set()
+        pipeline.close()
+
+
+def test_finish_resets_pipeline_for_next_request() -> None:
+    trainer = _FakeTrainer(nn.Linear(1, 1))
+    cache_was_empty: list[bool] = []
+
+    def train_window(trainer, window, persistent_cache, mode):
+        cache_was_empty.append(persistent_cache is None)
+        trainer.version += 1
+        return f"cache-{trainer.version}", SimpleNamespace(
+            model_version=trainer.version
+        )
+
+    pipeline = AsyncEagle3Pipeline(
+        trainer=trainer,
+        train_window=train_window,
+    )
+
+    try:
+        pipeline.submit_round(_make_round(0, 1, prompt=True))
+        pipeline.submit_round(_make_round(1, 2, prompt=False))
+
+        pipeline.finish_request("request-0")
+
+        assert trainer.version == 0
+        assert trainer.reset_count == 1
+        assert cache_was_empty == [True]
+        assert pipeline.poll_snapshot() is None
+
+        pipeline.submit_round(
+            _make_round(
+                0,
+                3,
+                prompt=True,
+                request_id="request-1",
+            )
+        )
+
+        snapshot = _wait_for_snapshot(pipeline)
+
+        assert snapshot is not None
+        assert snapshot.version == 1
+        assert trainer.version == 1
+        assert cache_was_empty == [True, True]
+    finally:
         pipeline.close()
 
 

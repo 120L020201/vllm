@@ -42,6 +42,7 @@ class Eagle3CaptureRuntime:
         transfer_chunk_size: int,
         on_round: Callable[[Eagle3PreparedRound], None],
         on_epoch_close: Callable[[str], None],
+        on_finish: Callable[[str], None],
         on_queue_size: Callable[[int], None] | None = None,
     ) -> None:
         self._hidden_size = hidden_size
@@ -50,6 +51,7 @@ class Eagle3CaptureRuntime:
         self._feature_dtype = feature_dtype
         self._on_round = on_round
         self._on_epoch_close_callback = on_epoch_close
+        self._on_finish_callback = on_finish
 
         self._request_id: str | None = None
         self._last_confirmed_input_embeds: torch.Tensor | None = None
@@ -231,3 +233,5 @@ class Eagle3CaptureRuntime:
         self._last_confirmed_input_embeds = None
         self._last_confirmed_aux_hidden_states = None
         self._last_confirmed_position = None
+
+        self._on_finish_callback(request_id)

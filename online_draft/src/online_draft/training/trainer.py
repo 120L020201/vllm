@@ -53,6 +53,11 @@ class DraftTrainer:
         if not self._trainable_named_parameters:
             raise ValueError("trainer requires at least one trainable parameter")
 
+        self._initial_weights = tuple(
+            (name, parameter.detach().clone())
+            for name, parameter in self._trainable_named_parameters
+        )
+
         self.optimizer = torch.optim.AdamW(
             [parameter for _, parameter in self._trainable_named_parameters],
             lr=self.config.learning_rate,
@@ -72,12 +77,29 @@ class DraftTrainer:
     def trainable_parameter_names(self) -> tuple[str, ...]:
         return tuple(name for name, _ in self._trainable_named_parameters)
 
+    @property
+    def initial_weights(self) -> tuple[tuple[str, torch.Tensor], ...]:
+        return self._initial_weights
+
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
 
     def clear_optimizer_state(self) -> None:
         self.optimizer.state.clear()
         self.zero_grad()
+
+    @torch.no_grad()
+    def reset(self) -> None:
+        for (_, parameter), (_, initial_weight) in zip(
+            self._trainable_named_parameters,
+            self._initial_weights,
+            strict=True,
+        ):
+            parameter.copy_(initial_weight)
+
+        self.clear_optimizer_state()
+        self._version = 0
+        self.last_loss = None
 
     def backward_and_step(
         self,

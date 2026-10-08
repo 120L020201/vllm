@@ -48,6 +48,7 @@ class DraftWeightInstaller:
                 raise ValueError(f"slot tensor metadata does not match: {name}")
 
         self._active_slot = 0
+        self._initial_version = initial_version
         self._active_version = initial_version
         self._staged: tuple[DraftWeightSnapshot, torch.cuda.Event | None] | None = None
         self._lock = Lock()
@@ -111,13 +112,39 @@ class DraftWeightInstaller:
         if snapshot.version <= self._active_version:
             raise ValueError("snapshot version must be newer than active version")
 
-        if tuple(name for name, _ in snapshot.tensors) != self._mutable_names:
-            raise ValueError("snapshot tensor names do not match the installer")
+        self._validate_weights(snapshot.tensors)
 
-        for name, tensor in snapshot.tensors:
+    def _validate_weights(
+        self,
+        weights: tuple[tuple[str, torch.Tensor], ...],
+    ) -> None:
+        if tuple(name for name, _ in weights) != self._mutable_names:
+            raise ValueError("weight tensor names do not match the installer")
+
+        for name, tensor in weights:
             if tensor.device.type != "cpu":
-                raise ValueError(f"snapshot tensor must be on CPU: {name}")
+                raise ValueError(f"weight tensor must be on CPU: {name}")
             if tensor.shape != self._slots[0][name].shape:
-                raise ValueError(f"snapshot shape does not match: {name}")
+                raise ValueError(f"weight shape does not match: {name}")
             if tensor.dtype != self._slots[0][name].dtype:
-                raise ValueError(f"snapshot dtype does not match: {name}")
+                raise ValueError(f"weight dtype does not match: {name}")
+
+    def reset(
+        self,
+        initial_weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Restore initial weights and discard the staged update."""
+        weights = tuple(initial_weights)
+
+        with self._lock:
+            self._validate_weights(weights)
+
+            if self._h2d_stream is not None:
+                self._h2d_stream.synchronize()
+
+            destination = self._slots[self._active_slot]
+            for name, source in weights:
+                destination[name].copy_(source)
+
+            self._staged = None
+            self._active_version = self._initial_version

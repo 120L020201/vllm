@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from queue import Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 
 import torch
 
@@ -95,6 +95,7 @@ class Eagle3CapturePacket:
 @dataclass(frozen=True, slots=True)
 class _FinishRequest:
     request_id: str
+    done: Event
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +155,15 @@ class Eagle3CaptureQueue:
 
     def finish_request(self, request_id: str) -> None:
         self.raise_if_failed()
-        self._queue.put_nowait(_FinishRequest(request_id))
+
+        item = _FinishRequest(
+            request_id=request_id,
+            done=Event(),
+        )
+        self._queue.put_nowait(item)
+
+        item.done.wait()
+        self.raise_if_failed()
 
     def close(self) -> None:
         self._queue.put(self._stop)
@@ -196,7 +205,7 @@ class Eagle3CaptureQueue:
                             "finished request does not match active request"
                         )
 
-                    consume_chunk()
+                    chunk.clear()
                     self._on_finish(item.request_id)
                     active_request_id = None
                     continue
@@ -231,6 +240,8 @@ class Eagle3CaptureQueue:
                 self._set_error(error)
                 return
             finally:
+                if isinstance(item, _FinishRequest):
+                    item.done.set()
                 self._queue.task_done()
 
     def _set_error(self, error: BaseException) -> None:

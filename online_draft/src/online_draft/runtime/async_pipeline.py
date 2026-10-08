@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 
 from online_draft.runtime.capture_runtime import Eagle3PreparedRound
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
@@ -38,6 +38,12 @@ class _RoundEvent:
 @dataclass(frozen=True, slots=True)
 class _CloseEpochEvent:
     request_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FinishRequestEvent:
+    request_id: str
+    done: Event
 
 
 class AsyncEagle3Pipeline:
@@ -87,6 +93,20 @@ class AsyncEagle3Pipeline:
     def close_epoch(self, request_id: str) -> int:
         return self._submit(_CloseEpochEvent(request_id))
 
+    def finish_request(self, request_id: str) -> None:
+        event = _FinishRequestEvent(
+            request_id=request_id,
+            done=Event(),
+        )
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pipeline is closed")
+            self._queue.put_nowait(event)
+
+        event.done.wait()
+        self.raise_if_failed()
+
     def poll_snapshot(self) -> DraftWeightSnapshot | None:
         with self._lock:
             snapshot = self._ready_snapshot
@@ -126,6 +146,13 @@ class AsyncEagle3Pipeline:
                 if event is self._stop:
                     return
 
+                if isinstance(event, _FinishRequestEvent):
+                    self._handle_finish_request(event.request_id)
+                    continue
+
+                if self.failed is not None:
+                    continue
+
                 if isinstance(event, _RoundEvent):
                     self._handle_round(event.round)
                 elif isinstance(event, _CloseEpochEvent):
@@ -134,8 +161,9 @@ class AsyncEagle3Pipeline:
                     raise RuntimeError("unknown EAGLE3 pipeline event")
             except Exception as error:
                 self._set_failure(error)
-                return
             finally:
+                if isinstance(event, _FinishRequestEvent):
+                    event.done.set()
                 self._queue.task_done()
 
     def _handle_round(self, prepared_round: Eagle3PreparedRound) -> None:
@@ -160,6 +188,20 @@ class AsyncEagle3Pipeline:
 
         if rounds:
             self._train(rounds)
+
+    def _handle_finish_request(self, request_id: str) -> None:
+        if self._request_id is not None and self._request_id != request_id:
+            raise RuntimeError("finished request does not match active request")
+
+        self._trainer.reset()
+        self._request_id = None
+        self._bootstrap_done = False
+        self._epoch_rounds.clear()
+        self._persistent_cache = None
+
+        with self._lock:
+            self._snapshot_pending = False
+            self._ready_snapshot = None
 
     def _train(
         self,

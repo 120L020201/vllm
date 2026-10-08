@@ -210,3 +210,41 @@ def test_unrelated_loss_does_not_advance_version() -> None:
     assert trainer.last_loss is None
     assert not trainer.optimizer.state
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_reset_restores_initial_training_state() -> None:
+    torch.manual_seed(5)
+
+    model = TinyModel()
+    trainer = DraftTrainer(
+        model,
+        TrainerConfig(
+            learning_rate=0.1,
+            frozen_parameter_prefixes=("frozen",),
+        ),
+    )
+    initial_parameters = {
+        name: parameter.detach().clone() for name, parameter in model.named_parameters()
+    }
+
+    inputs = torch.randn(4, 3)
+    loss = model(inputs).float().square().mean()
+    trainer.backward_and_step(loss)
+
+    assert trainer.version == 1
+    assert trainer.last_loss is not None
+    assert trainer.optimizer.state
+
+    trainer.reset()
+
+    assert trainer.version == 0
+    assert trainer.last_loss is None
+    assert not trainer.optimizer.state
+    assert all(parameter.grad is None for parameter in model.parameters())
+    assert tuple(name for name, _ in trainer.initial_weights) == (
+        "trainable.weight",
+        "trainable.bias",
+    )
+
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, initial_parameters[name])
