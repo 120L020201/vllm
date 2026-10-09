@@ -40,9 +40,9 @@ class Eagle3CaptureRuntime:
         draft_vocab_size: int,
         feature_dtype: torch.dtype,
         transfer_chunk_size: int,
-        on_round: Callable[[Eagle3PreparedRound], None],
-        on_epoch_close: Callable[[str], None],
-        on_finish: Callable[[str], None],
+        on_round: Callable[[Eagle3PreparedRound], object],
+        on_epoch_close: Callable[[str], object],
+        on_finish: Callable[[str], object],
         on_queue_size: Callable[[int], None] | None = None,
     ) -> None:
         self._hidden_size = hidden_size

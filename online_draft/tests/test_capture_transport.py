@@ -18,10 +18,14 @@ from online_draft.runtime.vllm_adapter import Eagle3VllmCaptureAdapter
 class _CaptureRuntime:
     def __init__(self) -> None:
         self.packets: list[Eagle3CapturePacket] = []
+        self.finished: list[str] = []
 
     def submit(self, packet: Eagle3CapturePacket) -> int:
         self.packets.append(packet)
         return len(self.packets)
+
+    def finish_request(self, request_id: str) -> None:
+        self.finished.append(request_id)
 
 
 def _packet(
@@ -181,6 +185,18 @@ def test_capture_runtime_forwards_finish() -> None:
         assert finished == ["request-0"]
     finally:
         runtime.close()
+
+
+def test_adapter_finishes_request_without_captured_proposal() -> None:
+    runtime = _CaptureRuntime()
+    adapter = Eagle3VllmCaptureAdapter(
+        runtime=runtime,  # type: ignore[arg-type]
+        target_token_ids=torch.tensor([1, 3]),
+        source_weight_version=lambda: 0,
+    )
+
+    assert adapter.finish_request("request-0") == 0
+    assert runtime.finished == ["request-0"]
 
 
 def test_next_prefill_submits_previous_proposal() -> None:

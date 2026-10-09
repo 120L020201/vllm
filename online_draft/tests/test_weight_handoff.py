@@ -42,25 +42,20 @@ def _snapshot(version: int) -> DraftWeightSnapshot:
     )
 
 
-def test_close_epoch_waits_for_successful_commit() -> None:
+def test_advance_returns_only_successful_commit() -> None:
     source = _SnapshotSource([_snapshot(1)])
     installer = _DelayedInstaller([None, 1])
-    closed: list[str] = []
     handoff = Eagle3WeightHandoff(
         snapshot_source=source,
         installer=installer,
-        on_epoch_close=closed.append,
     )
 
-    assert handoff.advance("request-0") is None
-    assert closed == []
-
-    assert handoff.advance("request-0") == 1
-    assert closed == ["request-0"]
+    assert handoff.advance() is None
+    assert handoff.advance() == 1
     assert installer.calls == ["stage", "commit", "commit"]
 
 
-def test_real_installer_switches_version_before_close() -> None:
+def test_real_installer_switches_version() -> None:
     active = {"weight": torch.tensor([0.0])}
     staging = {"weight": torch.tensor([0.0])}
 
@@ -69,16 +64,13 @@ def test_real_installer_switches_version_before_close() -> None:
         mutable_names=("weight",),
     )
     source = _SnapshotSource([_snapshot(1)])
-    versions: list[int] = []
     handoff = Eagle3WeightHandoff(
         snapshot_source=source,
         installer=installer,
-        on_epoch_close=lambda request_id: versions.append(installer.active_version),
     )
 
-    assert handoff.advance("request-0") == 1
+    assert handoff.advance() == 1
     assert installer.active_version == 1
-    assert versions == [1]
     assert torch.equal(
         installer.active_weights["weight"],
         torch.tensor([1.0]),

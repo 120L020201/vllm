@@ -164,7 +164,7 @@ class Eagle3VllmCaptureAdapter:
         self._step_id += 1
 
     def finish_request(self, request_id: str) -> int:
-        if request_id != self._request_id:
+        if self._request_id is not None and request_id != self._request_id:
             raise RuntimeError("request does not match active capture")
 
         self._runtime.finish_request(request_id)

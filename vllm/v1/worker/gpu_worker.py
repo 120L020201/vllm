@@ -102,10 +102,15 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
 
 
 if TYPE_CHECKING:
+    from online_draft.runtime.async_pipeline import AsyncEagle3Pipeline
+    from online_draft.runtime.vllm_adapter import Eagle3VllmCaptureAdapter
     from online_draft.training.trainer import DraftTrainer
 
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
+        EagleSpeculator,
+    )
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -178,6 +183,9 @@ class Worker(WorkerBase):
         self._weight_update_active = False
         self._weight_update_is_draft = False
         self._online_draft_trainer: DraftTrainer | None = None
+        self._online_draft_pipeline: AsyncEagle3Pipeline | None = None
+        self._online_draft_capture_adapter: Eagle3VllmCaptureAdapter | None = None
+        self._online_draft_speculator: EagleSpeculator | None = None
 
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -474,6 +482,10 @@ class Worker(WorkerBase):
             load_qwen3_eagle3_checkpoint,
             validate_qwen3_eagle3_weights,
         )
+        from online_draft.runtime.async_pipeline import AsyncEagle3Pipeline
+        from online_draft.runtime.capture_runtime import Eagle3CaptureRuntime
+        from online_draft.runtime.vllm_adapter import Eagle3VllmCaptureAdapter
+        from online_draft.runtime.weight_handoff import Eagle3WeightHandoff
         from online_draft.training.trainer import (
             DraftTrainer,
             TrainerConfig,
@@ -518,7 +530,62 @@ class Worker(WorkerBase):
         speculator.configure_online_training(
             trainer.trainable_parameter_names,
         )
+
+        installer = speculator.draft_weight_installer
+        assert installer is not None
+
+        pipeline = AsyncEagle3Pipeline(
+            trainer=trainer,
+            on_queue_size=lambda size: logger.debug(
+                "Online draft train queue size: %d",
+                size,
+            ),
+        )
+        runtime = Eagle3CaptureRuntime(
+            hidden_size=cpu_model.config.hidden_size,
+            num_aux_hidden_states=cpu_model.config.num_aux_hidden_states,
+            draft_vocab_size=cpu_model.config.draft_vocab_size,
+            feature_dtype=self.vllm_config.model_config.dtype,
+            transfer_chunk_size=1,
+            on_round=pipeline.submit_round,
+            on_epoch_close=pipeline.close_epoch,
+            on_finish=pipeline.finish_request,
+            on_queue_size=lambda size: logger.debug(
+                "Online draft capture queue size: %d",
+                size,
+            ),
+        )
+        adapter = Eagle3VllmCaptureAdapter(
+            runtime=runtime,
+            target_token_ids=cpu_model.get_target_token_ids().to(self.device),
+            source_weight_version=lambda: installer.active_version,
+        )
+        handoff = Eagle3WeightHandoff(
+            snapshot_source=pipeline,
+            installer=installer,
+        )
+
+        speculator.set_weight_handoff(handoff)
+
         self._online_draft_trainer = trainer
+        self._online_draft_pipeline = pipeline
+        self._online_draft_capture_adapter = adapter
+        self._online_draft_speculator = speculator
+
+    def _finish_online_draft_requests(
+        self,
+        request_ids: set[str],
+    ) -> None:
+        trainer = self._online_draft_trainer
+        speculator = self._online_draft_speculator
+        if trainer is None or speculator is None or speculator.capture_adapter is None:
+            return
+
+        for request_id in request_ids:
+            speculator.finish_request(
+                request_id,
+                trainer.initial_weights,
+            )
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -909,6 +976,13 @@ class Worker(WorkerBase):
             verbose=self.observability_config.jit_monitor_verbose,
         )
 
+        speculator = self._online_draft_speculator
+        if speculator is not None:
+            adapter = self._online_draft_capture_adapter
+            assert adapter is not None
+            speculator.set_capture_adapter(adapter)
+            logger.debug("Online draft capture enabled after warmup")
+
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
         freeze_gc_heap()
@@ -1109,6 +1183,9 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._finish_online_draft_requests(
+            scheduler_output.finished_req_ids,
+        )
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -1420,6 +1497,16 @@ class Worker(WorkerBase):
 
     def shutdown(self) -> None:
         gc.unfreeze()
+
+        if self._online_draft_capture_adapter is not None:
+            self._online_draft_capture_adapter.close()
+        if self._online_draft_pipeline is not None:
+            self._online_draft_pipeline.close()
+
+        self._online_draft_capture_adapter = None
+        self._online_draft_pipeline = None
+        self._online_draft_trainer = None
+        self._online_draft_speculator = None
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
