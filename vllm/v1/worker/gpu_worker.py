@@ -572,6 +572,11 @@ class Worker(WorkerBase):
         self._online_draft_capture_adapter = adapter
         self._online_draft_speculator = speculator
 
+    def _raise_if_online_draft_failed(self) -> None:
+        pipeline = self._online_draft_pipeline
+        if pipeline is not None:
+            pipeline.raise_if_failed()
+
     def _finish_online_draft_requests(
         self,
         request_ids: set[str],
@@ -1183,6 +1188,7 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._raise_if_online_draft_failed()
         self._finish_online_draft_requests(
             scheduler_output.finished_req_ids,
         )

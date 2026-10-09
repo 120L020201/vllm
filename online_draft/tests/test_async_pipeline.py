@@ -233,6 +233,7 @@ def test_training_failure_stops_pipeline_and_rejects_new_rounds() -> None:
         assert isinstance(pipeline.failed, RuntimeError)
         pipeline.submit_round(_make_round(1, 2, prompt=False))
         assert calls == 1
-    finally:
         with pytest.raises(RuntimeError, match="training failed"):
-            pipeline.close()
+            pipeline.raise_if_failed()
+    finally:
+        pipeline.close()

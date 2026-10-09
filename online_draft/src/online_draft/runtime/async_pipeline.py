@@ -120,7 +120,6 @@ class AsyncEagle3Pipeline:
                 self._queue.put(self._stop)
 
         self._worker.join()
-        self.raise_if_failed()
 
     def raise_if_failed(self) -> None:
         failure = self.failed

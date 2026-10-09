@@ -3,6 +3,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 import vllm.v1.worker.gpu_worker as gpu_worker
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -39,3 +41,16 @@ def test_shutdown_closes_online_draft_before_model_runner(monkeypatch) -> None:
     assert worker._online_draft_pipeline is None
     assert worker._online_draft_trainer is None
     assert worker._online_draft_speculator is None
+
+
+def test_online_draft_failure_stops_worker() -> None:
+    def raise_if_failed() -> None:
+        raise RuntimeError("training failed")
+
+    worker = object.__new__(Worker)
+    worker._online_draft_pipeline = SimpleNamespace(
+        raise_if_failed=raise_if_failed,
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        Worker._raise_if_online_draft_failed(worker)
