@@ -415,11 +415,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     .detach()
                     .clone()
                 )
-                self.last_prefill_length = torch.tensor(
-                    prefill_batch_desc.num_tokens,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+                self.last_prefill_length = self.last_token_indices[num_reqs - 1] + 1
 
                 self.on_prefill_input_embeds_ready(
                     num_reqs=num_reqs,
