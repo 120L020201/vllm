@@ -2,13 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
 
-from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
+    EagleSpeculator,
+    logger,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.weight_slots import (
     Eagle3WeightSlots,
 )
@@ -141,10 +145,12 @@ def test_finish_request_restores_initial_active_weights() -> None:
     speculator.capture_adapter = SimpleNamespace(finish_request=finish_request)
     speculator.draft_weight_installer = installer
     speculator.draft_weight_slots = slots
+    speculator._last_installed_round = 7
 
     speculator.finish_request("request-0", initial_weights)
 
     assert finished == ["request-0"]
+    assert speculator._last_installed_round == 0
     assert installer.active_version == 0
     assert installer.staged_version is None
     parameters = dict(draft.named_parameters())
@@ -152,3 +158,52 @@ def test_finish_request_restores_initial_active_weights() -> None:
         parameter = parameters[name]
         assert torch.equal(parameter, expected)
         assert parameter.data_ptr() == installer.active_weights[name].data_ptr()
+
+
+def test_weight_install_logs_rounds_since_previous_install() -> None:
+    installed: list[str] = []
+    speculator = object.__new__(EagleSpeculator)
+    speculator.capture_adapter = SimpleNamespace(completed_rounds=5)
+    speculator.weight_handoff = SimpleNamespace(advance=lambda: 2)
+    speculator._profile_online_draft = True
+    speculator._last_installed_round = 2
+    speculator.install_committed_weights = installed.append
+
+    with patch.object(logger, "info") as log_info:
+        speculator.on_prefill_input_embeds_ready(
+            num_reqs=1,
+            input_batch=SimpleNamespace(req_ids=["request-0"]),
+            aux_hidden_states=None,
+            num_sampled=torch.tensor([1]),
+            capture_enabled=False,
+        )
+
+    assert installed == ["request-0"]
+    assert speculator._last_installed_round == 5
+    log_info.assert_called_once_with(
+        "Online draft installed weights: request_id=%s version=%d rounds=%d",
+        "request-0",
+        2,
+        3,
+    )
+
+
+def test_weight_install_skips_profile_observation_when_disabled() -> None:
+    installed: list[str] = []
+    speculator = object.__new__(EagleSpeculator)
+    speculator.capture_adapter = SimpleNamespace()
+    speculator.weight_handoff = SimpleNamespace(advance=lambda: 2)
+    speculator._profile_online_draft = False
+    speculator.install_committed_weights = installed.append
+
+    with patch.object(logger, "info") as log_info:
+        speculator.on_prefill_input_embeds_ready(
+            num_reqs=1,
+            input_batch=SimpleNamespace(req_ids=["request-0"]),
+            aux_hidden_states=None,
+            num_sampled=torch.tensor([1]),
+            capture_enabled=False,
+        )
+
+    assert installed == ["request-0"]
+    log_info.assert_not_called()

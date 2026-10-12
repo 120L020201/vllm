@@ -44,6 +44,7 @@ class Eagle3CaptureRuntime:
         on_epoch_close: Callable[[str], object],
         on_finish: Callable[[str], object],
         on_queue_size: Callable[[int], None] | None = None,
+        profile_timeline: bool = False,
     ) -> None:
         self._hidden_size = hidden_size
         self._num_aux_hidden_states = num_aux_hidden_states
@@ -64,6 +65,7 @@ class Eagle3CaptureRuntime:
             on_finish=self._reset_request,
             on_close_epoch=self._handle_epoch_close,
             on_queue_size=on_queue_size,
+            profile_timeline=profile_timeline,
         )
 
     def submit(self, packet: Eagle3CapturePacket) -> int:

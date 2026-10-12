@@ -34,6 +34,8 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         self.draft_weight_installer: DraftWeightInstaller | None = None
         self.weight_handoff: Eagle3WeightHandoff | None = None
         self.capture_adapter: Any | None = None
+        self._profile_online_draft = False
+        self._last_installed_round = 0
 
     def set_capture_adapter(self, adapter: Any) -> None:
         self.capture_adapter = adapter
@@ -63,8 +65,11 @@ class EagleSpeculator(AutoRegressiveSpeculator):
     def configure_online_training(
         self,
         mutable_names: Iterable[str],
+        *,
+        profile_timeline: bool = False,
     ) -> None:
         assert self._online_target_model is not None
+        self._profile_online_draft = profile_timeline
 
         slots = Eagle3WeightSlots.from_models(
             target_model=self._online_target_model,
@@ -75,6 +80,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         self.draft_weight_installer = DraftWeightInstaller(
             slots=slots.slots,
             mutable_names=slots.owned_names,
+            profile_timeline=profile_timeline,
         )
 
     def install_committed_weights(
@@ -104,6 +110,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         self.draft_weight_slots.bind(
             self.draft_weight_installer.active_weights,
         )
+        self._last_installed_round = 0
 
     def on_prefill_input_embeds_ready(
         self,
@@ -139,10 +146,19 @@ class EagleSpeculator(AutoRegressiveSpeculator):
 
         request_id = input_batch.req_ids[0]
         self.install_committed_weights(request_id)
-        logger.debug(
-            "Online draft installed weights: request_id=%s version=%d",
+
+        if not self._profile_online_draft:
+            return
+
+        assert self.capture_adapter is not None
+        completed_rounds = self.capture_adapter.completed_rounds
+        rounds_since_install = completed_rounds - self._last_installed_round
+        self._last_installed_round = completed_rounds
+        logger.info(
+            "Online draft installed weights: request_id=%s version=%d rounds=%d",
             request_id,
             installed_version,
+            rounds_since_install,
         )
 
     def on_proposal_ready(

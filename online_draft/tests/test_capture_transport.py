@@ -247,3 +247,4 @@ def test_next_prefill_submits_previous_proposal() -> None:
         packet.confirmed_prefill_input_embeds,
         next_prefill_input_embeds,
     )
+    assert adapter.completed_rounds == 1

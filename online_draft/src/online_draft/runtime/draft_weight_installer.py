@@ -20,6 +20,7 @@ class DraftWeightInstaller:
         *,
         mutable_names: Iterable[str],
         initial_version: int = 0,
+        profile_timeline: bool = False,
     ) -> None:
         if len(slots) != 2:
             raise ValueError("slots must contain two mappings")
@@ -50,6 +51,7 @@ class DraftWeightInstaller:
         self._active_slot = 0
         self._initial_version = initial_version
         self._active_version = initial_version
+        self._profile_timeline = profile_timeline
         self._staged: tuple[DraftWeightSnapshot, torch.cuda.Event | None] | None = None
         self._lock = Lock()
         self._h2d_stream = (
@@ -80,6 +82,10 @@ class DraftWeightInstaller:
 
             inactive_slot = 1 - self._active_slot
             destination = self._slots[inactive_slot]
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_push(
+                    f"online_draft.h2d_stage[version={snapshot.version}]",
+                )
             if self._h2d_stream is None:
                 for name, source in snapshot.tensors:
                     destination[name].copy_(source)
@@ -90,6 +96,8 @@ class DraftWeightInstaller:
                         destination[name].copy_(source, non_blocking=True)
                     event = torch.cuda.Event()
                     event.record(self._h2d_stream)
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_pop()
 
             self._staged = (snapshot, event)
 
@@ -103,9 +111,15 @@ class DraftWeightInstaller:
             if event is not None and not event.query():
                 return None
 
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_push(
+                    f"online_draft.h2d_commit[version={snapshot.version}]",
+                )
             self._active_slot = 1 - self._active_slot
             self._active_version = snapshot.version
             self._staged = None
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_pop()
             return self._active_version
 
     def _validate_snapshot(self, snapshot: DraftWeightSnapshot) -> None:

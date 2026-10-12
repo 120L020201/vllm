@@ -54,6 +54,10 @@ class Eagle3VllmCaptureAdapter:
     def has_proposal(self) -> bool:
         return self._proposal is not None
 
+    @property
+    def completed_rounds(self) -> int:
+        return self._step_id
+
     def capture_teacher_logits(self, logits: torch.Tensor) -> None:
         """Project teacher logits before sampling modifies them."""
 

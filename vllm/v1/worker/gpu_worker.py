@@ -509,9 +509,13 @@ class Worker(WorkerBase):
         gpu_draft_model = self.get_draft_model()
         assert gpu_draft_model is not None
 
+        additional_config = cast(dict[str, Any], self.vllm_config.additional_config)
+        online_config = additional_config.get("online_draft", {})
+
         cpu_model = load_qwen3_eagle3_checkpoint(
             draft_model_config.model,
             dtype=self.vllm_config.model_config.dtype,
+            attention_backend=online_config.get("attention_backend"),
         )
         validate_qwen3_eagle3_weights(
             cpu_model,
@@ -520,15 +524,23 @@ class Worker(WorkerBase):
 
         trainer = DraftTrainer(
             cpu_model,
-            TrainerConfig(),
+            TrainerConfig(
+                fused=online_config.get("fused_optimizer", False),
+                frozen_parameter_prefixes=tuple(
+                    online_config.get("frozen_parameter_prefixes", ())
+                ),
+                check_gradients=online_config.get("check_gradients", True),
+            ),
         )
 
         model_runner = cast(GPUModelRunnerV2, self.model_runner)
         speculator = model_runner.speculator
         assert isinstance(speculator, EagleSpeculator)
 
+        profile_online_draft = envs.VLLM_ONLINE_DRAFT_PROFILE
         speculator.configure_online_training(
             trainer.trainable_parameter_names,
+            profile_timeline=profile_online_draft,
         )
 
         installer = speculator.draft_weight_installer
@@ -536,10 +548,15 @@ class Worker(WorkerBase):
 
         pipeline = AsyncEagle3Pipeline(
             trainer=trainer,
-            on_queue_size=lambda size: logger.debug(
-                "Online draft train queue size: %d",
-                size,
-            ),
+            on_queue_size=(
+                lambda size: logger.info(
+                    "Online draft train queue size: %d",
+                    size,
+                )
+            )
+            if profile_online_draft
+            else None,
+            profile_timeline=profile_online_draft,
         )
         runtime = Eagle3CaptureRuntime(
             hidden_size=cpu_model.config.hidden_size,
@@ -550,10 +567,15 @@ class Worker(WorkerBase):
             on_round=pipeline.submit_round,
             on_epoch_close=pipeline.close_epoch,
             on_finish=pipeline.finish_request,
-            on_queue_size=lambda size: logger.debug(
-                "Online draft capture queue size: %d",
-                size,
-            ),
+            on_queue_size=(
+                lambda size: logger.info(
+                    "Online draft capture queue size: %d",
+                    size,
+                )
+            )
+            if profile_online_draft
+            else None,
+            profile_timeline=profile_online_draft,
         )
         adapter = Eagle3VllmCaptureAdapter(
             runtime=runtime,

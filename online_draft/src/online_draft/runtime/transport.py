@@ -182,6 +182,7 @@ class Eagle3CaptureQueue:
         on_finish: Callable[[str], None],
         on_close_epoch: Callable[[str], None],
         on_queue_size: Callable[[int], None] | None = None,
+        profile_timeline: bool = False,
     ) -> None:
         if transfer_chunk_size <= 0:
             raise ValueError("transfer_chunk_size must be positive")
@@ -191,6 +192,7 @@ class Eagle3CaptureQueue:
         self._on_finish = on_finish
         self._on_close_epoch = on_close_epoch
         self._on_queue_size = on_queue_size
+        self._profile_timeline = profile_timeline
         self._queue: Queue[object] = Queue()
         self._stop = object()
 
@@ -253,6 +255,10 @@ class Eagle3CaptureQueue:
             if not chunk:
                 return
 
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_push(
+                    f"online_draft.d2h[rounds={len(chunk)}]",
+                )
             if chunk[0].ready is None:
                 cpu_chunk = tuple(packet.to_cpu() for packet in chunk)
             else:
@@ -275,8 +281,16 @@ class Eagle3CaptureQueue:
 
                 copy_done.synchronize()
                 cpu_chunk = tuple(cpu_packets)
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_pop()
 
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_push(
+                    f"online_draft.prepare[rounds={len(cpu_chunk)}]",
+                )
             self._consume_chunk(cpu_chunk)
+            if self._profile_timeline:
+                torch.cuda.nvtx.range_pop()
             chunk.clear()
 
         while True:
