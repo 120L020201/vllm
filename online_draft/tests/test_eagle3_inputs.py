@@ -382,7 +382,7 @@ def test_confirmed_path_packs_only_confirmed_queries() -> None:
     ]
     assert inputs.input_length == 5
     assert inputs.target_count == 5
-    assert fc_input_shapes == [torch.Size((1, 12)), torch.Size((1, 12))]
+    assert fc_input_shapes == [torch.Size((2, 12))]
     assert torch.equal(inputs.attention_mask, expected_mask)
 
     torch.testing.assert_close(

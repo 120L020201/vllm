@@ -130,6 +130,21 @@ def prepare_eagle3_training_inputs(
     Raises:
         ValueError: If the model and batch are incompatible.
     """
+    _validate_eagle3_training_batch(model, batch)
+
+    anchor_aux_hidden_states = batch.prefill_aux_hidden_states[-1:]
+    anchor_hidden_states = model.combine_hidden_states(anchor_aux_hidden_states)
+
+    return _assemble_eagle3_training_inputs(
+        batch,
+        anchor_hidden_states,
+    )
+
+
+def _validate_eagle3_training_batch(
+    model: Qwen3Eagle3ForCausalLM,
+    batch: Eagle3DistillationBatch,
+) -> None:
     feature_dtype = batch.prefill_input_embeds.dtype
 
     batch.validate(
@@ -147,13 +162,16 @@ def prepare_eagle3_training_inputs(
     if model_dtype != feature_dtype:
         raise ValueError("batch feature dtype must match the model parameter dtype")
 
+
+def _assemble_eagle3_training_inputs(
+    batch: Eagle3DistillationBatch,
+    anchor_hidden_states: torch.Tensor,
+) -> Eagle3TrainingInputs:
     # The proposal anchor is the final prefill input. Its persistent KV,
     # if present, must be excluded from the cache passed to this canvas.
     # Recomputing the anchor creates the first proposal logits and keeps
     # the anchor FC path differentiable.
     anchor_input_embeds = batch.prefill_input_embeds[-1:]
-    anchor_aux_hidden_states = batch.prefill_aux_hidden_states[-1:]
-    anchor_hidden_states = model.combine_hidden_states(anchor_aux_hidden_states)
 
     # These rows were generated during GPU draft inference and copied to
     # CPU as fixed training inputs. The CPU does not regenerate them from
@@ -304,9 +322,23 @@ def _prepare_eagle3_packed_window_inputs(
     if len(target_counts) != window.round_count:
         raise RuntimeError("every window round must have a target count")
 
+    for round_batch in window.rounds:
+        _validate_eagle3_training_batch(model, round_batch)
+
+    anchor_aux_hidden_states = torch.cat(
+        tuple(
+            round_batch.prefill_aux_hidden_states[-1:] for round_batch in window.rounds
+        ),
+        dim=0,
+    )
+    anchor_hidden_states = model.combine_hidden_states(anchor_aux_hidden_states)
+
     round_inputs = tuple(
-        prepare_eagle3_training_inputs(model, round_batch)
-        for round_batch in window.rounds
+        _assemble_eagle3_training_inputs(
+            round_batch,
+            anchor_hidden_states[index : index + 1],
+        )
+        for index, round_batch in enumerate(window.rounds)
     )
 
     for inputs, target_count in zip(round_inputs, target_counts, strict=True):
