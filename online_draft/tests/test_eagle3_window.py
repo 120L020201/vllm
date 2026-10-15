@@ -423,6 +423,39 @@ def test_confirmed_path_window_uses_one_optimizer_step() -> None:
     )
 
 
+def test_profile_timeline_labels_training_stages() -> None:
+    model = _make_model()
+    trainer = DraftTrainer(
+        model,
+        TrainerConfig(check_gradients=False),
+    )
+    window = Eagle3TrainingWindow(
+        rounds=(_make_batch(anchor_position=1),),
+    )
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+    ) as profiler:
+        train_eagle3_window(
+            trainer,
+            window,
+            None,
+            Eagle3WindowMode.CONFIRMED_PATH,
+            profile_timeline=True,
+        )
+
+    names = {event.key for event in profiler.key_averages()}
+    assert {
+        "online_draft.prepare_spine",
+        "online_draft.prepare_inputs",
+        "online_draft.forward",
+        "online_draft.loss",
+        "online_draft.backward",
+        "online_draft.optimizer",
+        "online_draft.rebuild_cache",
+    } <= names
+
+
 def test_later_confirmed_path_window_preserves_fixed_history() -> None:
     torch.manual_seed(11)
 

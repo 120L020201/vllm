@@ -13,6 +13,8 @@ from threading import Event, Lock, Thread
 
 import torch
 
+from online_draft.runtime import profile_range
+
 
 def _copy_to_cpu(
     tensor: torch.Tensor,
@@ -255,42 +257,34 @@ class Eagle3CaptureQueue:
             if not chunk:
                 return
 
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_push(
-                    f"online_draft.d2h[rounds={len(chunk)}]",
-                )
-            if chunk[0].ready is None:
-                cpu_chunk = tuple(packet.to_cpu() for packet in chunk)
-            else:
-                if d2h_stream is None:
-                    d2h_stream = torch.cuda.Stream(
-                        device=chunk[0].proposal_token_input_embeds.device,
-                    )
-
-                cpu_packets: list[Eagle3CapturePacket] = []
-                with torch.cuda.stream(d2h_stream):
-                    for packet in chunk:
-                        assert packet.ready is not None
-                        d2h_stream.wait_event(packet.ready)
-                        cpu_packets.append(
-                            packet.to_cpu(non_blocking=True),
+            name = f"online_draft.d2h[rounds={len(chunk)}]"
+            with profile_range(name, self._profile_timeline):
+                if chunk[0].ready is None:
+                    cpu_chunk = tuple(packet.to_cpu() for packet in chunk)
+                else:
+                    if d2h_stream is None:
+                        d2h_stream = torch.cuda.Stream(
+                            device=chunk[0].proposal_token_input_embeds.device,
                         )
 
-                    copy_done = torch.cuda.Event()
-                    copy_done.record(d2h_stream)
+                    cpu_packets: list[Eagle3CapturePacket] = []
+                    with torch.cuda.stream(d2h_stream):
+                        for packet in chunk:
+                            assert packet.ready is not None
+                            d2h_stream.wait_event(packet.ready)
+                            cpu_packets.append(
+                                packet.to_cpu(non_blocking=True),
+                            )
 
-                copy_done.synchronize()
-                cpu_chunk = tuple(cpu_packets)
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_pop()
+                        copy_done = torch.cuda.Event()
+                        copy_done.record(d2h_stream)
 
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_push(
-                    f"online_draft.prepare[rounds={len(cpu_chunk)}]",
-                )
-            self._consume_chunk(cpu_chunk)
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_pop()
+                    copy_done.synchronize()
+                    cpu_chunk = tuple(cpu_packets)
+
+            name = f"online_draft.prepare[rounds={len(cpu_chunk)}]"
+            with profile_range(name, self._profile_timeline):
+                self._consume_chunk(cpu_chunk)
             chunk.clear()
 
         while True:

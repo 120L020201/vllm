@@ -89,7 +89,8 @@ def test_bootstrap_and_epoch_close_publish_delayed_snapshots() -> None:
     prefill_positions: list[list[int]] = []
     trained = Event()
 
-    def train_window(trainer, window, persistent_cache, mode):
+    def train_window(trainer, window, persistent_cache, mode, profile_timeline):
+        assert not profile_timeline
         calls.append((window.round_count, persistent_cache is None, mode))
         prefill_positions.append(window.rounds[0].prefill_positions.tolist())
         trainer.version += 1
@@ -138,7 +139,8 @@ def test_queue_size_is_reported_while_training_is_busy() -> None:
     release = Event()
     queue_sizes: list[int] = []
 
-    def train_window(trainer, window, persistent_cache, mode):
+    def train_window(trainer, window, persistent_cache, mode, profile_timeline):
+        assert not profile_timeline
         entered.set()
         release.wait(timeout=5)
         trainer.version += 1
@@ -166,7 +168,8 @@ def test_finish_resets_pipeline_for_next_request() -> None:
     trainer = _FakeTrainer(nn.Linear(1, 1))
     cache_was_empty: list[bool] = []
 
-    def train_window(trainer, window, persistent_cache, mode):
+    def train_window(trainer, window, persistent_cache, mode, profile_timeline):
+        assert not profile_timeline
         cache_was_empty.append(persistent_cache is None)
         trainer.version += 1
         return f"cache-{trainer.version}", SimpleNamespace(
@@ -212,7 +215,8 @@ def test_training_failure_stops_pipeline_and_rejects_new_rounds() -> None:
     trainer = _FakeTrainer(nn.Linear(1, 1))
     calls = 0
 
-    def train_window(trainer, window, persistent_cache, mode):
+    def train_window(trainer, window, persistent_cache, mode, profile_timeline):
+        assert not profile_timeline
         nonlocal calls
         calls += 1
         raise RuntimeError("training failed")

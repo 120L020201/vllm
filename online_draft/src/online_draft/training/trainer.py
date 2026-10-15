@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from online_draft.runtime import profile_range
 
 
 @torch.compile(fullgraph=True)
@@ -104,11 +105,14 @@ class DraftTrainer:
     def backward_and_step(
         self,
         loss: torch.Tensor,
+        *,
+        profile_timeline: bool = False,
     ) -> float:
         """Backpropagate a finite scalar loss and update the model.
 
         Args:
             loss: Scalar loss connected to the trainer's model.
+            profile_timeline: Whether to annotate backward and optimizer.
 
         Returns:
             The detached FP32 loss value.
@@ -127,7 +131,8 @@ class DraftTrainer:
             raise ValueError("loss must be finite")
 
         try:
-            loss.backward()
+            with profile_range("online_draft.backward", profile_timeline):
+                loss.backward()
 
             if not any(
                 parameter.grad is not None
@@ -144,7 +149,8 @@ class DraftTrainer:
                 if gradients and not _gradients_are_finite(gradients).item():
                     raise ValueError("nonfinite gradients")
 
-            self.optimizer.step()
+            with profile_range("online_draft.optimizer", profile_timeline):
+                self.optimizer.step()
         except Exception:
             self.zero_grad()
             raise

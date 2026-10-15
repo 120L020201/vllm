@@ -8,8 +8,7 @@ from dataclasses import dataclass
 from queue import Queue
 from threading import Event, Lock, Thread
 
-import torch
-
+from online_draft.runtime import profile_range
 from online_draft.runtime.capture_runtime import Eagle3PreparedRound
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
 from online_draft.training.eagle3_cache import PersistentEagle3KVCache
@@ -27,6 +26,7 @@ TrainWindow = Callable[
         Eagle3TrainingWindow,
         PersistentEagle3KVCache,
         Eagle3WindowMode,
+        bool,
     ],
     tuple[PersistentEagle3KVCache, Eagle3WindowResult],
 ]
@@ -213,19 +213,18 @@ class AsyncEagle3Pipeline:
         window = Eagle3TrainingWindow(
             rounds=tuple(prepared_round.batch for prepared_round in rounds)
         )
-        if self._profile_timeline:
-            torch.cuda.nvtx.range_push(
-                f"online_draft.cpu_train[version={self._trainer.version + 1},"
-                f"rounds={len(rounds)}]"
-            )
-        updated_cache, result = self._train_window(
-            self._trainer,
-            window,
-            self._persistent_cache,
-            self._mode,
+        name = (
+            f"online_draft.cpu_train[version={self._trainer.version + 1},"
+            f"rounds={len(rounds)}]"
         )
-        if self._profile_timeline:
-            torch.cuda.nvtx.range_pop()
+        with profile_range(name, self._profile_timeline):
+            updated_cache, result = self._train_window(
+                self._trainer,
+                window,
+                self._persistent_cache,
+                self._mode,
+                self._profile_timeline,
+            )
         self._persistent_cache = updated_cache
         self._publish_snapshot(result.model_version)
 
@@ -235,16 +234,12 @@ class AsyncEagle3Pipeline:
             (name, named_parameters[name])
             for name in self._trainer.trainable_parameter_names
         )
-        if self._profile_timeline:
-            torch.cuda.nvtx.range_push(
-                f"online_draft.cpu_snapshot[version={version}]",
+        name = f"online_draft.cpu_snapshot[version={version}]"
+        with profile_range(name, self._profile_timeline):
+            snapshot = DraftWeightSnapshot.from_named_tensors(
+                tensors,
+                version=version,
             )
-        snapshot = DraftWeightSnapshot.from_named_tensors(
-            tensors,
-            version=version,
-        )
-        if self._profile_timeline:
-            torch.cuda.nvtx.range_pop()
 
         with self._lock:
             if self._ready_snapshot is not None:

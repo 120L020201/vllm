@@ -8,6 +8,7 @@ from threading import Lock
 
 import torch
 
+from online_draft.runtime import profile_range
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
 
 
@@ -82,22 +83,18 @@ class DraftWeightInstaller:
 
             inactive_slot = 1 - self._active_slot
             destination = self._slots[inactive_slot]
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_push(
-                    f"online_draft.h2d_stage[version={snapshot.version}]",
-                )
-            if self._h2d_stream is None:
-                for name, source in snapshot.tensors:
-                    destination[name].copy_(source)
-                event = None
-            else:
-                with torch.cuda.stream(self._h2d_stream):
+            profile_name = f"online_draft.h2d_stage[version={snapshot.version}]"
+            with profile_range(profile_name, self._profile_timeline):
+                if self._h2d_stream is None:
                     for name, source in snapshot.tensors:
-                        destination[name].copy_(source, non_blocking=True)
-                    event = torch.cuda.Event()
-                    event.record(self._h2d_stream)
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_pop()
+                        destination[name].copy_(source)
+                    event = None
+                else:
+                    with torch.cuda.stream(self._h2d_stream):
+                        for name, source in snapshot.tensors:
+                            destination[name].copy_(source, non_blocking=True)
+                        event = torch.cuda.Event()
+                        event.record(self._h2d_stream)
 
             self._staged = (snapshot, event)
 
@@ -111,15 +108,11 @@ class DraftWeightInstaller:
             if event is not None and not event.query():
                 return None
 
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_push(
-                    f"online_draft.h2d_commit[version={snapshot.version}]",
-                )
-            self._active_slot = 1 - self._active_slot
-            self._active_version = snapshot.version
-            self._staged = None
-            if self._profile_timeline:
-                torch.cuda.nvtx.range_pop()
+            profile_name = f"online_draft.h2d_commit[version={snapshot.version}]"
+            with profile_range(profile_name, self._profile_timeline):
+                self._active_slot = 1 - self._active_slot
+                self._active_version = snapshot.version
+                self._staged = None
             return self._active_version
 
     def _validate_snapshot(self, snapshot: DraftWeightSnapshot) -> None:

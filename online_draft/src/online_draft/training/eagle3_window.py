@@ -10,6 +10,7 @@ from online_draft.models.qwen3_eagle3 import (
     Eagle3KVCache,
     Qwen3Eagle3ForCausalLM,
 )
+from online_draft.runtime import profile_range
 from online_draft.training.eagle3_batch import (
     Eagle3DistillationBatch,
 )
@@ -142,6 +143,7 @@ def train_eagle3_window(
     window: Eagle3TrainingWindow,
     persistent_cache: PersistentEagle3KVCache,
     mode: Eagle3WindowMode,
+    profile_timeline: bool = False,
 ) -> tuple[Eagle3KVCache, Eagle3WindowResult]:
     """Train one EAGLE3 window with one optimizer update.
 
@@ -157,6 +159,7 @@ def train_eagle3_window(
         persistent_cache: Detached history through the first anchor, or
             None for the first window.
         mode: Window input and loss organization strategy.
+        profile_timeline: Whether to annotate the training stages.
 
     Returns:
         Updated persistent KV and metrics for the completed update.
@@ -176,45 +179,52 @@ def train_eagle3_window(
     )
 
     with torch.inference_mode(False), torch.enable_grad():
-        training_prefix = prepare_training_window_spine(
-            model,
-            window,
-            persistent_cache,
-        )
-        spine_length = persistent_cache_length(training_prefix)
-
-        if mode is Eagle3WindowMode.CONFIRMED_PATH:
-            training_inputs = prepare_eagle3_confirmed_path_inputs(
+        with profile_range("online_draft.prepare_spine", profile_timeline):
+            training_prefix = prepare_training_window_spine(
                 model,
                 window,
-                spine_length=spine_length,
+                persistent_cache,
             )
-        else:
-            training_inputs = prepare_eagle3_proposal_window_inputs(
-                model,
-                window,
-                spine_length=spine_length,
+            spine_length = persistent_cache_length(training_prefix)
+
+        with profile_range("online_draft.prepare_inputs", profile_timeline):
+            if mode is Eagle3WindowMode.CONFIRMED_PATH:
+                training_inputs = prepare_eagle3_confirmed_path_inputs(
+                    model,
+                    window,
+                    spine_length=spine_length,
+                )
+            else:
+                training_inputs = prepare_eagle3_proposal_window_inputs(
+                    model,
+                    window,
+                    spine_length=spine_length,
+                )
+
+        with profile_range("online_draft.forward", profile_timeline):
+            output = model(
+                positions=training_inputs.positions,
+                input_embeds=training_inputs.input_embeds,
+                hidden_states=training_inputs.hidden_states,
+                past_key_values=training_prefix,
+                attention_mask=training_inputs.attention_mask,
             )
+            hidden_states_for_loss = output.hidden_states
+            logits = model.compute_draft_logits(hidden_states_for_loss)
 
-        output = model(
-            positions=training_inputs.positions,
-            input_embeds=training_inputs.input_embeds,
-            hidden_states=training_inputs.hidden_states,
-            past_key_values=training_prefix,
-            attention_mask=training_inputs.attention_mask,
-        )
-        hidden_states_for_loss = output.hidden_states
-
-        logits = model.compute_draft_logits(hidden_states_for_loss)
-        loss = window_forward_kl_loss(
-            student_logits=logits,
-            teacher_probabilities=(training_inputs.teacher_probabilities),
-            rejection_target_mask=(training_inputs.rejection_target_mask),
-        )
+        with profile_range("online_draft.loss", profile_timeline):
+            loss = window_forward_kl_loss(
+                student_logits=logits,
+                teacher_probabilities=training_inputs.teacher_probabilities,
+                rejection_target_mask=training_inputs.rejection_target_mask,
+            )
 
         input_length = training_inputs.input_length
         target_count = training_inputs.target_count
-        loss_value = trainer.backward_and_step(loss)
+        loss_value = trainer.backward_and_step(
+            loss,
+            profile_timeline=profile_timeline,
+        )
 
         del loss
         del logits
@@ -223,12 +233,13 @@ def train_eagle3_window(
         del training_inputs
         del training_prefix
 
-    updated_cache = append_confirmed_window_to_persistent_cache(
-        model,
-        window,
-        persistent_cache,
-    )
-    updated_cache_length = persistent_cache_length(updated_cache)
+    with profile_range("online_draft.rebuild_cache", profile_timeline):
+        updated_cache = append_confirmed_window_to_persistent_cache(
+            model,
+            window,
+            persistent_cache,
+        )
+        updated_cache_length = persistent_cache_length(updated_cache)
 
     result = Eagle3WindowResult(
         loss=loss_value,
