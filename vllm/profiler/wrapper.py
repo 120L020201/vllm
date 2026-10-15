@@ -237,6 +237,11 @@ class TorchProfilerWrapper(WorkerProfiler):
             profile_memory=profiler_config.torch_profiler_with_memory,
             with_stack=profiler_config.torch_profiler_with_stack,
             with_flops=profiler_config.torch_profiler_with_flops,
+            experimental_config=torch.profiler._ExperimentalConfig(
+                profile_all_threads=True
+            )
+            if profiler_config.torch_profiler_all_threads
+            else None,
             on_trace_ready=trace_handler,
         )
 

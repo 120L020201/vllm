@@ -97,6 +97,10 @@ class ProfilerConfig:
     """If `True`, enables memory profiling in the torch profiler.
     Disabled by default."""
 
+    torch_profiler_all_threads: bool = False
+    """If `True`, records operators from all Python threads.
+    Disabled by default because this uses an experimental PyTorch option."""
+
     capture_torch_profiler: bool = False
     """If `True`, enables a torch profiler during CUDA graph capture on rank 0.
     Traces are saved to a `capture_traces` subdirectory under `torch_profiler_dir`.

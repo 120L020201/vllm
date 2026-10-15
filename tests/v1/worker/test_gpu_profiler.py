@@ -17,7 +17,11 @@ from vllm.config import (
 )
 from vllm.config.profiler import _is_uri_path
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import ProtonProfilerWrapper, WorkerProfiler
+from vllm.profiler.wrapper import (
+    ProtonProfilerWrapper,
+    TorchProfilerWrapper,
+    WorkerProfiler,
+)
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
@@ -65,6 +69,33 @@ def test_immediate_start_stop(default_profiler_config):
     assert profiler._running is False
     assert profiler._active is False
     assert profiler.stop_call_count == 1
+
+
+def test_torch_profiler_can_record_all_threads(tmp_path):
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_all_threads=True,
+    )
+    experimental_config = object()
+
+    with (
+        patch(
+            "torch.profiler._ExperimentalConfig",
+            return_value=experimental_config,
+        ) as make_experimental_config,
+        patch("torch.profiler.tensorboard_trace_handler"),
+        patch("torch.profiler.profile") as make_profiler,
+    ):
+        TorchProfilerWrapper(
+            config,
+            worker_name="rank_0",
+            local_rank=0,
+            activities=["CPU", "CUDA"],
+        )
+
+    make_experimental_config.assert_called_once_with(profile_all_threads=True)
+    assert make_profiler.call_args.kwargs["experimental_config"] is experimental_config
 
 
 def test_delayed_start(default_profiler_config):
