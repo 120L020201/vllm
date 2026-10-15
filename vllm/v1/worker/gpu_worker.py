@@ -525,6 +525,7 @@ class Worker(WorkerBase):
         trainer = DraftTrainer(
             cpu_model,
             TrainerConfig(
+                learning_rate=online_config.get("learning_rate", 1e-5),
                 fused=online_config.get("fused_optimizer", False),
                 frozen_parameter_prefixes=tuple(
                     online_config.get("frozen_parameter_prefixes", ())
@@ -541,6 +542,7 @@ class Worker(WorkerBase):
         speculator.configure_online_training(
             trainer.trainable_parameter_names,
             profile_timeline=profile_online_draft,
+            log_updates=online_config.get("log_updates", False),
         )
 
         installer = speculator.draft_weight_installer

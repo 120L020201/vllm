@@ -34,7 +34,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         self.draft_weight_installer: DraftWeightInstaller | None = None
         self.weight_handoff: Eagle3WeightHandoff | None = None
         self.capture_adapter: Any | None = None
-        self._profile_online_draft = False
+        self._log_online_draft_updates = False
         self._last_installed_round = 0
 
     def set_capture_adapter(self, adapter: Any) -> None:
@@ -67,9 +67,10 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         mutable_names: Iterable[str],
         *,
         profile_timeline: bool = False,
+        log_updates: bool = False,
     ) -> None:
         assert self._online_target_model is not None
-        self._profile_online_draft = profile_timeline
+        self._log_online_draft_updates = log_updates
 
         slots = Eagle3WeightSlots.from_models(
             target_model=self._online_target_model,
@@ -147,7 +148,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         request_id = input_batch.req_ids[0]
         self.install_committed_weights(request_id)
 
-        if not self._profile_online_draft:
+        if not self._log_online_draft_updates:
             return
 
         assert self.capture_adapter is not None

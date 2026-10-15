@@ -208,6 +208,7 @@ def test_consecutive_rounds_form_one_window() -> None:
     assert window.start_anchor_position == 4
     assert window.end_confirmed_position == 11
     assert window.proposal_target_count == 7
+    assert window.mean_acceptance_length == 3.5
 
     # The first round trains one accepted position plus the correction.
     # The second trains four accepted positions and excludes its bonus.
@@ -227,6 +228,7 @@ def test_single_round_is_a_valid_window() -> None:
     assert window.end_confirmed_position == 8
     assert window.proposal_target_count == 3
     assert window.confirmed_path_target_count == 1
+    assert window.mean_acceptance_length == 1.0
 
 
 def test_empty_window_is_invalid() -> None:
@@ -401,6 +403,7 @@ def test_confirmed_path_window_uses_one_optimizer_step() -> None:
     assert result.target_count == 5
     assert result.confirmed_length == 6
     assert result.persistent_cache_length == 8
+    assert result.mean_acceptance_length == 3.0
     assert math.isfinite(result.loss)
 
     assert not torch.equal(

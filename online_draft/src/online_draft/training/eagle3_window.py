@@ -97,6 +97,19 @@ class Eagle3TrainingWindow:
             for round_batch in self.rounds
         )
 
+    @property
+    def mean_acceptance_length(self) -> float:
+        """Return one plus the mean number of accepted draft tokens."""
+        accepted_tokens = sum(
+            (
+                round_batch.draft_length
+                if round_batch.rejection_position is None
+                else round_batch.rejection_position
+            )
+            for round_batch in self.rounds
+        )
+        return 1 + accepted_tokens / self.round_count
+
     def _validate_position_continuity(self) -> None:
         for previous, current in pairwise(self.rounds):
             previous_end = int(previous.confirmed_positions[-1].item())
@@ -121,6 +134,7 @@ class Eagle3WindowResult:
     target_count: int
     confirmed_length: int
     persistent_cache_length: int
+    mean_acceptance_length: float
 
 
 def train_eagle3_window(
@@ -225,6 +239,7 @@ def train_eagle3_window(
         target_count=target_count,
         confirmed_length=confirmed_length,
         persistent_cache_length=updated_cache_length,
+        mean_acceptance_length=window.mean_acceptance_length,
     )
 
     return updated_cache, result

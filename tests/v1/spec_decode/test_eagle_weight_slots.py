@@ -165,7 +165,7 @@ def test_weight_install_logs_rounds_since_previous_install() -> None:
     speculator = object.__new__(EagleSpeculator)
     speculator.capture_adapter = SimpleNamespace(completed_rounds=5)
     speculator.weight_handoff = SimpleNamespace(advance=lambda: 2)
-    speculator._profile_online_draft = True
+    speculator._log_online_draft_updates = True
     speculator._last_installed_round = 2
     speculator.install_committed_weights = installed.append
 
@@ -188,12 +188,12 @@ def test_weight_install_logs_rounds_since_previous_install() -> None:
     )
 
 
-def test_weight_install_skips_profile_observation_when_disabled() -> None:
+def test_weight_install_skips_update_log_when_disabled() -> None:
     installed: list[str] = []
     speculator = object.__new__(EagleSpeculator)
     speculator.capture_adapter = SimpleNamespace()
     speculator.weight_handoff = SimpleNamespace(advance=lambda: 2)
-    speculator._profile_online_draft = False
+    speculator._log_online_draft_updates = False
     speculator.install_committed_weights = installed.append
 
     with patch.object(logger, "info") as log_info:
