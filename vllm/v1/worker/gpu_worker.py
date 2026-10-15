@@ -511,6 +511,8 @@ class Worker(WorkerBase):
 
         additional_config = cast(dict[str, Any], self.vllm_config.additional_config)
         online_config = additional_config.get("online_draft", {})
+        profile_online_draft = envs.VLLM_ONLINE_DRAFT_PROFILE
+        log_queue_sizes = online_config.get("log_queue_sizes", False)
 
         cpu_model = load_qwen3_eagle3_checkpoint(
             draft_model_config.model,
@@ -538,7 +540,6 @@ class Worker(WorkerBase):
         speculator = model_runner.speculator
         assert isinstance(speculator, EagleSpeculator)
 
-        profile_online_draft = envs.VLLM_ONLINE_DRAFT_PROFILE
         speculator.configure_online_training(
             trainer.trainable_parameter_names,
             profile_timeline=profile_online_draft,
@@ -556,7 +557,7 @@ class Worker(WorkerBase):
                     size,
                 )
             )
-            if profile_online_draft
+            if log_queue_sizes
             else None,
             profile_timeline=profile_online_draft,
         )
@@ -575,7 +576,7 @@ class Worker(WorkerBase):
                     size,
                 )
             )
-            if profile_online_draft
+            if log_queue_sizes
             else None,
             profile_timeline=profile_online_draft,
         )
