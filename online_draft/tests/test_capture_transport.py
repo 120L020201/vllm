@@ -228,6 +228,7 @@ def test_next_prefill_submits_previous_proposal() -> None:
         request_id="request-0",
         verify_row_indices=torch.tensor([1]),
         target_aux_hidden_states=target_aux,
+        verified_draft_length=2,
         num_sampled=1,
         prefill_input_embeds=next_prefill_input_embeds,
         prefill_positions=torch.tensor([5]),
@@ -248,3 +249,56 @@ def test_next_prefill_submits_previous_proposal() -> None:
         next_prefill_input_embeds,
     )
     assert adapter.completed_rounds == 1
+
+
+def test_adapter_trims_proposal_to_verified_length() -> None:
+    runtime = _CaptureRuntime()
+    adapter = Eagle3VllmCaptureAdapter(
+        runtime=runtime,  # type: ignore[arg-type]
+        target_token_ids=torch.tensor([1, 3]),
+        source_weight_version=lambda: 0,
+    )
+
+    token_input_embeds = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    recurrent_hidden_states = token_input_embeds + 20
+    teacher_logits = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    target_aux = (torch.zeros(1, 2),)
+
+    adapter.capture_proposal(
+        request_id="request-0",
+        verify_row_indices=torch.tensor([0]),
+        target_aux_hidden_states=target_aux,
+        proposal=SimpleNamespace(
+            prefill_input_embeds=torch.zeros(1, 2),
+            prefill_positions=torch.tensor([4]),
+            prefill_length=torch.tensor(1),
+            draft_token_input_embeds=token_input_embeds,
+            draft_recurrent_hidden_states=recurrent_hidden_states,
+        ),
+    )
+    adapter.capture_teacher_logits(teacher_logits)
+
+    adapter.capture_prefill(
+        request_id="request-0",
+        verify_row_indices=torch.tensor([0]),
+        target_aux_hidden_states=target_aux,
+        verified_draft_length=5,
+        num_sampled=1,
+        prefill_input_embeds=torch.zeros(1, 2),
+        prefill_positions=torch.tensor([5]),
+        prefill_length=torch.tensor(1),
+    )
+
+    packet = runtime.packets[0]
+    assert torch.equal(
+        packet.proposal_token_input_embeds,
+        token_input_embeds[:4],
+    )
+    assert torch.equal(
+        packet.proposal_recurrent_hidden_states,
+        recurrent_hidden_states[:4],
+    )
+    assert torch.equal(
+        packet.teacher_logits,
+        teacher_logits[:5, [1, 3]],
+    )

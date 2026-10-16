@@ -103,6 +103,7 @@ class Eagle3VllmCaptureAdapter:
         request_id: str,
         verify_row_indices: torch.Tensor,
         target_aux_hidden_states: Sequence[torch.Tensor],
+        verified_draft_length: int,
         num_sampled: torch.Tensor | int,
         prefill_input_embeds: torch.Tensor,
         prefill_positions: torch.Tensor,
@@ -118,6 +119,10 @@ class Eagle3VllmCaptureAdapter:
 
         if self._teacher_logits is None:
             raise RuntimeError("teacher logits are missing")
+
+        if verified_draft_length == 0:
+            self._teacher_logits = None
+            return
 
         device = prefill_input_embeds.device
         sampled = self._as_device_scalar(num_sampled, device)
@@ -150,9 +155,13 @@ class Eagle3VllmCaptureAdapter:
             step_id=self._step_id,
             source_weight_version=self._proposal.source_weight_version,
             prompt_context=prompt_context,
-            proposal_token_input_embeds=(self._proposal.token_input_embeds),
-            proposal_recurrent_hidden_states=(self._proposal.recurrent_hidden_states),
-            teacher_logits=self._teacher_logits,
+            proposal_token_input_embeds=(
+                self._proposal.token_input_embeds[: verified_draft_length - 1]
+            ),
+            proposal_recurrent_hidden_states=(
+                self._proposal.recurrent_hidden_states[: verified_draft_length - 1]
+            ),
+            teacher_logits=self._teacher_logits[:verified_draft_length],
             verify_row_indices=captured_verify_row_indices,
             target_aux_hidden_states=captured_target_aux_hidden_states,
             num_sampled=sampled,

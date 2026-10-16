@@ -128,10 +128,16 @@ class EagleSpeculator(AutoRegressiveSpeculator):
             assert self.last_prefill_positions is not None
             assert self.last_prefill_length is not None
 
+            draft_lengths = input_batch.num_draft_tokens_per_req
+            verified_draft_length = (
+                0 if draft_lengths is None else int(draft_lengths[0])
+            )
+
             self.capture_adapter.capture_prefill(
                 request_id=input_batch.req_ids[0],
                 verify_row_indices=input_batch.logits_indices,
                 target_aux_hidden_states=aux_hidden_states,
+                verified_draft_length=verified_draft_length,
                 num_sampled=num_sampled[0],
                 prefill_input_embeds=self.last_prefill_input_embeds,
                 prefill_positions=self.last_prefill_positions,
