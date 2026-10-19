@@ -6,6 +6,6 @@
 import os
 
 if os.environ.get("OSD_METHOD") in {"tts", "random_sampling", "ospec"}:
-    from methods.utils.factory import install
+    from methods.utils.gpu_factory import install
 
     install()

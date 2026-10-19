@@ -29,7 +29,9 @@ _REQUEST_TIMING_METRICS = {
     "decode": "vllm:request_decode_time_seconds",
 }
 _BENCHMARK_PATTERN = re.compile(
-    r"^(?P<name>[A-Za-z0-9_.-]+)(?:\[(?P<sample_size>[0-9]+)\])?$"
+    r"^(?P<name>[A-Za-z0-9_.-]+)"
+    r"(?:(?:\((?P<sample_size>[0-9]+)\))|"
+    r"\[(?P<question_number>[0-9]+)\])?$"
 )
 
 
@@ -37,6 +39,7 @@ _BENCHMARK_PATTERN = re.compile(
 class BenchmarkSpec:
     name: str
     sample_size: int | None = None
+    question_number: int | None = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -45,12 +48,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--benchmarks", required=True)
+    parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--max-output-tokens", type=int, required=True)
     parser.add_argument("--max-prompt-tokens", type=int, required=True)
     parser.add_argument("--temperature", type=float, required=True)
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
+    parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--presence-penalty", type=float, required=True)
+    parser.add_argument("--frequency-penalty", type=float, default=0.0)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--stop-token-ids", default="151645,151643")
+    parser.add_argument("--warmup-tokens", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--enable-thinking",
@@ -85,9 +94,15 @@ def _parse_benchmark_specs(value: str) -> list[BenchmarkSpec]:
             raise ValueError(f"duplicate benchmark: {name}")
         raw_sample_size = match.group("sample_size")
         sample_size = int(raw_sample_size) if raw_sample_size is not None else None
+        raw_question_number = match.group("question_number")
+        question_number = (
+            int(raw_question_number) if raw_question_number is not None else None
+        )
         if sample_size is not None and sample_size < 1:
             raise ValueError(f"benchmark sample size must be positive: {item}")
-        specs.append(BenchmarkSpec(name, sample_size))
+        if question_number is not None and question_number < 1:
+            raise ValueError(f"benchmark question number must be positive: {item}")
+        specs.append(BenchmarkSpec(name, sample_size, question_number))
         names.add(name)
     if not specs:
         raise ValueError("BENCHMARKS must not be empty")
@@ -107,6 +122,13 @@ def _select_benchmark_records(
             if line.strip():
                 records.append((line_number, json.loads(line)))
 
+    if spec.question_number is not None:
+        if spec.question_number > len(records):
+            raise ValueError(
+                f"{spec.name} requested question {spec.question_number}, "
+                f"but only {len(records)} are available"
+            )
+        return [records[spec.question_number - 1]]
     if spec.sample_size is None:
         return records
     if spec.sample_size > len(records):
@@ -135,45 +157,123 @@ def _prompt(record: dict[str, Any]) -> str:
     raise ValueError("record has no supported prompt field")
 
 
-def _request_body(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
-    return {
+def _request_body(
+    args: argparse.Namespace,
+    prompt: str,
+    *,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    output_limit = args.max_output_tokens if max_tokens is None else max_tokens
+    if output_limit < 1:
+        raise ValueError("a positive per-request output limit is required")
+    body = {
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
         "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
-        "max_tokens": args.max_output_tokens,
-        "truncate_prompt_tokens": args.max_prompt_tokens,
-        "truncation_side": "left",
+        "max_tokens": output_limit,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "min_p": getattr(args, "min_p", 0.0),
         "presence_penalty": args.presence_penalty,
+        "frequency_penalty": getattr(args, "frequency_penalty", 0.0),
+        "repetition_penalty": getattr(args, "repetition_penalty", 1.0),
+        "stop_token_ids": _parse_token_ids(
+            getattr(args, "stop_token_ids", "151645,151643")
+        ),
         "seed": args.seed,
         "stream": False,
     }
+    if args.max_prompt_tokens:
+        body["truncate_prompt_tokens"] = args.max_prompt_tokens
+        body["truncation_side"] = "left"
+    return body
+
+
+def _parse_token_ids(value: str) -> list[int]:
+    if not value.strip():
+        return []
+    try:
+        token_ids = [int(item.strip()) for item in value.split(",")]
+    except ValueError as exc:
+        raise ValueError("stop token IDs must be comma-separated integers") from exc
+    if any(token_id < 0 for token_id in token_ids):
+        raise ValueError("stop token IDs must be nonnegative")
+    return token_ids
+
+
+def _tokenize_prompt(args: argparse.Namespace, prompt: str) -> int:
+    body = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
+    }
+    request = urllib.request.Request(
+        f"{args.base_url.rstrip('/')}/tokenize",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=args.request_timeout) as response:
+        payload = json.load(response)
+    return int(payload["count"])
+
+
+def _output_token_limit(
+    max_model_len: int,
+    prompt_tokens: int,
+    configured_limit: int,
+    max_prompt_tokens: int = 0,
+) -> int:
+    effective_prompt_tokens = (
+        min(prompt_tokens, max_prompt_tokens) if max_prompt_tokens else prompt_tokens
+    )
+    remaining = max_model_len - effective_prompt_tokens
+    if remaining < 1:
+        raise ValueError(
+            f"prompt uses {effective_prompt_tokens} tokens, leaving no generation "
+            f"space in the {max_model_len}-token context"
+        )
+    return min(remaining, configured_limit) if configured_limit else remaining
 
 
 def _request_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "endpoint": "/v1/chat/completions",
         "model": args.model,
+        "max_model_len": args.max_model_len,
         "max_output_tokens": args.max_output_tokens,
         "max_prompt_tokens": args.max_prompt_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "min_p": args.min_p,
         "presence_penalty": args.presence_penalty,
+        "frequency_penalty": args.frequency_penalty,
+        "repetition_penalty": args.repetition_penalty,
+        "stop_token_ids": _parse_token_ids(args.stop_token_ids),
+        "warmup_tokens": getattr(args, "warmup_tokens", 16),
         "enable_thinking": args.enable_thinking,
         "seed": args.seed,
         "benchmarks": args.benchmarks,
     }
 
 
-def _request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
-    body = _request_body(args, prompt)
+def _request(
+    args: argparse.Namespace,
+    prompt: str,
+    *,
+    max_tokens: int | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    body = _request_body(args, prompt, max_tokens=max_tokens)
+    headers = {"Content-Type": "application/json"}
+    if request_id is not None:
+        headers["X-Request-Id"] = request_id
     request = urllib.request.Request(
         f"{args.base_url.rstrip('/')}/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=args.request_timeout) as response:
@@ -630,15 +730,18 @@ def _prepare_resume(
 def main() -> None:
     args = _parse_args()
     if (
-        args.max_output_tokens < 1
-        or args.max_prompt_tokens < 1
+        args.max_model_len < 1
+        or args.max_output_tokens < 0
+        or args.max_prompt_tokens < 0
         or args.top_k < -1
         or args.seed < 0
+        or args.warmup_tokens < 0
     ):
         raise ValueError(
-            "max output and prompt tokens must be positive, top-k >= -1, "
-            "and seed nonnegative"
+            "model length must be positive; output, prompt, seed, and warmup "
+            "limits must be nonnegative; top-k must be >= -1"
         )
+    _parse_token_ids(args.stop_token_ids)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     benchmark_specs = _parse_benchmark_specs(args.benchmarks)
     benchmark_records = {
@@ -654,6 +757,14 @@ def main() -> None:
         benchmark: {line_number for line_number, _ in records}
         for benchmark, records in benchmark_records.items()
     }
+
+    if args.warmup_tokens:
+        _request(
+            args,
+            "Warm up.",
+            max_tokens=args.warmup_tokens,
+            request_id="_warmup_run_sh",
+        )
 
     request_config = _request_config(args)
     completed_keys: set[ResultKey] = set()
@@ -693,11 +804,18 @@ def main() -> None:
                 if key in completed_keys:
                     continue
                 prompt = _prompt(record)
+                tokenized_prompt_tokens = _tokenize_prompt(args, prompt)
+                output_limit = _output_token_limit(
+                    args.max_model_len,
+                    tokenized_prompt_tokens,
+                    args.max_output_tokens,
+                    args.max_prompt_tokens,
+                )
                 metrics_before = _fetch_server_metrics(args.base_url)
                 worker_before = _read_worker_stats(args.stats_file)
                 started = time.monotonic()
                 try:
-                    response = _request(args, prompt)
+                    response = _request(args, prompt, max_tokens=output_limit)
                     error = None
                 except (urllib.error.HTTPError, urllib.error.URLError) as exc:
                     response = None
@@ -740,6 +858,8 @@ def main() -> None:
                     "line": line_number,
                     "id": record.get("id"),
                     "prompt": prompt,
+                    "tokenized_prompt_tokens": tokenized_prompt_tokens,
+                    "requested_max_tokens": output_limit,
                     "request_config": request_config,
                     "response": response,
                     "error": error,
