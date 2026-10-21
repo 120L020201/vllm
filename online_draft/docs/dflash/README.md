@@ -72,6 +72,20 @@ batch、loss 或 KV 内容。Bootstrap、epoch、snapshot 和 reset 仍由公共
 推理侧，推理侧领取快照后调用 `installer.advance(snapshot)`，先 stage 再检查
 commit；没有新快照时传入 `None`，仍检查此前 H2D 是否完成。无需单独的 handoff 对象。
 
+vLLM 推理侧的状态与参数绑定位于 `vllm/v1/worker/gpu/spec_decode/`：
+
+- [`weight_slots.py`](../../../vllm/v1/worker/gpu/spec_decode/weight_slots.py)
+  是两种模型共用的 `DraftWeightSlots`，分配两份 draft 自有参数存储并绑定活动参数。
+- [`eagle/online.py`](../../../vllm/v1/worker/gpu/spec_decode/eagle/online.py)
+  的 `Eagle3OnlineState` 持有 slot、installer、snapshot 领取回调、capture adapter
+  引用和安装轮次计数，负责安装、窗口关闭日志及请求 reset。
+- [`dflash/online.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/online.py)
+  的 `DFlashOnlineState` 管理对应生命周期，`DFlashWeightSlots` 额外维护 fused KV
+  和 norm 派生 buffer；这些模型专用内容不进入公共 slot。
+
+各模型的 `speculator.py` 保留推理计算和 capture hook，在原来的边界调用在线状态
+对象。Worker 仍负责配置、连接 pipeline，并在 warmup 结束后启用 capture。
+
 推理线程提交 FC 快照与 ready event，capture 线程在独立 D2H stream 搬运。
 训练线程发布 pinned snapshot；installer 在私有 stream 提交 H2D，通过 event
 query 安装完成的权重，不等待 CPU 训练或未完成的 H2D。只有安装成功才绑定参数，

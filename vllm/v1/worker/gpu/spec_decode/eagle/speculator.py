@@ -2,25 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
-from vllm.v1.worker.gpu.spec_decode.weight_slots import (
-    DraftWeightSlots,
-)
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
+    from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
+
+    from vllm.v1.worker.gpu.spec_decode.eagle.online import Eagle3OnlineState
 
 
 class EagleSpeculator(AutoRegressiveSpeculator):
@@ -29,21 +28,20 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         self.online_draft_training_enabled = envs.VLLM_ONLINE_DRAFT_TRAIN
         self.explicit_input_embeds = self.online_draft_training_enabled
         self._online_target_model: nn.Module | None = None
-        self.draft_weight_slots: DraftWeightSlots | None = None
-        self.draft_weight_installer: DraftWeightInstaller | None = None
-        self._poll_snapshot: Callable[[], DraftWeightSnapshot | None] | None = None
-        self.capture_adapter: Any | None = None
-        self._log_online_draft_updates = False
-        self._last_installed_round = 0
+        self.online_state: Eagle3OnlineState | None = None
+        self.capture_adapter: Eagle3CaptureAdapter | None = None
 
-    def set_capture_adapter(self, adapter: Any) -> None:
+    def set_capture_adapter(self, adapter: "Eagle3CaptureAdapter") -> None:
+        assert self.online_state is not None
         self.capture_adapter = adapter
+        self.online_state.adapter = adapter
 
     def set_snapshot_source(
         self,
-        poll_snapshot: Callable[[], DraftWeightSnapshot | None],
+        poll_snapshot: Callable[[], "DraftWeightSnapshot | None"],
     ) -> None:
-        self._poll_snapshot = poll_snapshot
+        assert self.online_state is not None
+        self.online_state.poll_snapshot = poll_snapshot
 
     def on_target_logits_ready(self, logits: torch.Tensor) -> None:
         if self.capture_adapter is not None:
@@ -68,49 +66,28 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         profile_timeline: bool = False,
         log_updates: bool = False,
     ) -> None:
-        assert self._online_target_model is not None
-        self._log_online_draft_updates = log_updates
+        from vllm.v1.worker.gpu.spec_decode.eagle.online import Eagle3OnlineState
 
-        slots = DraftWeightSlots.from_models(
+        assert self._online_target_model is not None
+        self.online_state = Eagle3OnlineState(
             target_model=self._online_target_model,
             draft_model=self.model,
             mutable_names=mutable_names,
-        )
-        self.draft_weight_slots = slots
-        self.draft_weight_installer = DraftWeightInstaller(
-            slots=slots.slots,
-            mutable_names=slots.owned_names,
             profile_timeline=profile_timeline,
+            log_updates=log_updates,
         )
 
-    def install_committed_weights(
-        self,
-        request_id: str,
-    ) -> None:
-        assert self.draft_weight_slots is not None
-        assert self.draft_weight_installer is not None
-        assert self.capture_adapter is not None
-
-        self.draft_weight_slots.bind(
-            self.draft_weight_installer.active_weights,
-        )
-        self.capture_adapter.close_epoch(request_id)
+    @property
+    def draft_weight_installer(self) -> "DraftWeightInstaller | None":
+        return None if self.online_state is None else self.online_state.installer
 
     def finish_request(
         self,
         request_id: str,
         initial_weights: Iterable[tuple[str, torch.Tensor]],
     ) -> None:
-        assert self.capture_adapter is not None
-        assert self.draft_weight_installer is not None
-        assert self.draft_weight_slots is not None
-
-        self.capture_adapter.finish_request(request_id)
-        self.draft_weight_installer.reset(initial_weights)
-        self.draft_weight_slots.bind(
-            self.draft_weight_installer.active_weights,
-        )
-        self._last_installed_round = 0
+        assert self.online_state is not None
+        self.online_state.finish(request_id, initial_weights)
 
     def on_prefill_input_embeds_ready(
         self,
@@ -137,30 +114,11 @@ class EagleSpeculator(AutoRegressiveSpeculator):
                 prefill_length=num_sampled[0],
             )
 
-        if self._poll_snapshot is None:
+        if self.online_state is None:
             return
 
-        assert self.draft_weight_installer is not None
-        installed_version = self.draft_weight_installer.advance(self._poll_snapshot())
-        if installed_version is None:
-            return
-
-        request_id = input_batch.req_ids[0]
-        self.install_committed_weights(request_id)
-
-        if not self._log_online_draft_updates:
-            return
-
-        assert self.capture_adapter is not None
-        completed_rounds = self.capture_adapter.completed_rounds
-        rounds_since_install = completed_rounds - self._last_installed_round
-        self._last_installed_round = completed_rounds
-        logger.info(
-            "Online draft installed weights: request_id=%s version=%d rounds=%d",
-            request_id,
-            installed_version,
-            rounds_since_install,
-        )
+        if self.online_state.advance() is not None:
+            self.online_state.close_epoch(input_batch.req_ids[0])
 
     def on_proposal_ready(
         self,

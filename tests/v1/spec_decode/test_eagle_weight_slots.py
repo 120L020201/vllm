@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 import torch
@@ -10,10 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
-from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
-    EagleSpeculator,
-    logger,
-)
+from vllm.v1.worker.gpu.spec_decode.eagle.online import logger
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.weight_slots import (
     DraftWeightSlots,
 )
@@ -225,76 +223,104 @@ def test_bind_switches_draft_owned_parameters() -> None:
     assert draft.embed_tokens is target.embed_tokens
 
 
-def test_prefill_installs_snapshot_and_binds_before_closing_epoch() -> None:
-    target = nn.Module()
+def _eagle_speculator(*, log_updates: bool = False) -> EagleSpeculator:
     draft = nn.Module()
     draft.projection = nn.Linear(2, 2)
-    mutable_names = tuple(dict(draft.named_parameters()))
-    slots = DraftWeightSlots.from_models(target, draft, mutable_names)
-    installer = DraftWeightInstaller(
-        slots.slots,
-        mutable_names=mutable_names,
+    speculator = object.__new__(EagleSpeculator)
+    speculator.model = draft
+    speculator._online_target_model = nn.Module()
+    speculator.capture_adapter = None
+    speculator.configure_online_training(
+        tuple(dict(draft.named_parameters())), log_updates=log_updates
     )
+    return speculator
+
+
+def test_prefill_captures_before_install_and_binds_before_closing_epoch() -> None:
+    speculator = _eagle_speculator()
+    installer = speculator.draft_weight_installer
     snapshot = DraftWeightSnapshot.from_named_tensors(
         [
             (name, torch.full_like(tensor, 3.0))
-            for name, tensor in slots.slots[0].items()
+            for name, tensor in installer.active_weights.items()
         ],
         version=1,
         pin_memory=False,
     )
-    closed: list[str] = []
+    events: list[tuple[str, int]] = []
 
     def close_epoch(request_id: str) -> None:
-        for name, parameter in draft.named_parameters():
+        assert request_id == "request-0"
+        for name, parameter in speculator.model.named_parameters():
             assert parameter.data_ptr() == installer.active_weights[name].data_ptr()
-        closed.append(request_id)
+        events.append(("close", installer.active_version))
 
-    speculator = object.__new__(EagleSpeculator)
-    speculator.capture_adapter = SimpleNamespace(close_epoch=close_epoch)
-    speculator.draft_weight_installer = installer
-    speculator.draft_weight_slots = slots
-    speculator._log_online_draft_updates = False
+    speculator.set_capture_adapter(
+        SimpleNamespace(
+            capture_prefill=lambda **kwargs: events.append(
+                ("capture", installer.active_version)
+            ),
+            close_epoch=close_epoch,
+        )
+    )
+    speculator.last_prefill_input_embeds = torch.zeros(1, 2)
+    speculator.last_prefill_positions = torch.tensor([0])
+    speculator.last_prefill_length = torch.tensor(1)
     snapshots = iter([snapshot])
     speculator.set_snapshot_source(lambda: next(snapshots, None))
 
     for _ in range(2):
         speculator.on_prefill_input_embeds_ready(
             num_reqs=1,
-            input_batch=SimpleNamespace(req_ids=["request-0"]),
-            aux_hidden_states=None,
+            input_batch=SimpleNamespace(
+                req_ids=["request-0"], logits_indices=torch.tensor([0])
+            ),
+            aux_hidden_states=[torch.zeros(1, 2)],
             num_sampled=torch.tensor([1]),
-            capture_enabled=False,
+            capture_enabled=True,
         )
 
     assert installer.active_version == 1
-    assert closed == ["request-0"]
+    assert events == [("capture", 0), ("close", 1), ("capture", 1)]
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_prefill_without_snapshot_does_not_require_live_request(configured) -> None:
+    if configured:
+        speculator = _eagle_speculator()
+        speculator.set_snapshot_source(lambda: None)
+    else:
+        speculator = object.__new__(EagleSpeculator)
+        speculator.online_state = None
+        speculator.capture_adapter = None
+
+    speculator.on_prefill_input_embeds_ready(
+        num_reqs=0,
+        input_batch=SimpleNamespace(req_ids=[]),
+        aux_hidden_states=None,
+        num_sampled=torch.empty(0, dtype=torch.int32),
+        capture_enabled=False,
+    )
 
 
 def test_finish_request_restores_initial_active_weights() -> None:
-    target = nn.Module()
-    draft = nn.Module()
-    draft.projection = nn.Linear(2, 2)
-    mutable_names = tuple(dict(draft.named_parameters()))
-    slots = DraftWeightSlots.from_models(target, draft, mutable_names)
+    speculator = _eagle_speculator()
+    state = speculator.online_state
+    installer = speculator.draft_weight_installer
     initial_weights = tuple(
-        (name, tensor.clone()) for name, tensor in slots.slots[0].items()
-    )
-    installer = DraftWeightInstaller(
-        slots.slots,
-        mutable_names=mutable_names,
+        (name, tensor.clone()) for name, tensor in installer.active_weights.items()
     )
     snapshot = DraftWeightSnapshot.from_named_tensors(
         [
             (name, torch.full_like(tensor, 3.0))
-            for name, tensor in slots.slots[0].items()
+            for name, tensor in installer.active_weights.items()
         ],
         version=1,
         pin_memory=False,
     )
     installer.stage(snapshot)
     assert installer.commit_if_ready() == 1
-    slots.bind(installer.active_weights)
+    state.slots.bind(installer.active_weights)
 
     finished: list[str] = []
 
@@ -302,71 +328,63 @@ def test_finish_request_restores_initial_active_weights() -> None:
         assert installer.active_version == 1
         finished.append(request_id)
 
-    speculator = object.__new__(EagleSpeculator)
-    speculator.capture_adapter = SimpleNamespace(finish_request=finish_request)
-    speculator.draft_weight_installer = installer
-    speculator.draft_weight_slots = slots
-    speculator._last_installed_round = 7
+    speculator.set_capture_adapter(SimpleNamespace(finish_request=finish_request))
+    state._last_installed_round = 7
 
     speculator.finish_request("request-0", initial_weights)
 
     assert finished == ["request-0"]
-    assert speculator._last_installed_round == 0
+    assert state._last_installed_round == 0
     assert installer.active_version == 0
     assert installer.staged_version is None
-    parameters = dict(draft.named_parameters())
+    parameters = dict(speculator.model.named_parameters())
     for name, expected in initial_weights:
         parameter = parameters[name]
         assert torch.equal(parameter, expected)
         assert parameter.data_ptr() == installer.active_weights[name].data_ptr()
 
 
-def test_weight_install_logs_rounds_since_previous_install() -> None:
+@pytest.mark.parametrize("log_updates", [False, True])
+def test_weight_install_logs_rounds_only_when_enabled(log_updates) -> None:
     installed: list[str] = []
-    speculator = object.__new__(EagleSpeculator)
-    speculator.capture_adapter = SimpleNamespace(completed_rounds=5)
-    speculator.set_snapshot_source(lambda: None)
-    speculator.draft_weight_installer = SimpleNamespace(advance=lambda snapshot: 2)
-    speculator._log_online_draft_updates = True
-    speculator._last_installed_round = 2
-    speculator.install_committed_weights = installed.append
-
-    with patch.object(logger, "info") as log_info:
-        speculator.on_prefill_input_embeds_ready(
-            num_reqs=1,
-            input_batch=SimpleNamespace(req_ids=["request-0"]),
-            aux_hidden_states=None,
-            num_sampled=torch.tensor([1]),
-            capture_enabled=False,
+    speculator = _eagle_speculator(log_updates=log_updates)
+    installer = speculator.draft_weight_installer
+    adapter = SimpleNamespace(completed_rounds=0, close_epoch=installed.append)
+    speculator.set_capture_adapter(adapter)
+    snapshots = iter(
+        DraftWeightSnapshot.from_named_tensors(
+            [
+                (name, tensor + version)
+                for name, tensor in installer.active_weights.items()
+            ],
+            version=version,
+            pin_memory=False,
         )
-
-    assert installed == ["request-0"]
-    assert speculator._last_installed_round == 5
-    log_info.assert_called_once_with(
-        "Online draft installed weights: request_id=%s version=%d rounds=%d",
-        "request-0",
-        2,
-        3,
+        for version in (1, 2)
     )
-
-
-def test_weight_install_skips_update_log_when_disabled() -> None:
-    installed: list[str] = []
-    speculator = object.__new__(EagleSpeculator)
-    speculator.capture_adapter = SimpleNamespace()
-    speculator.set_snapshot_source(lambda: None)
-    speculator.draft_weight_installer = SimpleNamespace(advance=lambda snapshot: 2)
-    speculator._log_online_draft_updates = False
-    speculator.install_committed_weights = installed.append
+    speculator.set_snapshot_source(lambda: next(snapshots, None))
 
     with patch.object(logger, "info") as log_info:
-        speculator.on_prefill_input_embeds_ready(
-            num_reqs=1,
-            input_batch=SimpleNamespace(req_ids=["request-0"]),
-            aux_hidden_states=None,
-            num_sampled=torch.tensor([1]),
-            capture_enabled=False,
-        )
+        for completed_rounds in (2, 5):
+            adapter.completed_rounds = completed_rounds
+            speculator.on_prefill_input_embeds_ready(
+                num_reqs=1,
+                input_batch=SimpleNamespace(req_ids=["request-0"]),
+                aux_hidden_states=None,
+                num_sampled=torch.tensor([1]),
+                capture_enabled=False,
+            )
 
-    assert installed == ["request-0"]
-    log_info.assert_not_called()
+    assert installed == ["request-0", "request-0"]
+    if log_updates:
+        assert log_info.call_args_list == [
+            call(
+                "Online draft installed weights: request_id=%s version=%d rounds=%d",
+                "request-0",
+                version,
+                rounds,
+            )
+            for version, rounds in ((1, 2), (2, 3))
+        ]
+    else:
+        log_info.assert_not_called()

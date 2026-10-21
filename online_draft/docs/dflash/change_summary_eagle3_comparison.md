@@ -23,7 +23,7 @@
 | [`training/dflash/window.py`](../../src/online_draft/training/dflash/window.py) | DFlash batch/cache；窗口打包与位置 mask；最近 N 个完整 query block；位置衰减 KL；新增 context 梯度；更新后连续 KV 追加；记录缓存段版本 |
 | [`runtime/capture/dflash.py`](../../src/online_draft/runtime/capture/dflash.py) | prompt bootstrap、完整 proposal、FC 输出、teacher logits 和 verification 计数的捕获及对齐；预分配 pinned D2H staging；CPU batch 构造器持有连续历史并选择有效监督行 |
 | [`dflash/online.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/online.py) | DFlash 参数 slot 及 fused KV/norm 派生 buffer 一致性；安装、窗口关闭、请求结束及 reset |
-| [`dflash/speculator.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/speculator.py) | 在 target 特征进入 FC 前 capture；接入 teacher/proposal 回调；每个参数 slot 一套 query graph；按活动 slot 执行；在线关闭时沿用原推理路径 |
+| [`dflash/speculator.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/speculator.py) | 在 FC 后、context KV 构建前 capture；接入 teacher/proposal 回调；每个参数 slot 一套 query graph；按活动 slot 执行；在线关闭时沿用原推理路径 |
 
 ### 共用组件的改动
 
@@ -35,6 +35,7 @@
 | [`runtime/transport.py`](../../src/online_draft/runtime/transport.py) | 通用 FIFO 和 D2H 搬运；失败后继续处理清理信号，避免 finish 等待悬空，错误仍传播给推理主路径 |
 | [`runtime/weights.py`](../../src/online_draft/runtime/weights.py) | 共用 `DraftWeightSnapshot` 和 `DraftWeightInstaller`；推理侧领取 snapshot 后调用 `advance(snapshot)`，先 stage 再非阻塞检查 commit；管理活动 slot/version、旧 slot 最后使用事件、派生 buffer 准备和 reset；移除独立 handoff 对象，绑定和 epoch close 仍由各模型负责 |
 | [`spec_decode/weight_slots.py`](../../../vllm/v1/worker/gpu/spec_decode/weight_slots.py) | EAGLE3 与 DFlash 共用 `DraftWeightSlots`；只给选中的 draft 自有参数分配两份 GPU 存储，不改 target 共享参数 |
+| [`eagle/online.py`](../../../vllm/v1/worker/gpu/spec_decode/eagle/online.py) | `Eagle3OnlineState` 集中管理 slot、installer、安装日志、窗口关闭和 request reset；`eagle/speculator.py` 保留 capture hook 与调用顺序 |
 | [`runtime/cpu_worker.py`](../../src/online_draft/runtime/cpu_worker.py) | 新增 inference/capture/training 三种角色的线程局部 OpenMP/MKL 配置及 affinity；EAGLE3 同样可以配置 |
 | [`training/trainer.py`](../../src/online_draft/training/trainer.py) | 新增可选 FP32 master weights 和配套梯度/reset；默认关闭，原 AdamW 行为保留 |
 | [`gpu_worker.py`](../../../vllm/v1/worker/gpu_worker.py) | 按方法加载 CPU 模型及 recipe；DFlash 配置检查与默认 N=16、gamma=7、fused=True；保留 EAGLE3 loss、全量窗口及 fused=False 默认；统一角色配置和生命周期 |
