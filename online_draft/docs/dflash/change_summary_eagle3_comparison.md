@@ -1,26 +1,21 @@
-# DFlash 改动总览与 EAGLE3 在线训练策略对比
+# DFlash 与 EAGLE3 在线训练实现对比
 
-整理日期：2026-10-19。代码范围：`/home/lixiang/work/myvllm-eagle3-dflash`，
-分支 `eagle3&dflash`，基线 `3979838d2d`。下文比较的是**本仓库当前接入的在线
-训练路径**，不是两个方法的所有论文训练方案。数值实验来自 2026-10-16 的报告，
-本次只核对代码与整理文档，没有重新跑 GPU 实验，也没有提交 Git。
+本文对应结构重构后的当前实现，比较的是本仓库接入的在线训练路径。
+完整目录和模块调用链见[代码导航](../../README.md)，DFlash 运行方式及历史
+实验索引见 [README](README.md)。历史性能数字不作为本次重构的重新测量结果。
 
 当前 DFlash 复用了 EAGLE3 的请求生命周期、异步调度、trainer 和权重安装机制。
-主要分歧在模型输入、监督加权、query 选择、context 梯度及 GPU graph 接入。
+主要分歧在模型输入、监督加权、query 选择、context 构建及 GPU graph 接入。
 “复用运行时”不等于“训练策略完全相同”；一些共享运行时优化也已作用于 EAGLE3。
 
-## 全部改动按职责归档
+## 当前代码按职责归档
 
-相对上述基线，已有跟踪文件修改 15 个，其中运行代码 9 个、测试 6 个；另新增
-运行文件 5 个、测试文件 1 个、实验脚本 6 个，以及阶段报告和结果 JSON。
-普通 `git diff --stat` 不包含这些尚未跟踪的新文件，不能只按它显示的行数估计范围。
-
-### 新增 DFlash 模型与训练方法
+### DFlash 专用实现
 
 | 文件 | 最终职责 |
 | --- | --- |
 | [`models/qwen3_dflash.py`](../../src/online_draft/models/qwen3_dflash.py) | CPU 可微 DFlash；从已加载的 GPU draft 复制真实参数；打包 QKV、gate/up；独立 context 投影；非因果完整 block；CPU Flash SDPA；attention 按完整 block 分组 |
-| [`training/dflash/window.py`](../../src/online_draft/training/dflash/window.py) | DFlash batch/cache；窗口打包与位置 mask；最近 N 个完整 query block；位置衰减 KL；新增 context 梯度；更新后连续 KV 追加；记录缓存段版本 |
+| [`training/dflash/window.py`](../../src/online_draft/training/dflash/window.py) | DFlash batch/cache；窗口打包与位置 mask；最近 N 个完整 query block；位置衰减 KL；no-grad context 投影；更新后连续 KV 追加；记录缓存段版本 |
 | [`runtime/capture/dflash.py`](../../src/online_draft/runtime/capture/dflash.py) | prompt bootstrap、完整 proposal、FC 输出、teacher logits 和 verification 计数的捕获及对齐；预分配 pinned D2H staging；CPU batch 构造器持有连续历史并选择有效监督行 |
 | [`dflash/online.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/online.py) | DFlash 参数 slot 及 fused KV/norm 派生 buffer 一致性；安装、窗口关闭、请求结束及 reset |
 | [`dflash/speculator.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/speculator.py) | 在 FC 后、context KV 构建前 capture；接入 teacher/proposal 回调；每个参数 slot 一套 query graph；按活动 slot 执行；在线关闭时沿用原推理路径 |
@@ -29,7 +24,7 @@
 
 | 文件 | 改动及 EAGLE3 影响 |
 | --- | --- |
-| [`runtime/async_pipeline.py`](../../src/online_draft/runtime/async_pipeline.py) | 两种模型共用 `AsyncDraftPipeline`，由 worker 注入各自的训练函数，EAGLE3 window 包装留在训练层；共享 bootstrap/安装划分窗口/reset；复用一份 pinned snapshot；记录 CPU/source version、完整/训练轮数、目标数和耗时 |
+| [`runtime/async_pipeline.py`](../../src/online_draft/runtime/async_pipeline.py) | 两种模型共用 `AsyncDraftPipeline`，由装配函数注入各自的训练函数，EAGLE3 window 包装留在训练层；共享 bootstrap/安装划分窗口/reset；复用一份 pinned snapshot；记录 CPU/source version、完整/训练轮数、目标数和耗时 |
 | [`runtime/contracts.py`](../../src/online_draft/runtime/contracts.py) | 通用 `PreparedRound` 与 `CapturePacket` 协议；独立于模型专用采集实现 |
 | [`runtime/capture/eagle3.py`](../../src/online_draft/runtime/capture/eagle3.py) | EAGLE3 packet、GPU adapter 和专用 CPU batch 构造器；持有 confirmed 历史并处理位置对齐 |
 | [`runtime/transport.py`](../../src/online_draft/runtime/transport.py) | 通用 FIFO 和 D2H 搬运；失败后继续处理清理信号，避免 finish 等待悬空，错误仍传播给推理主路径 |
@@ -41,34 +36,32 @@
 | [`gpu/online_draft.py`](../../../vllm/v1/worker/gpu/online_draft.py) | 按方法加载 CPU 模型及 recipe，构建 trainer、pipeline、capture adapter 并连接回调；DFlash 默认 N=16、gamma=7、fused=True，EAGLE3 保留原 loss、全量窗口及 fused=False；`OnlineDraftRuntime` 管理 CPU 角色配置、capture 启用、finish、错误传播及关闭 |
 | [`gpu_worker.py`](../../../vllm/v1/worker/gpu_worker.py) | 持有一个可选的 `OnlineDraftRuntime`，保留加载、warmup 后启用、执行前检查/finish、shutdown 四处生命周期调用点 |
 
-共享 snapshot 只复用一份 pinned buffer的前提是：下一次训练由上一次 H2D 真正
+共享 snapshot 只复用一份 pinned buffer 的前提是：下一次训练由上一次 H2D 真正
 commit 后的 epoch close 触发，CPU 不会在上传仍读取快照时覆盖该 buffer。
 这是现有时序保证，不能在以后改成无约束连续 optimizer update 时直接照搬。
 
 ### 测试、实验与报告
 
-新增 [`test_dflash_training.py`](../../tests/test_dflash_training.py)，覆盖完整 block
-attention、bootstrap、新 context 梯度、旧 KV 不变、窗口打包等价性、位置衰减及
-减少 query 后历史仍完整。扩展六个现有测试文件：`test_async_pipeline.py`、
+[`test_dflash_training.py`](../../tests/test_dflash_training.py) 覆盖完整 block
+attention、bootstrap、冻结 FC、detached context、旧 KV 不变、窗口打包等价性、
+位置衰减及减少 query 后历史仍完整。公共链路的测试包括 `test_async_pipeline.py`、
 `test_capture_transport.py`、`test_draft_weight_installer.py`、`test_trainer.py`、
 `tests/v1/spec_decode/test_eagle_weight_slots.py`、
 `tests/v1/worker/test_gpu_worker_online_draft.py`。主要验证线程隔离、位置对齐、
 FIFO/reset、pinned buffer、slot 连续覆盖、双 graph/派生 buffer 及 FP32 小更新。
 
-六个新增脚本均位于 `online_draft/scripts/`：
+当前脚本位于 `online_draft/scripts/`：
 
 | 脚本 | 用途 |
 | --- | --- |
-| `smoke_async_dflash.py` | baseline/采集/训练不安装/完整在线消融；AIME/GSM8K；纯 decode 和上下文分段；指定区间 profile |
+| `smoke_async_dflash.py` | DFlash/EAGLE3 baseline 与完整 online；AIME/GSM8K；decode 和上下文分段；指定区间 profile；DFlash 数学与队列诊断 |
+| `smoke_async_eagle3.py` | 早期 EAGLE3 单请求 smoke，通过环境变量启用 online |
+| `smoke_async_eagle3_two_requests.py` | 顺序两请求 smoke 和各请求接受长度、耗时 |
 | `check_dflash_math.py` | 真实 CPU/GPU logits、安装后的派生参数及 reset 数值检查 |
-| `benchmark_dflash_cpu.py` | CPU 算子阶段、线程数、optimizer、compile、FP32 master weights 微基准 |
-| `audit_dflash_updates.py` | 真实 capture 回放、权重有效变化与同窗 loss 审计 |
-| `summarize_dflash_ablation.py` | 消融结果汇总，区分生成与完整请求时间 |
 | `summarize_dflash_trace.py` | copy/kernel 重叠、stream、同步、CPU 阶段和算子统计 |
 
-阶段 0–3 完成接入与正确性，4–8 完成采集/训练/安装消融、双 graph、CPU 配置和
-长窗口优化，9–12 完成更新审计、位置衰减 KL、减量训练与长请求验证，13 完成
-16K 纯 decode 对照和 trace。索引及六份结果 JSON 见 [README](README.md)。
+早期专用 benchmark、更新审计和消融脚本已删除。历史报告中的产物路径与旧命令
+不保证可运行，当前入口以本文和 [README](README.md) 为准。
 
 ## 两者保留的共同策略
 
@@ -96,16 +89,16 @@ FIFO/reset、pinned buffer、slot 连续覆盖、双 graph/派生 buffer 及 FP3
 | --- | --- | --- |
 | 本地 draft 结构 | 1 层，3 组 target 特征，32K draft 词表 | 5 层，5 组 target 特征，151936 全词表 |
 | proposal | 自回归展开，后续输入含旧 draft 的 recurrent hidden | 1 个 anchor + K 个 mask，一次并行预测；b16 对应 K=15 |
-| 捕获输入 | token embedding、recurrent hidden、target 原始辅助特征、teacher、确认位置 | token IDs/positions、完整 query block、FC 前 target 原始特征、teacher、确认/拒绝计数 |
+| 捕获输入 | token embedding、recurrent hidden、target 原始辅助特征、teacher、确认位置 | token IDs/positions、完整 query block、GPU FC 输出、teacher、确认/拒绝计数 |
 | teacher 词表 | GPU 先取映射后的 draft 词表 logits，CPU softmax 为条件分布 | 完整 target 词表 logits；CPU 转分布并选有效行 |
 | loss 权重 | 普通位置 1，首拒绝位置 2 | 每 block 内第 k 个预测位置 `exp(-(k-1)/7)`，不再额外首拒绝 ×2 |
 | 窗口选择 | 已关闭窗口的全部完整 round 参与训练 | worker 默认只选最近 16 个完整 query block，0 表示全量 |
 | query 数量 | `CONFIRMED_PATH` 可只保留有监督的因果 query 行 | 所选 block 的 anchor 和拒绝后 mask 也必须保留在 forward 中；只在 loss/head 选择监督行 |
 | 跨轮隔离 | 每轮看其 anchor 之前的确认上下文及本轮因果 query 前缀 | 每轮看 anchor 之前的确认 context 及本轮完整非因果 block，不能看其他 block 的 query |
-| 临时 context 梯度 | 训练前以 `no_grad` 构建确认上下文 KV；它整体作为常量 | 默认 bootstrap prompt 和本窗口新增、对所选 query 可见的 context 投影参与梯度；旧持久 KV 为常量。可用 `context_grad=False` 关闭新增投影梯度，见[阶段 14 消融](stage14_context_gradient_ablation.md) |
+| 临时 context 梯度 | 训练前以 `no_grad` 构建确认上下文 KV；它整体作为常量 | `project_context` 固定 no-grad，输入为采集的 FC 输出；bootstrap、新增和旧 context KV 都作为常量，无 `context_grad` 开关 |
 | query 输入梯度 | 每轮 anchor 的 FC 重新计算并可训练；后续 recurrent hidden 是固定采集值，不跨 GPU rollout 反传 | 当前 CPU 权重计算整个 query block，没有采集并固定的 recurrent hidden 链 |
 | 永久 KV 追加 | 更新后用新权重对新增确认路径做 no-grad draft forward | 更新后用新权重对全部新增确认特征做 no-grad context 投影 |
-| 可训练参数 | draft 自有 FC/decoder/norm/独立 lm_head，叠加冻结前缀；输入 embedding 为捕获常量 | draft 自有 FC/decoder/norm，叠加冻结前缀；来自 target 的 embedding 和 lm_head 冻结 |
+| 可训练参数 | draft 自有 FC/decoder/norm/独立 lm_head，叠加冻结前缀；输入 embedding 为捕获常量 | draft decoder 和输出 norm，叠加冻结前缀；FC、hidden norm、target embedding 和 lm_head 冻结；context K/V 与 k_norm 通过共享的 query 路径更新 |
 | KV 版本记录 | 持久 KV 为 tensor tuple；round/update 有版本信息 | 另有 `DFlashCache.segments`，记录 CPU KV 段终点及构建版本 |
 
 “只训练最近 16 个 block”并不意味着只留 16 个 block 的 context，更不意味着
@@ -160,7 +153,7 @@ DFlash 还有必须严格消除的一类错误：**当前参数与其派生权�
 | online draft CUDA Graph | `explicit_input_embeds=True` 导致 draft eager | 双 slot 各有一套 query FULL graph，当前活动 slot 选择对应 graph |
 | target CUDA Graph | 可独立开启 | 可独立开启 |
 | 默认 fused AdamW | False，可显式开启 | worker 默认 True |
-| FP32 master weights | 共享 trainer 提供，可选，默认 False | 同左；本次消融更慢，没有选为最优 |
+| FP32 master weights | 共享 trainer 提供，可选，默认 False | 同左；早期消融更慢，没有作为默认 |
 | 最近 N block / 衰减 KL | 未接入 | 已接入 |
 
 EAGLE3 的 eager 依据是 `EagleSpeculator.explicit_input_embeds` 及
@@ -168,16 +161,20 @@ EAGLE3 的 eager 依据是 `EagleSpeculator.explicit_input_embeds` 及
 不能因为 target 开了 FULL graph，或两条链路都有双权重 slot，就认为 EAGLE3
 在线 draft 也已获得 DFlash 的双 graph 优化。
 
-默认与实验配置也要区分：两者生产默认学习率仍为 **1e-5**、weight decay 0、
-`check_gradients=True`、`master_weights=False`。DFlash 长请求候选显式使用
-**1e-4**、N=16、fused AdamW、`check_gradients=False`、16 核训练及独立绑核；
-loss 有限值检查保留。可选 glibc 参数和 `OMP_WAIT_POLICY=PASSIVE` 通过实验启动
-环境设置，不是 runtime 自动修改的全局默认。
+默认与实验配置也要区分：两者默认学习率仍为 **1e-5**、weight decay 0、
+`check_gradients=True`、`master_weights=False`。DFlash 默认 N=16、gamma=7、
+fused AdamW；GQA、selective last layer 默认关闭。长请求实验显式调整学习率、
+梯度检查、CPU 线程数和绑核，具体参数见对应报告。Loss 有限值检查保留。
+可选 glibc 参数和 `OMP_WAIT_POLICY=PASSIVE` 通过实验启动环境设置，
+不是 runtime 自动修改的全局默认。
 
-loss/MLP `torch.compile`、FP32 master weights、foreach/普通 AdamW 都做过对照，
-没有把所有开关一概启用。当前采用的组合见阶段 11/12；“都支持”不代表“都更快”。
+CPU attention 前向复用 PyTorch，DFlash 的 backward 由
+[`cpu_attention.py`](../../src/online_draft/models/cpu_attention.py) 和 C++ extension
+接入 query 分块及历史 KV 梯度裁剪。实现与实验见
+[阶段 29](stage29_parallel_attention_backward.md)，不能仅根据早期阶段 11/12
+报告推断当前 CPU 算子路径。
 
-## 实验已经说明了什么
+## 历史实验的适用范围
 
 - [阶段 5](stage5_eagle_cpu_diagnosis.md) 的短请求 EAGLE3 对照中，online 也有开销：
   baseline 约 139.2、online 113.3 token/s。它与 DFlash 的 K 值、模型结构不同，
@@ -191,12 +188,13 @@ loss/MLP `torch.compile`、FP32 master weights、foreach/普通 AdamW 都做过�
   得到纯 decode 173.45→201.97 token/s，增加 16.44%；最后 4K 段增加 39.76%。
   每次 GPU 安装 64 次，输出一致；仍是单题截断结果，不是完整准确率或普遍加速证明。
 
-历史 EAGLE3 较容易及时完成更新，与其 1 层、较小 head、可裁掉无监督 query，
-以及 detached context 的计算方式相符。DFlash 的全量窗口原来容易出现“训练越慢，
-窗口越大，下一次更慢”的反馈；最近 16 block 主要缓解了这个问题。不过它仍有
-5 层完整 block 和可微新增 context，长历史成本并未消失。
+上述早期数字对应当时的采集、context 梯度和 CPU 算子实现。当前方案已改为
+固定 FC 输出、detached context 和增量 KV 重算，不能用这些数字直接评价重构后
+代码的吞吐或准确率。
 
-此前阶段 12 的完整生产回归为 131 passed；阶段 13 的脚本检查和实际 GPU 对照
-均已记录。本次仅复核这些证据，不把历史通过记录写成本日重新测试的结果。
-后续 CPU GQA/历史缓存复制、有效 teacher 行传输、GPU 小 batch GEMM 是阶段 13
-提出的待验证方向，目前均不能算作已经实现的改动。
+[阶段 25](stage25_fc_incremental_context.md) 描述当前数据与梯度路径，
+[阶段 29](stage29_parallel_attention_backward.md) 描述 CPU backward 优化。
+当前长请求实验见[阶段 30](stage30_long_aime_acceptance.md)、
+[阶段 31](stage31_nonrepeating_long_aime.md) 和
+[阶段 32](stage32_new_long_aime_selection.md)。这些也都是历史实验记录，
+本次结构重构没有重新执行完整模型评估或长请求性能对照。

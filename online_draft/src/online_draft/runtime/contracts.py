@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, Protocol, Self, TypeVar
+from typing import Generic, Protocol, TypeVar
 
 import torch
+from typing_extensions import Self
 
 BatchT = TypeVar("BatchT")
 

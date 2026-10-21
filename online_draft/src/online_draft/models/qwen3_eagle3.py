@@ -3,7 +3,7 @@
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from enum import StrEnum
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +14,13 @@ from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-class Eagle3AttentionBackend(StrEnum):
+class Eagle3AttentionBackend(str, Enum):
     """Attention implementations supported by the CPU training model."""
 
     EAGER = "eager"
     FLASH_ATTENTION = "flash_attention"
+
+    __str__ = str.__str__
 
 
 @dataclass(frozen=True, slots=True)

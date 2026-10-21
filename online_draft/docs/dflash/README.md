@@ -1,5 +1,8 @@
 # DFlash 请求内在线训练
 
+重构后的完整目录、模块职责及调用链见[在线 draft 代码导航](../../README.md)。
+当前两种方法的差异见[EAGLE3 / DFlash 对比](change_summary_eagle3_comparison.md)。
+
 当前实现固定传输 **GPU FC 输出**，CPU 使用当前权重构建 detached context KV；
 每次 optimizer 更新后，重新投影本窗口新增 context 并追加到历史 KV。
 历史 KV 不重算，继续接受混合权重版本。实现复用 EAGLE3 的 trainer、FIFO、
@@ -166,7 +169,6 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 .venv/bin/python -m pytest \
 原始 trace、JSON 汇总、生成图和专用消融脚本；历史报告中的产物路径与消融命令
 不再可用，当前接口以本文和阶段 25 为准。历史性能数字不代表本次清理后重新测量。
 
-- [改动总览与 EAGLE3 在线训练策略对比](change_summary_eagle3_comparison.md)
 - [阶段 0：设计与边界](stage0_design.md)
 - [阶段 1：CPU 模型与训练](stage1_cpu_training.md)
 - [阶段 2：Capture 与安装](stage2_capture_and_install.md)

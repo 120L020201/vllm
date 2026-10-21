@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from itertools import pairwise
 
 import torch
@@ -30,11 +30,13 @@ from online_draft.training.eagle3.inputs import (
 from online_draft.training.trainer import DraftTrainer
 
 
-class Eagle3WindowMode(StrEnum):
+class Eagle3WindowMode(str, Enum):
     """Supported EAGLE3 window training objectives."""
 
     CONFIRMED_PATH = "confirmed_path"
     PROPOSAL_CANVAS = "proposal_canvas"
+
+    __str__ = str.__str__
 
 
 @dataclass(frozen=True, slots=True)
