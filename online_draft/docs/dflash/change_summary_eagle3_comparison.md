@@ -38,7 +38,8 @@
 | [`eagle/online.py`](../../../vllm/v1/worker/gpu/spec_decode/eagle/online.py) | `Eagle3OnlineState` 集中管理 slot、installer、安装日志、窗口关闭和 request reset；`eagle/speculator.py` 保留 capture hook 与调用顺序 |
 | [`runtime/cpu_worker.py`](../../src/online_draft/runtime/cpu_worker.py) | 新增 inference/capture/training 三种角色的线程局部 OpenMP/MKL 配置及 affinity；EAGLE3 同样可以配置 |
 | [`training/trainer.py`](../../src/online_draft/training/trainer.py) | 新增可选 FP32 master weights 和配套梯度/reset；默认关闭，原 AdamW 行为保留 |
-| [`gpu_worker.py`](../../../vllm/v1/worker/gpu_worker.py) | 按方法加载 CPU 模型及 recipe；DFlash 配置检查与默认 N=16、gamma=7、fused=True；保留 EAGLE3 loss、全量窗口及 fused=False 默认；统一角色配置和生命周期 |
+| [`gpu/online_draft.py`](../../../vllm/v1/worker/gpu/online_draft.py) | 按方法加载 CPU 模型及 recipe，构建 trainer、pipeline、capture adapter 并连接回调；DFlash 默认 N=16、gamma=7、fused=True，EAGLE3 保留原 loss、全量窗口及 fused=False；`OnlineDraftRuntime` 管理 CPU 角色配置、capture 启用、finish、错误传播及关闭 |
+| [`gpu_worker.py`](../../../vllm/v1/worker/gpu_worker.py) | 持有一个可选的 `OnlineDraftRuntime`，保留加载、warmup 后启用、执行前检查/finish、shutdown 四处生命周期调用点 |
 
 共享 snapshot 只复用一份 pinned buffer的前提是：下一次训练由上一次 H2D 真正
 commit 后的 epoch close 触发，CPU 不会在上传仍读取快照时覆盖该 buffer。

@@ -26,9 +26,10 @@ def inspect_inference_cpu(worker):
 
 def configure_queue_measurement(worker):
     """Measure host queue depth and residence time without per-round logging."""
-    pipeline = worker._online_draft_pipeline
-    adapter = worker._online_draft_capture_adapter
-    submit, consume = adapter._on_round, pipeline._handle_round
+    pipeline = worker._online_draft.pipeline
+    adapter = worker._online_draft.capture_adapter
+    builder = adapter._batch_builder
+    submit, consume = builder._on_round, pipeline._handle_round
     submitted = {}
 
     def on_round(prepared):
@@ -47,7 +48,7 @@ def configure_queue_measurement(worker):
             [time.perf_counter() - worker.queue_measurement_start, size]
         )
 
-    adapter._on_round = on_round
+    builder._on_round = on_round
     pipeline._handle_round = handle_round
     pipeline._on_queue_size = measure("train")
     adapter._queue._on_queue_size = measure("capture")
@@ -63,7 +64,7 @@ def inspect_queue_measurement(worker):
 
 
 def configure_eagle_stats(worker):
-    speculator = worker._online_draft_speculator
+    speculator = worker._online_draft.speculator
     finish = speculator.finish_request
 
     def measured_finish(request_id, initial_weights):
@@ -78,26 +79,27 @@ def configure_eagle_stats(worker):
 
 
 def inspect_online(worker, method="dflash"):
-    pipeline = worker._online_draft_pipeline
-    if pipeline is None:
+    runtime = worker._online_draft
+    if runtime is None:
         return None
-    if worker._online_draft_speculator.capture_adapter is None:
+    pipeline = runtime.pipeline
+    if runtime.speculator.capture_adapter is None:
         return None
     if method == "eagle3":
-        speculator = worker._online_draft_speculator
+        speculator = runtime.speculator
         return {
-            "cpu_version": worker._online_draft_trainer.version,
+            "cpu_version": runtime.trainer.version,
             "gpu_version": speculator.draft_weight_installer.active_version,
             "finished_cpu": pipeline.finished_request,
             "finished_gpu": speculator.finished_request,
         }
-    speculator = worker._online_draft_speculator
+    speculator = runtime.speculator
     state = speculator.online_state
     result = {
         "draft_graphs_per_slot": [
             len(m.graphs) for m in speculator.query_cudagraph_managers
         ],
-        "cpu_version": worker._online_draft_trainer.version,
+        "cpu_version": runtime.trainer.version,
         "gpu_version": state.installer.active_version,
         "completed_rounds": state.adapter.completed_rounds,
         "updates": list(pipeline.update_stats),
@@ -105,7 +107,7 @@ def inspect_online(worker, method="dflash"):
         "finished_gpu": state.finished_request,
         "snapshot_bytes": sum(
             tensor.numel() * tensor.element_size()
-            for _, tensor in worker._online_draft_trainer.initial_weights
+            for _, tensor in runtime.trainer.initial_weights
         ),
     }
     return result

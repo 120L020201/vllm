@@ -59,7 +59,7 @@ Adapter 持有推理线程的 proposal/teacher 状态；batch 构造器只在 ca
 transport 等待生产事件、发起复制并等待完成后调用 batch 构造器。提交给训练
 线程的 batch 不引用下一次 D2H 会覆盖的 staging 内容。
 
-两种模型共用 `AsyncDraftPipeline`，由 worker 注入训练函数：EAGLE3 使用
+两种模型共用 `AsyncDraftPipeline`，由装配函数注入训练函数：EAGLE3 使用
 `training/eagle3/window.py` 的 `train_eagle3_rounds`，在训练层构建
 `Eagle3TrainingWindow`；DFlash 使用 `train_dflash_window`，通过 `partial`
 绑定最近训练轮数和 loss 衰减参数。Pipeline 传入 trainer、完整 CPU batch 元组、
@@ -68,7 +68,7 @@ batch、loss 或 KV 内容。Bootstrap、epoch、snapshot 和 reset 仍由公共
 
 权重管理集中在 [`weights.py`](../../src/online_draft/runtime/weights.py)：
 `DraftWeightSnapshot` 携带 CPU 权重与版本；`DraftWeightInstaller` 管理 H2D、
-活动 slot/version、完成事件和 reset。Worker 将 `pipeline.poll_snapshot` 注入
+活动 slot/version、完成事件和 reset。装配函数将 `pipeline.poll_snapshot` 注入
 推理侧，推理侧领取快照后调用 `installer.advance(snapshot)`，先 stage 再检查
 commit；没有新快照时传入 `None`，仍检查此前 H2D 是否完成。无需单独的 handoff 对象。
 
@@ -84,7 +84,15 @@ vLLM 推理侧的状态与参数绑定位于 `vllm/v1/worker/gpu/spec_decode/`�
   和 norm 派生 buffer；这些模型专用内容不进入公共 slot。
 
 各模型的 `speculator.py` 保留推理计算和 capture hook，在原来的边界调用在线状态
-对象。Worker 仍负责配置、连接 pipeline，并在 warmup 结束后启用 capture。
+对象。
+
+[`gpu/online_draft.py`](../../../vllm/v1/worker/gpu/online_draft.py) 的
+`create_online_draft` 负责模型选择、CPU 配置、trainer/pipeline/adapter 构建与回调
+连接；返回的 `OnlineDraftRuntime` 统一持有这些组件及 speculator 引用。
+`gpu_worker.py` 只保留生命周期调用点：加载模型后创建组件，warmup 结束后应用
+inference CPU 配置并启用 capture，每次执行前传播后台错误及处理已结束请求，
+shutdown 时先关闭 capture、再关闭 pipeline，最后释放 model runner。
+在线关闭时不创建此对象。诊断脚本通过 `worker._online_draft` 访问组件。
 
 推理线程提交 FC 快照与 ready event，capture 线程在独立 D2H stream 搬运。
 训练线程发布 pinned snapshot；installer 在私有 stream 提交 H2D，通过 event

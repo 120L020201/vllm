@@ -11,8 +11,8 @@ from torch.nn import functional as F
 def check_dflash_math(worker):
     from online_draft.runtime.weights import DraftWeightSnapshot
 
-    trainer = worker._online_draft_trainer
-    state = worker._online_draft_speculator.online_state
+    trainer = worker._online_draft.trainer
+    state = worker._online_draft.speculator.online_state
     target_storage = {
         p.untyped_storage().data_ptr() for p in worker.model_runner.model.parameters()
     }
@@ -65,7 +65,7 @@ def check_dflash_math(worker):
 def _compare_dflash_math(worker):
     from vllm import _custom_ops as ops
 
-    cpu = worker._online_draft_trainer.model
+    cpu = worker._online_draft.trainer.model
     gpu = worker.get_draft_model()
     model = gpu.model
     config = cpu.config

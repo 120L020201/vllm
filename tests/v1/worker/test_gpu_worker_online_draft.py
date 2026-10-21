@@ -2,24 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 import vllm.v1.worker.gpu_worker as gpu_worker
+from vllm.v1.worker.gpu.online_draft import OnlineDraftRuntime
 from vllm.v1.worker.gpu_worker import Worker
 
 
 def test_shutdown_closes_online_draft_before_model_runner(monkeypatch) -> None:
     closed: list[str] = []
     worker = object.__new__(Worker)
-    worker._online_draft_capture_adapter = SimpleNamespace(
-        close=lambda: closed.append("capture")
+    worker._online_draft = OnlineDraftRuntime(
+        trainer=Mock(),
+        pipeline=SimpleNamespace(close=lambda: closed.append("pipeline")),
+        capture_adapter=SimpleNamespace(close=lambda: closed.append("capture")),
+        speculator=Mock(),
+        inference_cpu=Mock(),
     )
-    worker._online_draft_pipeline = SimpleNamespace(
-        close=lambda: closed.append("pipeline")
-    )
-    worker._online_draft_trainer = object()
-    worker._online_draft_speculator = object()
     worker.profiler = None
     worker.model_runner = SimpleNamespace(
         shutdown=lambda: closed.append("model_runner")
@@ -37,10 +38,7 @@ def test_shutdown_closes_online_draft_before_model_runner(monkeypatch) -> None:
     Worker.shutdown(worker)
 
     assert closed == ["capture", "pipeline", "model_runner"]
-    assert worker._online_draft_capture_adapter is None
-    assert worker._online_draft_pipeline is None
-    assert worker._online_draft_trainer is None
-    assert worker._online_draft_speculator is None
+    assert worker._online_draft is None
 
 
 @pytest.mark.parametrize("component", ["pipeline", "capture_adapter"])
@@ -49,15 +47,62 @@ def test_online_draft_failure_stops_worker(component) -> None:
         raise RuntimeError("online worker failed")
 
     worker = object.__new__(Worker)
-    worker._online_draft_pipeline = None
-    worker._online_draft_capture_adapter = None
+    worker._online_draft = OnlineDraftRuntime(
+        trainer=Mock(),
+        pipeline=Mock(),
+        capture_adapter=Mock(),
+        speculator=Mock(),
+        inference_cpu=Mock(),
+    )
     setattr(
-        worker,
-        f"_online_draft_{component}",
+        worker._online_draft,
+        component,
         SimpleNamespace(
             raise_if_failed=raise_if_failed,
         ),
     )
 
     with pytest.raises(RuntimeError, match="online worker failed"):
-        Worker._raise_if_online_draft_failed(worker)
+        Worker.execute_model(worker, SimpleNamespace(finished_req_ids={"request-0"}))
+
+    worker._online_draft.speculator.finish_request.assert_not_called()
+
+
+def test_capture_enable_applies_inference_cpu_settings_before_attachment() -> None:
+    calls = []
+    adapter = object()
+
+    def attach(value):
+        assert value is adapter
+        calls.append("capture")
+
+    runtime = OnlineDraftRuntime(
+        trainer=Mock(),
+        pipeline=Mock(),
+        capture_adapter=adapter,
+        speculator=SimpleNamespace(set_capture_adapter=attach),
+        inference_cpu=SimpleNamespace(apply=lambda: calls.append("cpu")),
+    )
+
+    assert calls == []
+    runtime.enable_capture()
+    assert calls == ["cpu", "capture"]
+
+
+def test_finish_uses_initial_weights_only_after_capture_is_enabled() -> None:
+    initial_weights = object()
+    speculator = Mock(capture_adapter=None)
+    runtime = OnlineDraftRuntime(
+        trainer=SimpleNamespace(initial_weights=initial_weights),
+        pipeline=Mock(),
+        capture_adapter=Mock(),
+        speculator=speculator,
+        inference_cpu=Mock(),
+    )
+
+    runtime.finish_requests({"request-0"})
+    speculator.finish_request.assert_not_called()
+
+    speculator.capture_adapter = runtime.capture_adapter
+    runtime.finish_requests({"request-0"})
+    speculator.finish_request.assert_called_once_with("request-0", initial_weights)
