@@ -104,8 +104,8 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
 
 if TYPE_CHECKING:
     from online_draft.runtime.async_pipeline import AsyncDraftPipeline
-    from online_draft.runtime.dflash_capture import DFlashCaptureAdapter
-    from online_draft.runtime.vllm_adapter import Eagle3VllmCaptureAdapter
+    from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
+    from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
     from online_draft.training.trainer import DraftTrainer
 
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
@@ -188,7 +188,7 @@ class Worker(WorkerBase):
         self._online_draft_trainer: DraftTrainer | None = None
         self._online_draft_pipeline: AsyncDraftPipeline | None = None
         self._online_draft_capture_adapter: (
-            Eagle3VllmCaptureAdapter | DFlashCaptureAdapter | None
+            Eagle3CaptureAdapter | DFlashCaptureAdapter | None
         ) = None
         self._online_draft_speculator: EagleSpeculator | DFlashSpeculator | None = None
 
@@ -491,9 +491,8 @@ class Worker(WorkerBase):
             AsyncDraftPipeline,
             AsyncEagle3Pipeline,
         )
-        from online_draft.runtime.capture_runtime import Eagle3CaptureRuntime
+        from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
         from online_draft.runtime.cpu_worker import CPUWorkerConfig
-        from online_draft.runtime.vllm_adapter import Eagle3VllmCaptureAdapter
         from online_draft.runtime.weight_handoff import DraftWeightHandoff
         from online_draft.training.trainer import (
             DraftTrainer,
@@ -539,7 +538,7 @@ class Worker(WorkerBase):
         is_dflash = speculative_config.method == "dflash"
         if is_dflash:
             from online_draft.models.qwen3_dflash import load_qwen3_dflash_from_vllm
-            from online_draft.runtime.dflash_capture import (
+            from online_draft.runtime.capture.dflash import (
                 DFlashCaptureAdapter,
                 DFlashCaptureBuffers,
             )
@@ -649,7 +648,9 @@ class Worker(WorkerBase):
                 profile_timeline=profile_online_draft,
                 cpu_config=cpu_configs["training"],
             )
-            runtime = Eagle3CaptureRuntime(
+            adapter = Eagle3CaptureAdapter(
+                target_token_ids=cpu_model.get_target_token_ids().to(self.device),
+                source_weight_version=lambda: installer.active_version,
                 hidden_size=cpu_model.config.hidden_size,
                 num_aux_hidden_states=cpu_model.config.num_aux_hidden_states,
                 draft_vocab_size=cpu_model.config.draft_vocab_size,
@@ -661,11 +662,6 @@ class Worker(WorkerBase):
                 on_queue_size=capture_queue_log,
                 profile_timeline=profile_online_draft,
                 cpu_config=cpu_configs["capture"],
-            )
-            adapter = Eagle3VllmCaptureAdapter(
-                runtime=runtime,
-                target_token_ids=cpu_model.get_target_token_ids().to(self.device),
-                source_weight_version=lambda: installer.active_version,
             )
         handoff = DraftWeightHandoff(
             snapshot_source=pipeline,

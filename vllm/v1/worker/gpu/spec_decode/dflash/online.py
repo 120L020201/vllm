@@ -4,7 +4,7 @@
 from collections.abc import Iterable, Mapping
 
 import torch
-from online_draft.runtime.dflash_capture import DFlashCaptureAdapter
+from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
 from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
 from online_draft.runtime.weight_handoff import DraftWeightHandoff
 

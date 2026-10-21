@@ -43,6 +43,22 @@ DFlash 仅保留这条 FC 路径，EAGLE3 的训练策略保持原样。
 
 ## 异步执行与版本
 
+Capture 代码按模型集中在 `runtime/capture/`：
+
+- [`capture/dflash.py`](../../src/online_draft/runtime/capture/dflash.py) 包含
+  DFlash packet、pinned staging、GPU adapter 和 CPU batch 构造器。
+- [`capture/eagle3.py`](../../src/online_draft/runtime/capture/eagle3.py) 包含
+  EAGLE3 packet、GPU adapter 和 CPU batch 构造器。
+- [`contracts.py`](../../src/online_draft/runtime/contracts.py) 定义通用
+  `CapturePacket` 协议与 `PreparedRound`，不依赖模型专用 batch。
+- [`transport.py`](../../src/online_draft/runtime/transport.py) 管理通用 FIFO、
+  D2H stream、CUDA event、finish barrier 和错误传播。
+
+Adapter 持有推理线程的 proposal/teacher 状态；batch 构造器只在 capture 线程
+访问 prompt 与连续历史。Packet 的 `to_cpu()` 显式描述各模型的复制布局，由
+transport 等待生产事件、发起复制并等待完成后调用 batch 构造器。提交给训练
+线程的 batch 不引用下一次 D2H 会覆盖的 staging 内容。
+
 推理线程提交 FC 快照与 ready event，capture 线程在独立 D2H stream 搬运。
 训练线程发布 pinned snapshot；推理线程沿用 EAGLE3 的 handoff，在私有 stream
 提交 H2D，并通过 event query 安装完成的权重，不等待 CPU 训练。

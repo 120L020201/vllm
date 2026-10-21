@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from queue import Queue
 from threading import Event, Lock, Thread
 from typing import cast
@@ -19,7 +16,7 @@ from online_draft.runtime.contracts import CapturePacket
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 
 
-def _copy_to_cpu(
+def copy_to_cpu(
     tensor: torch.Tensor,
     *,
     non_blocking: bool,
@@ -34,136 +31,6 @@ def _copy_to_cpu(
         non_blocking=non_blocking,
     )
     return cpu_tensor
-
-
-@dataclass(slots=True)
-class Eagle3PromptContext:
-    """Prompt data transferred once for one request."""
-
-    prefill_input_embeds: torch.Tensor
-    prefill_positions: torch.Tensor
-    prefill_length: torch.Tensor
-    prefill_aux_hidden_states: tuple[torch.Tensor, ...]
-    prefill_aux_row_indices: torch.Tensor
-
-    def to_cpu(
-        self,
-        *,
-        non_blocking: bool = False,
-    ) -> Eagle3PromptContext:
-        return replace(
-            self,
-            prefill_input_embeds=_copy_to_cpu(
-                self.prefill_input_embeds,
-                non_blocking=non_blocking,
-            ),
-            prefill_positions=_copy_to_cpu(
-                self.prefill_positions,
-                non_blocking=non_blocking,
-            ),
-            prefill_length=_copy_to_cpu(
-                self.prefill_length,
-                non_blocking=non_blocking,
-            ),
-            prefill_aux_hidden_states=tuple(
-                _copy_to_cpu(
-                    tensor,
-                    non_blocking=non_blocking,
-                )
-                for tensor in self.prefill_aux_hidden_states
-            ),
-            prefill_aux_row_indices=_copy_to_cpu(
-                self.prefill_aux_row_indices,
-                non_blocking=non_blocking,
-            ),
-        )
-
-
-@dataclass(slots=True)
-class Eagle3CapturePacket:
-    """One GPU-resident EAGLE3 verification round."""
-
-    request_id: str
-    step_id: int
-    source_weight_version: int
-
-    prompt_context: Eagle3PromptContext | None
-
-    proposal_token_input_embeds: torch.Tensor
-    proposal_recurrent_hidden_states: torch.Tensor
-
-    teacher_logits: torch.Tensor
-    verify_row_indices: torch.Tensor
-    target_aux_hidden_states: tuple[torch.Tensor, ...]
-    num_sampled: torch.Tensor
-
-    confirmed_prefill_input_embeds: torch.Tensor
-    confirmed_prefill_positions: torch.Tensor
-    confirmed_prefill_length: torch.Tensor
-
-    ready: torch.cuda.Event | None = None
-
-    @property
-    def device(self) -> torch.device:
-        return self.proposal_token_input_embeds.device
-
-    def to_cpu(
-        self,
-        *,
-        non_blocking: bool = False,
-    ) -> Eagle3CapturePacket:
-        prompt_context = (
-            None
-            if self.prompt_context is None
-            else self.prompt_context.to_cpu(
-                non_blocking=non_blocking,
-            )
-        )
-
-        return replace(
-            self,
-            prompt_context=prompt_context,
-            proposal_token_input_embeds=_copy_to_cpu(
-                self.proposal_token_input_embeds,
-                non_blocking=non_blocking,
-            ),
-            proposal_recurrent_hidden_states=_copy_to_cpu(
-                self.proposal_recurrent_hidden_states,
-                non_blocking=non_blocking,
-            ),
-            teacher_logits=_copy_to_cpu(
-                self.teacher_logits,
-                non_blocking=non_blocking,
-            ),
-            verify_row_indices=_copy_to_cpu(
-                self.verify_row_indices,
-                non_blocking=non_blocking,
-            ),
-            target_aux_hidden_states=tuple(
-                _copy_to_cpu(
-                    tensor,
-                    non_blocking=non_blocking,
-                )
-                for tensor in self.target_aux_hidden_states
-            ),
-            num_sampled=_copy_to_cpu(
-                self.num_sampled,
-                non_blocking=non_blocking,
-            ),
-            confirmed_prefill_input_embeds=_copy_to_cpu(
-                self.confirmed_prefill_input_embeds,
-                non_blocking=non_blocking,
-            ),
-            confirmed_prefill_positions=_copy_to_cpu(
-                self.confirmed_prefill_positions,
-                non_blocking=non_blocking,
-            ),
-            confirmed_prefill_length=_copy_to_cpu(
-                self.confirmed_prefill_length,
-                non_blocking=non_blocking,
-            ),
-            ready=None,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +224,3 @@ class CaptureQueue:
         with self._error_lock:
             if self._error is None:
                 self._error = error
-
-
-Eagle3CaptureQueue = CaptureQueue

@@ -28,7 +28,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
-    from online_draft.runtime.dflash_capture import DFlashCaptureAdapter
+    from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
     from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
     from online_draft.runtime.weight_handoff import DraftWeightHandoff
 

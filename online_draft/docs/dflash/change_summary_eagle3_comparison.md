@@ -21,7 +21,7 @@
 | --- | --- |
 | [`models/qwen3_dflash.py`](../../src/online_draft/models/qwen3_dflash.py) | CPU 可微 DFlash；从已加载的 GPU draft 复制真实参数；打包 QKV、gate/up；独立 context 投影；非因果完整 block；CPU Flash SDPA；attention 按完整 block 分组 |
 | [`training/dflash/window.py`](../../src/online_draft/training/dflash/window.py) | DFlash batch/cache；窗口打包与位置 mask；最近 N 个完整 query block；位置衰减 KL；新增 context 梯度；更新后连续 KV 追加；记录缓存段版本 |
-| [`runtime/dflash_capture.py`](../../src/online_draft/runtime/dflash_capture.py) | prompt bootstrap、完整 proposal、原始 target features、teacher logits 和 verification 计数的捕获及对齐；预分配 pinned D2H staging；CPU 有效监督行选择 |
+| [`runtime/capture/dflash.py`](../../src/online_draft/runtime/capture/dflash.py) | prompt bootstrap、完整 proposal、FC 输出、teacher logits 和 verification 计数的捕获及对齐；预分配 pinned D2H staging；CPU batch 构造器持有连续历史并选择有效监督行 |
 | [`dflash/online.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/online.py) | DFlash 参数 slot 及 fused KV/norm 派生 buffer 一致性；安装、窗口关闭、请求结束及 reset |
 | [`dflash/speculator.py`](../../../vllm/v1/worker/gpu/spec_decode/dflash/speculator.py) | 在 target 特征进入 FC 前 capture；接入 teacher/proposal 回调；每个参数 slot 一套 query graph；按活动 slot 执行；在线关闭时沿用原推理路径 |
 
@@ -30,8 +30,9 @@
 | 文件 | 改动及 EAGLE3 影响 |
 | --- | --- |
 | [`runtime/async_pipeline.py`](../../src/online_draft/runtime/async_pipeline.py) | 提取 `AsyncDraftPipeline`，EAGLE3 以薄适配类继续调用原 recipe；共享 bootstrap/安装划分窗口/reset；复用一份 pinned snapshot；增加 CPU/source version、完整/训练轮数、目标数和耗时统计 |
-| [`runtime/capture_runtime.py`](../../src/online_draft/runtime/capture_runtime.py) | 将 `PreparedRound` 的 batch 泛化，保留 EAGLE3 别名及专用 CPU batch 构建；接入采集线程配置 |
-| [`runtime/transport.py`](../../src/online_draft/runtime/transport.py) | 统一 packet 搬运协议和 FIFO；保留 EAGLE3 名称兼容；失败后继续处理清理信号，避免 finish 等待悬空，错误仍传播给推理主路径 |
+| [`runtime/contracts.py`](../../src/online_draft/runtime/contracts.py) | 通用 `PreparedRound` 与 `CapturePacket` 协议；独立于模型专用采集实现 |
+| [`runtime/capture/eagle3.py`](../../src/online_draft/runtime/capture/eagle3.py) | EAGLE3 packet、GPU adapter 和专用 CPU batch 构造器；持有 confirmed 历史并处理位置对齐 |
+| [`runtime/transport.py`](../../src/online_draft/runtime/transport.py) | 通用 FIFO 和 D2H 搬运；失败后继续处理清理信号，避免 finish 等待悬空，错误仍传播给推理主路径 |
 | [`runtime/weight_handoff.py`](../../src/online_draft/runtime/weight_handoff.py) | 共用 `DraftWeightHandoff`，保留旧别名；继续先 stage，再非阻塞检查 commit |
 | [`runtime/draft_weight_installer.py`](../../src/online_draft/runtime/draft_weight_installer.py) | 增加活动 slot、旧 slot 最后使用事件、可选派生 buffer 准备回调；两条链路都获得覆盖旧 slot 前的使用事件保护 |
 | [`eagle/weight_slots.py`](../../../vllm/v1/worker/gpu/spec_decode/eagle/weight_slots.py) | 提取 `DraftWeightSlots` 并保留 EAGLE3 别名；仍只给选中的 draft 自有参数分配两份 GPU 存储，不改 target 共享参数 |

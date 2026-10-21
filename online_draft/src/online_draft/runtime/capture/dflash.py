@@ -102,6 +102,66 @@ class DFlashCapturePacket:
         )
 
 
+class _DFlashBatchBuilder:
+    """Build CPU rounds and own continuous target history on the capture worker."""
+
+    def __init__(
+        self,
+        on_round: Callable[[PreparedRound[DFlashBatch]], object],
+        on_finish: Callable[[str], object],
+    ) -> None:
+        self._on_round = on_round
+        self._on_finish = on_finish
+        self._prompt: list[torch.Tensor] = []
+        self._history_end = 0
+
+    def consume(self, packets: tuple[DFlashCapturePacket, ...]) -> None:
+        for packet in packets:
+            target_positions = packet.target_metadata[:-2]
+            rejected, sampled = packet.target_metadata[-2:].tolist()
+            count = target_positions.numel() - rejected
+            positions = target_positions[:count]
+            assert torch.equal(
+                positions, torch.arange(self._history_end, self._history_end + count)
+            ), "DFlash requires continuous target context (disable prefix caching)"
+            self._history_end += count
+            confirmed = packet.target_fc[:count].clone()
+            if packet.proposal is None:
+                self._prompt.append(confirmed)
+                continue
+            proposal = packet.proposal
+            input_ids, query_positions = proposal.metadata.unbind()
+            assert int(positions[0]) == int(query_positions[0])
+            assert packet.teacher_logits is not None
+            k = input_ids.numel() - 1
+            targets = min(sampled, k)
+            assert targets > 0
+            probabilities = packet.teacher_logits[:targets].float().softmax(-1)
+            probabilities /= probabilities.sum(-1, keepdim=True, dtype=torch.float64)
+            batch = DFlashBatch(
+                input_ids=input_ids.clone(),
+                positions=query_positions.clone(),
+                prompt_fc=torch.cat(self._prompt) if self._prompt else None,
+                confirmed_fc=confirmed,
+                teacher_probabilities=probabilities,
+                rejection_position=sampled - 1 if sampled <= k else None,
+            )
+            self._prompt.clear()
+            self._on_round(
+                PreparedRound(
+                    packet.request_id,
+                    packet.step_id,
+                    proposal.source_weight_version,
+                    batch,
+                )
+            )
+
+    def finish_request(self, request_id: str) -> None:
+        self._prompt.clear()
+        self._history_end = 0
+        self._on_finish(request_id)
+
+
 class DFlashCaptureAdapter:
     """Capture FC outputs and prepare aligned rounds on the D2H worker."""
 
@@ -116,22 +176,18 @@ class DFlashCaptureAdapter:
         profile_timeline: bool = False,
         cpu_config: CPUWorkerConfig | None = None,
     ):
-        self._on_round = on_round
         self._buffers = buffers
-        self._on_finish = on_finish
         self._profile_timeline = profile_timeline
         self._proposal: DFlashProposal | None = None
         self._teacher: torch.Tensor | None = None
         self._step_id = 0
         self._capture_proposal = False
-        # Only the capture worker owns the CPU history below.
-        self._prompt: list[torch.Tensor] = []
-        self._history_end = 0
+        self._batch_builder = _DFlashBatchBuilder(on_round, on_finish)
         self._queue = CaptureQueue(
             transfer_chunk_size=1,
-            consume_chunk=self._consume,
+            consume_chunk=self._batch_builder.consume,
             on_close_epoch=on_epoch_close,
-            on_finish=self._finish_cpu,
+            on_finish=self._batch_builder.finish_request,
             on_queue_size=on_queue_size,
             profile_timeline=profile_timeline,
             cpu_config=cpu_config,
@@ -195,54 +251,8 @@ class DFlashCaptureAdapter:
                     torch.stack((input_ids, positions)), version
                 )
 
-    def _consume(self, packets: tuple[DFlashCapturePacket, ...]) -> None:
-        for packet in packets:
-            target_positions = packet.target_metadata[:-2]
-            rejected, sampled = packet.target_metadata[-2:].tolist()
-            count = target_positions.numel() - rejected
-            positions = target_positions[:count]
-            assert torch.equal(
-                positions, torch.arange(self._history_end, self._history_end + count)
-            ), "DFlash requires continuous target context (disable prefix caching)"
-            self._history_end += count
-            confirmed = packet.target_fc[:count].clone()
-            if packet.proposal is None:
-                self._prompt.append(confirmed)
-                continue
-            proposal = packet.proposal
-            input_ids, query_positions = proposal.metadata.unbind()
-            assert int(positions[0]) == int(query_positions[0])
-            assert packet.teacher_logits is not None
-            k = input_ids.numel() - 1
-            targets = min(sampled, k)
-            assert targets > 0
-            probabilities = packet.teacher_logits[:targets].float().softmax(-1)
-            probabilities /= probabilities.sum(-1, keepdim=True, dtype=torch.float64)
-            batch = DFlashBatch(
-                input_ids=input_ids.clone(),
-                positions=query_positions.clone(),
-                prompt_fc=torch.cat(self._prompt) if self._prompt else None,
-                confirmed_fc=confirmed,
-                teacher_probabilities=probabilities,
-                rejection_position=sampled - 1 if sampled <= k else None,
-            )
-            self._prompt.clear()
-            self._on_round(
-                PreparedRound(
-                    packet.request_id,
-                    packet.step_id,
-                    proposal.source_weight_version,
-                    batch,
-                )
-            )
-
     def close_epoch(self, request_id: str) -> None:
         self._queue.close_epoch(request_id)
-
-    def _finish_cpu(self, request_id: str) -> None:
-        self._prompt.clear()
-        self._history_end = 0
-        self._on_finish(request_id)
 
     def finish_request(self, request_id: str) -> None:
         self._queue.finish_request(request_id)

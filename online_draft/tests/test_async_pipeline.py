@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from online_draft.runtime.async_pipeline import AsyncEagle3Pipeline
-from online_draft.runtime.capture_runtime import Eagle3PreparedRound
+from online_draft.runtime.capture.eagle3 import Eagle3PreparedRound
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.training.eagle3.batch import Eagle3DistillationBatch
 from online_draft.training.eagle3.window import Eagle3WindowMode
