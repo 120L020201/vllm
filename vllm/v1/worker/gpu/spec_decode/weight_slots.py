@@ -55,6 +55,3 @@ class DraftWeightSlots:
 
         for name, tensor in weights.items():
             parameters[name].data = tensor
-
-
-Eagle3WeightSlots = DraftWeightSlots

@@ -14,8 +14,8 @@ from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
     EagleSpeculator,
     logger,
 )
-from vllm.v1.worker.gpu.spec_decode.eagle.weight_slots import (
-    Eagle3WeightSlots,
+from vllm.v1.worker.gpu.spec_decode.weight_slots import (
+    DraftWeightSlots,
 )
 
 
@@ -184,7 +184,7 @@ def test_only_selected_draft_owned_parameters_receive_slots() -> None:
         "projection.weight",
         "projection.bias",
     )
-    slots = Eagle3WeightSlots.from_models(
+    slots = DraftWeightSlots.from_models(
         target,
         draft,
         mutable_names,
@@ -204,7 +204,7 @@ def test_bind_switches_draft_owned_parameters() -> None:
     draft.embed_tokens = target.embed_tokens
     draft.projection = nn.Linear(3, 2)
 
-    slots = Eagle3WeightSlots.from_models(
+    slots = DraftWeightSlots.from_models(
         target,
         draft,
         (
@@ -230,7 +230,7 @@ def test_prefill_installs_snapshot_and_binds_before_closing_epoch() -> None:
     draft = nn.Module()
     draft.projection = nn.Linear(2, 2)
     mutable_names = tuple(dict(draft.named_parameters()))
-    slots = Eagle3WeightSlots.from_models(target, draft, mutable_names)
+    slots = DraftWeightSlots.from_models(target, draft, mutable_names)
     installer = DraftWeightInstaller(
         slots.slots,
         mutable_names=mutable_names,
@@ -276,7 +276,7 @@ def test_finish_request_restores_initial_active_weights() -> None:
     draft = nn.Module()
     draft.projection = nn.Linear(2, 2)
     mutable_names = tuple(dict(draft.named_parameters()))
-    slots = Eagle3WeightSlots.from_models(target, draft, mutable_names)
+    slots = DraftWeightSlots.from_models(target, draft, mutable_names)
     initial_weights = tuple(
         (name, tensor.clone()) for name, tensor in slots.slots[0].items()
     )

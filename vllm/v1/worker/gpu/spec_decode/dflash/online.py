@@ -8,7 +8,7 @@ from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
 from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.spec_decode.eagle.weight_slots import DraftWeightSlots
+from vllm.v1.worker.gpu.spec_decode.weight_slots import DraftWeightSlots
 
 logger = init_logger(__name__)
 

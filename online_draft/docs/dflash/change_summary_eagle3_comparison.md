@@ -34,7 +34,7 @@
 | [`runtime/capture/eagle3.py`](../../src/online_draft/runtime/capture/eagle3.py) | EAGLE3 packet、GPU adapter 和专用 CPU batch 构造器；持有 confirmed 历史并处理位置对齐 |
 | [`runtime/transport.py`](../../src/online_draft/runtime/transport.py) | 通用 FIFO 和 D2H 搬运；失败后继续处理清理信号，避免 finish 等待悬空，错误仍传播给推理主路径 |
 | [`runtime/weights.py`](../../src/online_draft/runtime/weights.py) | 共用 `DraftWeightSnapshot` 和 `DraftWeightInstaller`；推理侧领取 snapshot 后调用 `advance(snapshot)`，先 stage 再非阻塞检查 commit；管理活动 slot/version、旧 slot 最后使用事件、派生 buffer 准备和 reset；移除独立 handoff 对象，绑定和 epoch close 仍由各模型负责 |
-| [`eagle/weight_slots.py`](../../../vllm/v1/worker/gpu/spec_decode/eagle/weight_slots.py) | 提取 `DraftWeightSlots` 并保留 EAGLE3 别名；仍只给选中的 draft 自有参数分配两份 GPU 存储，不改 target 共享参数 |
+| [`spec_decode/weight_slots.py`](../../../vllm/v1/worker/gpu/spec_decode/weight_slots.py) | EAGLE3 与 DFlash 共用 `DraftWeightSlots`；只给选中的 draft 自有参数分配两份 GPU 存储，不改 target 共享参数 |
 | [`runtime/cpu_worker.py`](../../src/online_draft/runtime/cpu_worker.py) | 新增 inference/capture/training 三种角色的线程局部 OpenMP/MKL 配置及 affinity；EAGLE3 同样可以配置 |
 | [`training/trainer.py`](../../src/online_draft/training/trainer.py) | 新增可选 FP32 master weights 和配套梯度/reset；默认关闭，原 AdamW 行为保留 |
 | [`gpu_worker.py`](../../../vllm/v1/worker/gpu_worker.py) | 按方法加载 CPU 模型及 recipe；DFlash 配置检查与默认 N=16、gamma=7、fused=True；保留 EAGLE3 loss、全量窗口及 fused=False 默认；统一角色配置和生命周期 |

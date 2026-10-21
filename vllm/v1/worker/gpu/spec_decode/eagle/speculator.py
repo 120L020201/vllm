@@ -16,8 +16,8 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
-from vllm.v1.worker.gpu.spec_decode.eagle.weight_slots import (
-    Eagle3WeightSlots,
+from vllm.v1.worker.gpu.spec_decode.weight_slots import (
+    DraftWeightSlots,
 )
 
 logger = init_logger(__name__)
@@ -29,7 +29,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         self.online_draft_training_enabled = envs.VLLM_ONLINE_DRAFT_TRAIN
         self.explicit_input_embeds = self.online_draft_training_enabled
         self._online_target_model: nn.Module | None = None
-        self.draft_weight_slots: Eagle3WeightSlots | None = None
+        self.draft_weight_slots: DraftWeightSlots | None = None
         self.draft_weight_installer: DraftWeightInstaller | None = None
         self._poll_snapshot: Callable[[], DraftWeightSnapshot | None] | None = None
         self.capture_adapter: Any | None = None
@@ -71,7 +71,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         assert self._online_target_model is not None
         self._log_online_draft_updates = log_updates
 
-        slots = Eagle3WeightSlots.from_models(
+        slots = DraftWeightSlots.from_models(
             target_model=self._online_target_model,
             draft_model=self.model,
             mutable_names=mutable_names,
