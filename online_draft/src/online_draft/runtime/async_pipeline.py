@@ -16,25 +16,7 @@ from online_draft.runtime import profile_range
 from online_draft.runtime.contracts import PreparedRound
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
-from online_draft.training.eagle3.cache import PersistentEagle3KVCache
-from online_draft.training.eagle3.window import (
-    Eagle3TrainingWindow,
-    Eagle3WindowMode,
-    Eagle3WindowResult,
-    train_eagle3_window,
-)
 from online_draft.training.trainer import DraftTrainer
-
-TrainWindow = Callable[
-    [
-        DraftTrainer,
-        Eagle3TrainingWindow,
-        PersistentEagle3KVCache,
-        Eagle3WindowMode,
-        bool,
-    ],
-    tuple[PersistentEagle3KVCache, Eagle3WindowResult],
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,30 +273,3 @@ class AsyncDraftPipeline:
         with self._lock:
             if self._failure is None:
                 self._failure = error
-
-
-class AsyncEagle3Pipeline(AsyncDraftPipeline):
-    """Run the EAGLE3 recipe using the shared asynchronous scheduler."""
-
-    def __init__(
-        self,
-        *,
-        trainer: DraftTrainer,
-        mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
-        on_queue_size: Callable[[int], None] | None = None,
-        train_window: TrainWindow = train_eagle3_window,
-        profile_timeline: bool = False,
-        cpu_config: CPUWorkerConfig | None = None,
-    ) -> None:
-        def train_rounds(trainer, rounds, cache, profile):
-            return train_window(
-                trainer, Eagle3TrainingWindow(rounds), cache, mode, profile
-            )
-
-        super().__init__(
-            trainer=trainer,
-            train_rounds=train_rounds,
-            on_queue_size=on_queue_size,
-            profile_timeline=profile_timeline,
-            cpu_config=cpu_config,
-        )

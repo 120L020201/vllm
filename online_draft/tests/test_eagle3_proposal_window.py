@@ -32,6 +32,7 @@ from online_draft.training.eagle3.inputs import (
 from online_draft.training.eagle3.window import (
     Eagle3TrainingWindow,
     Eagle3WindowMode,
+    train_eagle3_rounds,
     train_eagle3_window,
 )
 from online_draft.training.trainer import (
@@ -606,9 +607,9 @@ def test_proposal_window_trains_once_and_rebuilds_confirmed_cache() -> None:
 
     try:
         with torch.inference_mode():
-            persistent_cache, result = train_eagle3_window(
+            persistent_cache, result = train_eagle3_rounds(
                 trainer=trainer,
-                window=window,
+                rounds=window.rounds,
                 persistent_cache=None,
                 mode=Eagle3WindowMode.PROPOSAL_CANVAS,
             )

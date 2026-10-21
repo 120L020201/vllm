@@ -21,7 +21,7 @@ from online_draft.training.eagle3.cache import (
 from online_draft.training.eagle3.window import (
     Eagle3TrainingWindow,
     Eagle3WindowMode,
-    train_eagle3_window,
+    train_eagle3_rounds,
 )
 from online_draft.training.trainer import (
     DraftTrainer,
@@ -378,11 +378,10 @@ def test_confirmed_path_window_uses_one_optimizer_step() -> None:
 
     try:
         with torch.inference_mode():
-            persistent_cache, result = train_eagle3_window(
+            persistent_cache, result = train_eagle3_rounds(
                 trainer=trainer,
-                window=window,
+                rounds=window.rounds,
                 persistent_cache=None,
-                mode=Eagle3WindowMode.CONFIRMED_PATH,
             )
     finally:
         model_handle.remove()
@@ -436,11 +435,10 @@ def test_profile_timeline_labels_training_stages() -> None:
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU],
     ) as profiler:
-        train_eagle3_window(
+        train_eagle3_rounds(
             trainer,
-            window,
+            window.rounds,
             None,
-            Eagle3WindowMode.CONFIRMED_PATH,
             profile_timeline=True,
         )
 
@@ -520,11 +518,10 @@ def test_later_confirmed_path_window_preserves_fixed_history() -> None:
     )
 
     try:
-        updated_cache, result = train_eagle3_window(
+        updated_cache, result = train_eagle3_rounds(
             trainer=trainer,
-            window=window,
+            rounds=window.rounds,
             persistent_cache=persistent_cache,
-            mode=Eagle3WindowMode.CONFIRMED_PATH,
         )
     finally:
         handle.remove()

@@ -487,13 +487,11 @@ class Worker(WorkerBase):
             load_qwen3_eagle3_checkpoint,
             validate_qwen3_eagle3_weights,
         )
-        from online_draft.runtime.async_pipeline import (
-            AsyncDraftPipeline,
-            AsyncEagle3Pipeline,
-        )
+        from online_draft.runtime.async_pipeline import AsyncDraftPipeline
         from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
         from online_draft.runtime.cpu_worker import CPUWorkerConfig
         from online_draft.runtime.weight_handoff import DraftWeightHandoff
+        from online_draft.training.eagle3.window import train_eagle3_rounds
         from online_draft.training.trainer import (
             DraftTrainer,
             TrainerConfig,
@@ -605,6 +603,7 @@ class Worker(WorkerBase):
         )
         train_queue_log = queue_logger("train") if log_queue_sizes else None
         capture_queue_log = queue_logger("capture") if log_queue_sizes else None
+        train_rounds: Callable
         if is_dflash:
             max_train_rounds = online_config.get("max_train_rounds", 16)
             loss_decay_gamma = online_config.get("loss_decay_gamma", 7.0)
@@ -613,17 +612,22 @@ class Worker(WorkerBase):
                     "DFlash requires max_train_rounds >= 0 and "
                     "finite loss_decay_gamma > 0"
                 )
-            pipeline = AsyncDraftPipeline(
-                trainer=trainer,
-                train_rounds=partial(
-                    train_dflash_window,
-                    max_train_rounds=max_train_rounds,
-                    loss_decay_gamma=loss_decay_gamma,
-                ),
-                on_queue_size=train_queue_log,
-                profile_timeline=profile_online_draft,
-                cpu_config=cpu_configs["training"],
+            train_rounds = partial(
+                train_dflash_window,
+                max_train_rounds=max_train_rounds,
+                loss_decay_gamma=loss_decay_gamma,
             )
+        else:
+            train_rounds = train_eagle3_rounds
+
+        pipeline = AsyncDraftPipeline(
+            trainer=trainer,
+            train_rounds=train_rounds,
+            on_queue_size=train_queue_log,
+            profile_timeline=profile_online_draft,
+            cpu_config=cpu_configs["training"],
+        )
+        if is_dflash:
             adapter = DFlashCaptureAdapter(
                 buffers=DFlashCaptureBuffers(
                     self.scheduler_config.max_num_batched_tokens,
@@ -642,12 +646,6 @@ class Worker(WorkerBase):
                 cpu_config=cpu_configs["capture"],
             )
         else:
-            pipeline = AsyncEagle3Pipeline(
-                trainer=trainer,
-                on_queue_size=train_queue_log,
-                profile_timeline=profile_online_draft,
-                cpu_config=cpu_configs["training"],
-            )
             adapter = Eagle3CaptureAdapter(
                 target_token_ids=cpu_model.get_target_token_ids().to(self.device),
                 source_weight_version=lambda: installer.active_version,

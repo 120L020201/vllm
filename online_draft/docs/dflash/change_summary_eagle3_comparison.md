@@ -29,7 +29,7 @@
 
 | 文件 | 改动及 EAGLE3 影响 |
 | --- | --- |
-| [`runtime/async_pipeline.py`](../../src/online_draft/runtime/async_pipeline.py) | 提取 `AsyncDraftPipeline`，EAGLE3 以薄适配类继续调用原 recipe；共享 bootstrap/安装划分窗口/reset；复用一份 pinned snapshot；增加 CPU/source version、完整/训练轮数、目标数和耗时统计 |
+| [`runtime/async_pipeline.py`](../../src/online_draft/runtime/async_pipeline.py) | 两种模型共用 `AsyncDraftPipeline`，由 worker 注入各自的训练函数，EAGLE3 window 包装留在训练层；共享 bootstrap/安装划分窗口/reset；复用一份 pinned snapshot；记录 CPU/source version、完整/训练轮数、目标数和耗时 |
 | [`runtime/contracts.py`](../../src/online_draft/runtime/contracts.py) | 通用 `PreparedRound` 与 `CapturePacket` 协议；独立于模型专用采集实现 |
 | [`runtime/capture/eagle3.py`](../../src/online_draft/runtime/capture/eagle3.py) | EAGLE3 packet、GPU adapter 和专用 CPU batch 构造器；持有 confirmed 历史并处理位置对齐 |
 | [`runtime/transport.py`](../../src/online_draft/runtime/transport.py) | 通用 FIFO 和 D2H 搬运；失败后继续处理清理信号，避免 finish 等待悬空，错误仍传播给推理主路径 |

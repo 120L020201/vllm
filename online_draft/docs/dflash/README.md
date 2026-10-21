@@ -59,6 +59,13 @@ Adapter 持有推理线程的 proposal/teacher 状态；batch 构造器只在 ca
 transport 等待生产事件、发起复制并等待完成后调用 batch 构造器。提交给训练
 线程的 batch 不引用下一次 D2H 会覆盖的 staging 内容。
 
+两种模型共用 `AsyncDraftPipeline`，由 worker 注入训练函数：EAGLE3 使用
+`training/eagle3/window.py` 的 `train_eagle3_rounds`，在训练层构建
+`Eagle3TrainingWindow`；DFlash 使用 `train_dflash_window`，通过 `partial`
+绑定最近训练轮数和 loss 衰减参数。Pipeline 传入 trainer、完整 CPU batch 元组、
+历史 cache 和 profiling 开关，接收更新后的 cache 与训练结果；它不解释各模型的
+batch、loss 或 KV 内容。Bootstrap、epoch、snapshot 和 reset 仍由公共调度器管理。
+
 推理线程提交 FC 快照与 ready event，capture 线程在独立 D2H stream 搬运。
 训练线程发布 pinned snapshot；推理线程沿用 EAGLE3 的 handoff，在私有 stream
 提交 H2D，并通过 event query 安装完成的权重，不等待 CPU 训练。

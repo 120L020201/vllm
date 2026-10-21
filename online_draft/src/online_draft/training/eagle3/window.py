@@ -138,6 +138,20 @@ class Eagle3WindowResult:
     mean_acceptance_length: float
 
 
+def train_eagle3_rounds(
+    trainer: DraftTrainer,
+    rounds: tuple[Eagle3DistillationBatch, ...],
+    persistent_cache: PersistentEagle3KVCache,
+    profile_timeline: bool = False,
+    *,
+    mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
+) -> tuple[Eagle3KVCache, Eagle3WindowResult]:
+    """Train the rounds selected by the shared asynchronous pipeline."""
+    return train_eagle3_window(
+        trainer, Eagle3TrainingWindow(rounds), persistent_cache, mode, profile_timeline
+    )
+
+
 def train_eagle3_window(
     trainer: DraftTrainer,
     window: Eagle3TrainingWindow,
