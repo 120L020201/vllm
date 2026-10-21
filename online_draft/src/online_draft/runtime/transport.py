@@ -10,11 +10,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Protocol, Self, cast
+from typing import cast
 
 import torch
 
 from online_draft.runtime import profile_range
+from online_draft.runtime.contracts import CapturePacket
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 
 
@@ -174,16 +175,6 @@ class _FinishRequest:
 @dataclass(frozen=True, slots=True)
 class _CloseEpoch:
     request_id: str
-
-
-class CapturePacket(Protocol):
-    request_id: str
-    ready: torch.cuda.Event | None
-
-    @property
-    def device(self) -> torch.device: ...
-
-    def to_cpu(self, *, non_blocking: bool = False) -> Self: ...
 
 
 class CaptureQueue:

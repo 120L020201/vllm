@@ -7,11 +7,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Generic, TypeVar
 
 import torch
 
+from online_draft.runtime.contracts import PreparedRound
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.runtime.transport import (
     Eagle3CapturePacket,
@@ -19,19 +18,6 @@ from online_draft.runtime.transport import (
     Eagle3PromptContext,
 )
 from online_draft.training.eagle3.batch import Eagle3DistillationBatch
-
-BatchT = TypeVar("BatchT")
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedRound(Generic[BatchT]):
-    """One CPU batch with request and weight metadata."""
-
-    request_id: str
-    step_id: int
-    source_weight_version: int
-    batch: BatchT
-
 
 Eagle3PreparedRound = PreparedRound[Eagle3DistillationBatch]
 

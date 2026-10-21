@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 from online_draft.runtime import profile_range
-from online_draft.runtime.capture_runtime import PreparedRound
+from online_draft.runtime.contracts import PreparedRound
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
 from online_draft.training.eagle3.cache import PersistentEagle3KVCache
