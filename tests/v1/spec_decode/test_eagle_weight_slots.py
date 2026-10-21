@@ -8,8 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
-from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
+from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
     EagleSpeculator,

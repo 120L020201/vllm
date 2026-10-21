@@ -490,7 +490,7 @@ class Worker(WorkerBase):
         from online_draft.runtime.async_pipeline import AsyncDraftPipeline
         from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
         from online_draft.runtime.cpu_worker import CPUWorkerConfig
-        from online_draft.runtime.weight_handoff import DraftWeightHandoff
+        from online_draft.runtime.weights import DraftWeightHandoff
         from online_draft.training.eagle3.window import train_eagle3_rounds
         from online_draft.training.trainer import (
             DraftTrainer,

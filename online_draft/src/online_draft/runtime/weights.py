@@ -4,12 +4,43 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from threading import Lock
+from typing import Protocol
 
 import torch
 
 from online_draft.runtime import profile_range
-from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWeightSnapshot:
+    """Detached CPU weights owned by one install attempt."""
+
+    version: int
+    tensors: tuple[tuple[str, torch.Tensor], ...]
+
+    @classmethod
+    def from_named_tensors(
+        cls,
+        named_tensors: Iterable[tuple[str, torch.Tensor]],
+        *,
+        version: int,
+        pin_memory: bool = True,
+    ) -> DraftWeightSnapshot:
+        """Copy named tensors into CPU-owned storage."""
+        use_pinned_memory = pin_memory and torch.cuda.is_available()
+        tensors = []
+        for name, tensor in named_tensors:
+            cpu_tensor = torch.empty_like(
+                tensor,
+                device="cpu",
+                pin_memory=use_pinned_memory,
+            )
+            cpu_tensor.copy_(tensor.detach())
+            tensors.append((name, cpu_tensor))
+
+        return cls(version=version, tensors=tuple(tensors))
 
 
 class DraftWeightInstaller:
@@ -175,3 +206,37 @@ class DraftWeightInstaller:
 
             self._staged = None
             self._active_version = self._initial_version
+
+
+class _SnapshotSource(Protocol):
+    def poll_snapshot(self) -> DraftWeightSnapshot | None: ...
+
+
+class _WeightInstaller(Protocol):
+    def stage(self, snapshot: DraftWeightSnapshot) -> None: ...
+
+    def commit_if_ready(self) -> int | None: ...
+
+
+class DraftWeightHandoff:
+    """Move CPU snapshots to GPU slots and commit completed copies."""
+
+    def __init__(
+        self,
+        *,
+        snapshot_source: _SnapshotSource,
+        installer: _WeightInstaller,
+    ) -> None:
+        self._snapshot_source = snapshot_source
+        self._installer = installer
+
+    def advance(self) -> int | None:
+        """Stage a ready snapshot and commit it when its copy is complete."""
+        snapshot = self._snapshot_source.poll_snapshot()
+        if snapshot is not None:
+            self._installer.stage(snapshot)
+
+        return self._installer.commit_if_ready()
+
+
+Eagle3WeightHandoff = DraftWeightHandoff

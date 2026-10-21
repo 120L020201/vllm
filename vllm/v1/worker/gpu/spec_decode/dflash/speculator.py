@@ -29,8 +29,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
     from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
-    from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
-    from online_draft.runtime.weight_handoff import DraftWeightHandoff
+    from online_draft.runtime.weights import DraftWeightHandoff, DraftWeightInstaller
 
     from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashOnlineState
 

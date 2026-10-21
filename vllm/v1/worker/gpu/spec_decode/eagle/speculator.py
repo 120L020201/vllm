@@ -6,8 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
-from online_draft.runtime.weight_handoff import Eagle3WeightHandoff
+from online_draft.runtime.weights import DraftWeightInstaller, Eagle3WeightHandoff
 
 import vllm.envs as envs
 from vllm.config import VllmConfig

@@ -4,9 +4,11 @@
 from dataclasses import dataclass, field
 
 import torch
-from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
-from online_draft.runtime.weight_handoff import Eagle3WeightHandoff
-from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
+from online_draft.runtime.weights import (
+    DraftWeightInstaller,
+    DraftWeightSnapshot,
+    Eagle3WeightHandoff,
+)
 
 
 @dataclass

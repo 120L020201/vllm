@@ -3,8 +3,7 @@
 
 import pytest
 import torch
-from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
-from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
+from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 
 def _slots() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:

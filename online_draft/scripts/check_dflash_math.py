@@ -9,7 +9,7 @@ from torch.nn import functional as F
 
 
 def check_dflash_math(worker):
-    from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
+    from online_draft.runtime.weights import DraftWeightSnapshot
 
     trainer = worker._online_draft_trainer
     state = worker._online_draft_speculator.online_state
