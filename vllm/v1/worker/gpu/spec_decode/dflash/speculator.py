@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -29,7 +29,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
     from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
-    from online_draft.runtime.weights import DraftWeightHandoff, DraftWeightInstaller
+    from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
     from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashOnlineState
 
@@ -207,8 +207,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.capture_adapter = adapter
         self.online_state.adapter = adapter
 
-    def set_weight_handoff(self, handoff: "DraftWeightHandoff") -> None:
-        self.online_state.handoff = handoff
+    def set_snapshot_source(
+        self, poll_snapshot: Callable[[], "DraftWeightSnapshot | None"]
+    ) -> None:
+        self.online_state.poll_snapshot = poll_snapshot
 
     def on_target_logits_ready(self, logits: torch.Tensor) -> None:
         if self.capture_adapter is not None:

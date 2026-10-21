@@ -490,7 +490,6 @@ class Worker(WorkerBase):
         from online_draft.runtime.async_pipeline import AsyncDraftPipeline
         from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
         from online_draft.runtime.cpu_worker import CPUWorkerConfig
-        from online_draft.runtime.weights import DraftWeightHandoff
         from online_draft.training.eagle3.window import train_eagle3_rounds
         from online_draft.training.trainer import (
             DraftTrainer,
@@ -661,12 +660,7 @@ class Worker(WorkerBase):
                 profile_timeline=profile_online_draft,
                 cpu_config=cpu_configs["capture"],
             )
-        handoff = DraftWeightHandoff(
-            snapshot_source=pipeline,
-            installer=installer,
-        )
-
-        speculator.set_weight_handoff(handoff)
+        speculator.set_snapshot_source(pipeline.poll_snapshot)
 
         self._online_draft_trainer = trainer
         self._online_draft_pipeline = pipeline

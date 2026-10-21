@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
 import torch.nn as nn
-from online_draft.runtime.weights import DraftWeightInstaller, Eagle3WeightHandoff
+from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -31,7 +31,7 @@ class EagleSpeculator(AutoRegressiveSpeculator):
         self._online_target_model: nn.Module | None = None
         self.draft_weight_slots: Eagle3WeightSlots | None = None
         self.draft_weight_installer: DraftWeightInstaller | None = None
-        self.weight_handoff: Eagle3WeightHandoff | None = None
+        self._poll_snapshot: Callable[[], DraftWeightSnapshot | None] | None = None
         self.capture_adapter: Any | None = None
         self._log_online_draft_updates = False
         self._last_installed_round = 0
@@ -39,11 +39,11 @@ class EagleSpeculator(AutoRegressiveSpeculator):
     def set_capture_adapter(self, adapter: Any) -> None:
         self.capture_adapter = adapter
 
-    def set_weight_handoff(
+    def set_snapshot_source(
         self,
-        handoff: Eagle3WeightHandoff,
+        poll_snapshot: Callable[[], DraftWeightSnapshot | None],
     ) -> None:
-        self.weight_handoff = handoff
+        self._poll_snapshot = poll_snapshot
 
     def on_target_logits_ready(self, logits: torch.Tensor) -> None:
         if self.capture_adapter is not None:
@@ -137,10 +137,11 @@ class EagleSpeculator(AutoRegressiveSpeculator):
                 prefill_length=num_sampled[0],
             )
 
-        if self.weight_handoff is None:
+        if self._poll_snapshot is None:
             return
 
-        installed_version = self.weight_handoff.advance()
+        assert self.draft_weight_installer is not None
+        installed_version = self.draft_weight_installer.advance(self._poll_snapshot())
         if installed_version is None:
             return
 

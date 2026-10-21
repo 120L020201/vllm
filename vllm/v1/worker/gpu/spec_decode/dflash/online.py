@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 import torch
 from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
-from online_draft.runtime.weights import DraftWeightHandoff, DraftWeightInstaller
+from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.eagle.weight_slots import DraftWeightSlots
@@ -65,13 +65,13 @@ class DFlashOnlineState:
             profile_timeline=profile_timeline,
         )
         self.adapter: DFlashCaptureAdapter
-        self.handoff: DraftWeightHandoff
+        self.poll_snapshot: Callable[[], DraftWeightSnapshot | None]
         self.log_updates = log_updates
         self._last_installed_round = 0
         self.finished_request: dict | None = None
 
     def advance(self, request_id: str) -> int | None:
-        version = self.handoff.advance()
+        version = self.installer.advance(self.poll_snapshot())
         if version is None:
             return None
         self.slots.bind(self.installer.active_weights)

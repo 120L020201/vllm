@@ -3,7 +3,7 @@
 当前实现固定传输 **GPU FC 输出**，CPU 使用当前权重构建 detached context KV；
 每次 optimizer 更新后，重新投影本窗口新增 context 并追加到历史 KV。
 历史 KV 不重算，继续接受混合权重版本。实现复用 EAGLE3 的 trainer、FIFO、
-pinned snapshot、weight handoff 和双 slot。
+pinned snapshot、权重安装器和双 slot。
 
 最新技术说明见[阶段 25：固定 FC 采集与增量 KV 重算](stage25_fc_incremental_context.md)。
 训练轮数限制与窗口增长的验证见
@@ -66,10 +66,21 @@ transport 等待生产事件、发起复制并等待完成后调用 batch 构造
 历史 cache 和 profiling 开关，接收更新后的 cache 与训练结果；它不解释各模型的
 batch、loss 或 KV 内容。Bootstrap、epoch、snapshot 和 reset 仍由公共调度器管理。
 
+权重管理集中在 [`weights.py`](../../src/online_draft/runtime/weights.py)：
+`DraftWeightSnapshot` 携带 CPU 权重与版本；`DraftWeightInstaller` 管理 H2D、
+活动 slot/version、完成事件和 reset。Worker 将 `pipeline.poll_snapshot` 注入
+推理侧，推理侧领取快照后调用 `installer.advance(snapshot)`，先 stage 再检查
+commit；没有新快照时传入 `None`，仍检查此前 H2D 是否完成。无需单独的 handoff 对象。
+
 推理线程提交 FC 快照与 ready event，capture 线程在独立 D2H stream 搬运。
-训练线程发布 pinned snapshot；推理线程沿用 EAGLE3 的 handoff，在私有 stream
-提交 H2D，并通过 event query 安装完成的权重，不等待 CPU 训练。
-GPU 安装不会重算其历史 KV；后续新增段使用已安装的新权重。
+训练线程发布 pinned snapshot；installer 在私有 stream 提交 H2D，通过 event
+query 安装完成的权重，不等待 CPU 训练或未完成的 H2D。只有安装成功才绑定参数，
+并在各模型原来的位置关闭 epoch：EAGLE3 先提交 packet，再安装、绑定和关闭；
+DFlash 先安装和绑定，再计算 FC、提交 packet，最后关闭。GPU 安装不会重算其历史
+KV；后续新增段使用已安装的新权重。
+
+Pipeline 复用一份 pinned snapshot buffer；下一次训练由上一次真正安装后的
+epoch close 触发，保证上传读取期间不会覆盖快照。
 
 每个请求从 W0 开始，第一个完整 round 连同 prompt 单独更新。此后只在 GPU 真正
 安装新版本时关闭 epoch；本轮 packet 先入队，再入 epoch 标记。每个 proposal 保留

@@ -89,13 +89,15 @@ def test_dflash_graphs_read_each_updated_slot_and_reset_weights(monkeypatch):
     slots.bind(installer.active_weights)
 
     for version in (1, 2, 3):
-        installer.stage(
+        installed = installer.advance(
             DraftWeightSnapshot.from_named_tensors(
                 [(n, p + version * 0.05) for n, p in initial], version=version
             )
         )
         torch.accelerator.synchronize()
-        assert installer.commit_if_ready() == version
+        if installed is None:
+            installed = installer.advance(None)
+        assert installed == version
         assert installer.active_slot == version % 2
         slots.bind(installer.active_weights)
         graphs[installer.active_slot].replay()
@@ -114,7 +116,7 @@ def test_dflash_commit_and_reset_keep_derived_buffers_with_active_parameters():
         Qwen3DFlashForCausalLM,
     )
 
-    from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashWeightSlots
+    from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashOnlineState
 
     draft = Qwen3DFlashForCausalLM(Qwen3DFlashConfig(8, 16, 2, 1, 4, 2, 23, 2))
     target = nn.Module()
@@ -138,21 +140,22 @@ def test_dflash_commit_and_reset_keep_derived_buffers_with_active_parameters():
     with torch.no_grad():
         draft.model._fused_kv_weight, draft.model._k_norm_weights = derived()
     mutable = tuple(n for n, p in draft.named_parameters() if p.requires_grad)
-    slots = DFlashWeightSlots(target, draft, mutable)
-    installer = DraftWeightInstaller(
-        slots.slots, mutable_names=mutable, prepare_slot=slots.prepare
+    state = DFlashOnlineState(
+        target, draft, mutable, profile_timeline=False, log_updates=False
     )
+    installer = state.installer
     initial = tuple((n, p.clone()) for n, p in installer.active_weights.items())
-    for version in (1, 2):
-        installer.stage(
-            DraftWeightSnapshot.from_named_tensors(
-                [(n, p + version) for n, p in initial],
-                version=version,
-                pin_memory=False,
-            )
+    snapshots = iter(
+        DraftWeightSnapshot.from_named_tensors(
+            [(n, p + version) for n, p in initial],
+            version=version,
+            pin_memory=False,
         )
-        assert installer.commit_if_ready() == version
-        slots.bind(installer.active_weights)
+        for version in (1, 2)
+    )
+    state.poll_snapshot = lambda: next(snapshots, None)
+    for version in (1, 2):
+        assert state.advance("request-0") == version
         expected_kv, expected_norm = derived()
         torch.testing.assert_close(draft.model._fused_kv_weight, expected_kv)
         torch.testing.assert_close(draft.model._k_norm_weights, expected_norm)
@@ -160,8 +163,9 @@ def test_dflash_commit_and_reset_keep_derived_buffers_with_active_parameters():
             draft.model._hidden_norm_weight.data_ptr()
             == draft.model.hidden_norm.weight.data_ptr()
         )
+    assert state.advance("request-0") is None
     installer.reset(initial)
-    slots.bind(installer.active_weights)
+    state.slots.bind(installer.active_weights)
     expected_kv, expected_norm = derived()
     torch.testing.assert_close(draft.model._fused_kv_weight, expected_kv)
     torch.testing.assert_close(draft.model._k_norm_weights, expected_norm)
@@ -221,7 +225,7 @@ def test_bind_switches_draft_owned_parameters() -> None:
     assert draft.embed_tokens is target.embed_tokens
 
 
-def test_install_committed_weights_binds_slot_before_closing_epoch() -> None:
+def test_prefill_installs_snapshot_and_binds_before_closing_epoch() -> None:
     target = nn.Module()
     draft = nn.Module()
     draft.projection = nn.Linear(2, 2)
@@ -239,9 +243,6 @@ def test_install_committed_weights_binds_slot_before_closing_epoch() -> None:
         version=1,
         pin_memory=False,
     )
-    installer.stage(snapshot)
-    assert installer.commit_if_ready() == 1
-
     closed: list[str] = []
 
     def close_epoch(request_id: str) -> None:
@@ -253,9 +254,20 @@ def test_install_committed_weights_binds_slot_before_closing_epoch() -> None:
     speculator.capture_adapter = SimpleNamespace(close_epoch=close_epoch)
     speculator.draft_weight_installer = installer
     speculator.draft_weight_slots = slots
+    speculator._log_online_draft_updates = False
+    snapshots = iter([snapshot])
+    speculator.set_snapshot_source(lambda: next(snapshots, None))
 
-    speculator.install_committed_weights("request-0")
+    for _ in range(2):
+        speculator.on_prefill_input_embeds_ready(
+            num_reqs=1,
+            input_batch=SimpleNamespace(req_ids=["request-0"]),
+            aux_hidden_states=None,
+            num_sampled=torch.tensor([1]),
+            capture_enabled=False,
+        )
 
+    assert installer.active_version == 1
     assert closed == ["request-0"]
 
 
@@ -313,7 +325,8 @@ def test_weight_install_logs_rounds_since_previous_install() -> None:
     installed: list[str] = []
     speculator = object.__new__(EagleSpeculator)
     speculator.capture_adapter = SimpleNamespace(completed_rounds=5)
-    speculator.weight_handoff = SimpleNamespace(advance=lambda: 2)
+    speculator.set_snapshot_source(lambda: None)
+    speculator.draft_weight_installer = SimpleNamespace(advance=lambda snapshot: 2)
     speculator._log_online_draft_updates = True
     speculator._last_installed_round = 2
     speculator.install_committed_weights = installed.append
@@ -341,7 +354,8 @@ def test_weight_install_skips_update_log_when_disabled() -> None:
     installed: list[str] = []
     speculator = object.__new__(EagleSpeculator)
     speculator.capture_adapter = SimpleNamespace()
-    speculator.weight_handoff = SimpleNamespace(advance=lambda: 2)
+    speculator.set_snapshot_source(lambda: None)
+    speculator.draft_weight_installer = SimpleNamespace(advance=lambda snapshot: 2)
     speculator._log_online_draft_updates = False
     speculator.install_committed_weights = installed.append
 

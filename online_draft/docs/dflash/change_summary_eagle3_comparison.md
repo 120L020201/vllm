@@ -33,8 +33,7 @@
 | [`runtime/contracts.py`](../../src/online_draft/runtime/contracts.py) | 通用 `PreparedRound` 与 `CapturePacket` 协议；独立于模型专用采集实现 |
 | [`runtime/capture/eagle3.py`](../../src/online_draft/runtime/capture/eagle3.py) | EAGLE3 packet、GPU adapter 和专用 CPU batch 构造器；持有 confirmed 历史并处理位置对齐 |
 | [`runtime/transport.py`](../../src/online_draft/runtime/transport.py) | 通用 FIFO 和 D2H 搬运；失败后继续处理清理信号，避免 finish 等待悬空，错误仍传播给推理主路径 |
-| [`runtime/weights.py`](../../src/online_draft/runtime/weights.py) | 共用 `DraftWeightHandoff`，保留旧别名；继续先 stage，再非阻塞检查 commit |
-| [`runtime/weights.py`](../../src/online_draft/runtime/weights.py) | 增加活动 slot、旧 slot 最后使用事件、可选派生 buffer 准备回调；两条链路都获得覆盖旧 slot 前的使用事件保护 |
+| [`runtime/weights.py`](../../src/online_draft/runtime/weights.py) | 共用 `DraftWeightSnapshot` 和 `DraftWeightInstaller`；推理侧领取 snapshot 后调用 `advance(snapshot)`，先 stage 再非阻塞检查 commit；管理活动 slot/version、旧 slot 最后使用事件、派生 buffer 准备和 reset；移除独立 handoff 对象，绑定和 epoch close 仍由各模型负责 |
 | [`eagle/weight_slots.py`](../../../vllm/v1/worker/gpu/spec_decode/eagle/weight_slots.py) | 提取 `DraftWeightSlots` 并保留 EAGLE3 别名；仍只给选中的 draft 自有参数分配两份 GPU 存储，不改 target 共享参数 |
 | [`runtime/cpu_worker.py`](../../src/online_draft/runtime/cpu_worker.py) | 新增 inference/capture/training 三种角色的线程局部 OpenMP/MKL 配置及 affinity；EAGLE3 同样可以配置 |
 | [`training/trainer.py`](../../src/online_draft/training/trainer.py) | 新增可选 FP32 master weights 和配套梯度/reset；默认关闭，原 AdamW 行为保留 |

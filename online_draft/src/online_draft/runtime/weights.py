@@ -6,7 +6,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from threading import Lock
-from typing import Protocol
 
 import torch
 
@@ -112,6 +111,12 @@ class DraftWeightInstaller:
     def active_weights(self) -> Mapping[str, torch.Tensor]:
         return self._slots[self._active_slot]
 
+    def advance(self, snapshot: DraftWeightSnapshot | None) -> int | None:
+        """Stage an available snapshot and commit a completed copy without waiting."""
+        if snapshot is not None:
+            self.stage(snapshot)
+        return self.commit_if_ready()
+
     def stage(self, snapshot: DraftWeightSnapshot) -> None:
         """Copy a CPU snapshot into the inactive device slot."""
         with self._lock:
@@ -206,37 +211,3 @@ class DraftWeightInstaller:
 
             self._staged = None
             self._active_version = self._initial_version
-
-
-class _SnapshotSource(Protocol):
-    def poll_snapshot(self) -> DraftWeightSnapshot | None: ...
-
-
-class _WeightInstaller(Protocol):
-    def stage(self, snapshot: DraftWeightSnapshot) -> None: ...
-
-    def commit_if_ready(self) -> int | None: ...
-
-
-class DraftWeightHandoff:
-    """Move CPU snapshots to GPU slots and commit completed copies."""
-
-    def __init__(
-        self,
-        *,
-        snapshot_source: _SnapshotSource,
-        installer: _WeightInstaller,
-    ) -> None:
-        self._snapshot_source = snapshot_source
-        self._installer = installer
-
-    def advance(self) -> int | None:
-        """Stage a ready snapshot and commit it when its copy is complete."""
-        snapshot = self._snapshot_source.poll_snapshot()
-        if snapshot is not None:
-            self._installer.stage(snapshot)
-
-        return self._installer.commit_if_ready()
-
-
-Eagle3WeightHandoff = DraftWeightHandoff

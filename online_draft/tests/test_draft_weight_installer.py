@@ -40,10 +40,13 @@ def test_slot_derived_weights_are_prepared_before_commit_and_reset():
     torch.testing.assert_close(derived[1], torch.tensor([2.0, 4.0]))
 
 
-def test_commit_only_queries_incomplete_transfer():
+@pytest.mark.parametrize("use_advance", [False, True])
+def test_pending_transfer_commits_only_when_ready(use_advance):
     class PendingEvent:
+        ready = False
+
         def query(self):
-            return False
+            return self.ready
 
         def synchronize(self):
             pytest.fail("commit must not wait for a transfer")
@@ -54,9 +57,27 @@ def test_commit_only_queries_incomplete_transfer():
         version=1,
         pin_memory=False,
     )
-    installer._staged = (snapshot, PendingEvent())
-    assert installer.commit_if_ready() is None
+    installer.stage(snapshot)
+    event = PendingEvent()
+    installer._staged = (snapshot, event)
+
+    def commit():
+        return installer.advance(None) if use_advance else installer.commit_if_ready()
+
+    assert commit() is None
     assert installer.active_version == 0
+    assert installer.staged_version == 1
+    torch.testing.assert_close(
+        installer.active_weights["weight"], torch.tensor([1.0, 2.0])
+    )
+    event.ready = True
+    assert commit() == 1
+    assert installer.active_version == 1
+    assert installer.staged_version is None
+    torch.testing.assert_close(
+        installer.active_weights["weight"], torch.tensor([3.0, 4.0])
+    )
+    assert commit() is None
 
 
 def test_snapshot_owns_cpu_copy() -> None:
@@ -119,7 +140,7 @@ def test_installer_rejects_two_pending_updates() -> None:
 
     installer.stage(first)
     with pytest.raises(RuntimeError, match="already staged"):
-        installer.stage(second)
+        installer.advance(second)
 
 
 def test_installer_reset_restores_initial_weights() -> None:
@@ -139,8 +160,7 @@ def test_installer_reset_restores_initial_weights() -> None:
             version=version,
             pin_memory=False,
         )
-        installer.stage(snapshot)
-        assert installer.commit_if_ready() == version
+        assert installer.advance(snapshot) == version
 
     assert installer.active_version == 2
     assert torch.equal(
@@ -181,8 +201,7 @@ def test_installer_reset_discards_staged_update() -> None:
         pin_memory=False,
     )
 
-    installer.stage(first)
-    assert installer.commit_if_ready() == 1
+    assert installer.advance(first) == 1
 
     installer.stage(pending)
     assert installer.staged_version == 2
@@ -191,7 +210,7 @@ def test_installer_reset_discards_staged_update() -> None:
 
     assert installer.active_version == 0
     assert installer.staged_version is None
-    assert installer.commit_if_ready() is None
+    assert installer.advance(None) is None
     assert torch.equal(
         installer.active_weights["weight"],
         torch.tensor([1.0, 2.0]),
