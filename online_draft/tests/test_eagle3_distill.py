@@ -3,7 +3,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from online_draft.training.eagle3_distill import (
+from online_draft.training.eagle3.distill import (
     forward_kl_loss,
     project_teacher_distribution,
     window_forward_kl_loss,

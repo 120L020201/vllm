@@ -7,12 +7,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Queue
 from threading import Event, Lock, Thread
+from time import perf_counter
+from typing import Any
+
+import torch
 
 from online_draft.runtime import profile_range
-from online_draft.runtime.capture_runtime import Eagle3PreparedRound
+from online_draft.runtime.capture_runtime import PreparedRound
+from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
-from online_draft.training.eagle3_cache import PersistentEagle3KVCache
-from online_draft.training.eagle3_window import (
+from online_draft.training.eagle3.cache import PersistentEagle3KVCache
+from online_draft.training.eagle3.window import (
     Eagle3TrainingWindow,
     Eagle3WindowMode,
     Eagle3WindowResult,
@@ -34,7 +39,7 @@ TrainWindow = Callable[
 
 @dataclass(frozen=True, slots=True)
 class _RoundEvent:
-    round: Eagle3PreparedRound
+    round: PreparedRound
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,23 +53,23 @@ class _FinishRequestEvent:
     done: Event
 
 
-class AsyncEagle3Pipeline:
-    """Train CPU EAGLE3 weights behind an ordered round queue."""
+class AsyncDraftPipeline:
+    """Train draft weights behind an ordered round queue."""
 
     def __init__(
         self,
         *,
         trainer: DraftTrainer,
-        mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
         on_queue_size: Callable[[int], None] | None = None,
-        train_window: TrainWindow = train_eagle3_window,
+        train_rounds: Callable,
         profile_timeline: bool = False,
+        cpu_config: CPUWorkerConfig | None = None,
     ) -> None:
         self._trainer = trainer
-        self._mode = mode
         self._on_queue_size = on_queue_size
-        self._train_window = train_window
+        self._train_rounds = train_rounds
         self._profile_timeline = profile_timeline
+        self._cpu_config = cpu_config
 
         self._queue: Queue[object] = Queue()
         self._stop = object()
@@ -74,14 +79,25 @@ class AsyncEagle3Pipeline:
 
         self._request_id: str | None = None
         self._bootstrap_done = False
-        self._epoch_rounds: list[Eagle3PreparedRound] = []
-        self._persistent_cache: PersistentEagle3KVCache = None
+        self._epoch_rounds: list[PreparedRound] = []
+        self._persistent_cache: Any = None
         self._snapshot_pending = False
         self._ready_snapshot: DraftWeightSnapshot | None = None
+        self.update_stats: list[dict] = []
+        self.finished_request: dict | None = None
+        parameters = dict(trainer.model.named_parameters())
+        self._snapshot_parameters = tuple(
+            (name, parameters[name]) for name in trainer.trainable_parameter_names
+        )
+        # The next epoch starts only after H2D commits, so one pinned buffer is safe.
+        with torch.inference_mode(False):
+            self._snapshot_tensors = DraftWeightSnapshot.from_named_tensors(
+                self._snapshot_parameters, version=trainer.version
+            ).tensors
 
         self._worker = Thread(
             target=self._run,
-            name="eagle3-trainer",
+            name="online-draft-trainer",
             daemon=True,
         )
         self._worker.start()
@@ -91,7 +107,7 @@ class AsyncEagle3Pipeline:
         with self._lock:
             return self._failure
 
-    def submit_round(self, prepared_round: Eagle3PreparedRound) -> int:
+    def submit_round(self, prepared_round: PreparedRound) -> int:
         return self._submit(_RoundEvent(prepared_round))
 
     def close_epoch(self, request_id: str) -> int:
@@ -149,6 +165,10 @@ class AsyncEagle3Pipeline:
                 if event is self._stop:
                     return
 
+                if self._cpu_config is not None:
+                    config, self._cpu_config = self._cpu_config, None
+                    config.apply()
+
                 if isinstance(event, _FinishRequestEvent):
                     self._handle_finish_request(event.request_id)
                     continue
@@ -161,7 +181,7 @@ class AsyncEagle3Pipeline:
                 elif isinstance(event, _CloseEpochEvent):
                     self._handle_close_epoch(event.request_id)
                 else:
-                    raise RuntimeError("unknown EAGLE3 pipeline event")
+                    raise RuntimeError("unknown draft pipeline event")
             except Exception as error:
                 self._set_failure(error)
             finally:
@@ -169,7 +189,7 @@ class AsyncEagle3Pipeline:
                     event.done.set()
                 self._queue.task_done()
 
-    def _handle_round(self, prepared_round: Eagle3PreparedRound) -> None:
+    def _handle_round(self, prepared_round: PreparedRound) -> None:
         self._set_request(prepared_round.request_id)
 
         if not self._bootstrap_done:
@@ -196,11 +216,17 @@ class AsyncEagle3Pipeline:
         if self._request_id is not None and self._request_id != request_id:
             raise RuntimeError("finished request does not match active request")
 
+        self.finished_request = {
+            "request_id": request_id,
+            "cpu_version": self._trainer.version,
+            "updates": self.update_stats,
+        }
         self._trainer.reset()
         self._request_id = None
         self._bootstrap_done = False
         self._epoch_rounds.clear()
         self._persistent_cache = None
+        self.update_stats = []
 
         with self._lock:
             self._snapshot_pending = False
@@ -208,38 +234,46 @@ class AsyncEagle3Pipeline:
 
     def _train(
         self,
-        rounds: tuple[Eagle3PreparedRound, ...],
+        rounds: tuple[PreparedRound, ...],
     ) -> None:
-        window = Eagle3TrainingWindow(
-            rounds=tuple(prepared_round.batch for prepared_round in rounds)
-        )
         name = (
             f"online_draft.cpu_train[version={self._trainer.version + 1},"
             f"rounds={len(rounds)}]"
         )
+        start = perf_counter()
+        cpu_version = self._trainer.version
         with profile_range(name, self._profile_timeline):
-            updated_cache, result = self._train_window(
+            updated_cache, result = self._train_rounds(
                 self._trainer,
-                window,
+                tuple(prepared.batch for prepared in rounds),
                 self._persistent_cache,
-                self._mode,
                 self._profile_timeline,
             )
         self._persistent_cache = updated_cache
+        self.update_stats.append(
+            {
+                "cpu_start_version": cpu_version,
+                "cpu_version": result.model_version,
+                "start_step": rounds[0].step_id,
+                "end_step": rounds[-1].step_id,
+                "rounds": len(rounds),
+                "trained_rounds": result.round_count,
+                "target_count": result.target_count,
+                "source_versions": sorted({r.source_weight_version for r in rounds}),
+                "train_seconds": perf_counter() - start,
+                "loss": self._trainer.last_loss,
+            }
+        )
         self._publish_snapshot(result.model_version)
 
     def _publish_snapshot(self, version: int) -> None:
-        named_parameters = dict(self._trainer.model.named_parameters())
-        tensors = tuple(
-            (name, named_parameters[name])
-            for name in self._trainer.trainable_parameter_names
-        )
         name = f"online_draft.cpu_snapshot[version={version}]"
         with profile_range(name, self._profile_timeline):
-            snapshot = DraftWeightSnapshot.from_named_tensors(
-                tensors,
-                version=version,
-            )
+            for (_, destination), (_, parameter) in zip(
+                self._snapshot_tensors, self._snapshot_parameters, strict=True
+            ):
+                destination.copy_(parameter.detach())
+            snapshot = DraftWeightSnapshot(version, self._snapshot_tensors)
 
         with self._lock:
             if self._ready_snapshot is not None:
@@ -257,3 +291,30 @@ class AsyncEagle3Pipeline:
         with self._lock:
             if self._failure is None:
                 self._failure = error
+
+
+class AsyncEagle3Pipeline(AsyncDraftPipeline):
+    """Run the EAGLE3 recipe using the shared asynchronous scheduler."""
+
+    def __init__(
+        self,
+        *,
+        trainer: DraftTrainer,
+        mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
+        on_queue_size: Callable[[int], None] | None = None,
+        train_window: TrainWindow = train_eagle3_window,
+        profile_timeline: bool = False,
+        cpu_config: CPUWorkerConfig | None = None,
+    ) -> None:
+        def train_rounds(trainer, rounds, cache, profile):
+            return train_window(
+                trainer, Eagle3TrainingWindow(rounds), cache, mode, profile
+            )
+
+        super().__init__(
+            trainer=trainer,
+            train_rounds=train_rounds,
+            on_queue_size=on_queue_size,
+            profile_timeline=profile_timeline,
+            cpu_config=cpu_config,
+        )

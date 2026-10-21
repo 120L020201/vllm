@@ -11,14 +11,14 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
 )
-from online_draft.training.eagle3_batch import (
+from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
-from online_draft.training.eagle3_cache import (
+from online_draft.training.eagle3.cache import (
     append_confirmed_to_persistent_cache,
     persistent_cache_length,
 )
-from online_draft.training.eagle3_window import (
+from online_draft.training.eagle3.window import (
     Eagle3TrainingWindow,
     Eagle3WindowMode,
     train_eagle3_window,

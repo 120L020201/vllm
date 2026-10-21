@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from threading import Lock
 
 import torch
@@ -22,6 +22,7 @@ class DraftWeightInstaller:
         mutable_names: Iterable[str],
         initial_version: int = 0,
         profile_timeline: bool = False,
+        prepare_slot: Callable[[int, Mapping[str, torch.Tensor]], None] | None = None,
     ) -> None:
         if len(slots) != 2:
             raise ValueError("slots must contain two mappings")
@@ -53,6 +54,8 @@ class DraftWeightInstaller:
         self._initial_version = initial_version
         self._active_version = initial_version
         self._profile_timeline = profile_timeline
+        self._prepare_slot = prepare_slot
+        self._last_use: list[torch.cuda.Event | None] = [None, None]
         self._staged: tuple[DraftWeightSnapshot, torch.cuda.Event | None] | None = None
         self._lock = Lock()
         self._h2d_stream = (
@@ -60,6 +63,10 @@ class DraftWeightInstaller:
             if self._device.type == "cuda"
             else None
         )
+
+    @property
+    def active_slot(self) -> int:
+        return self._active_slot
 
     @property
     def active_version(self) -> int:
@@ -88,11 +95,18 @@ class DraftWeightInstaller:
                 if self._h2d_stream is None:
                     for name, source in snapshot.tensors:
                         destination[name].copy_(source)
+                    if self._prepare_slot is not None:
+                        self._prepare_slot(inactive_slot, destination)
                     event = None
                 else:
                     with torch.cuda.stream(self._h2d_stream):
+                        last_use = self._last_use[inactive_slot]
+                        if last_use is not None:
+                            self._h2d_stream.wait_event(last_use)
                         for name, source in snapshot.tensors:
                             destination[name].copy_(source, non_blocking=True)
+                        if self._prepare_slot is not None:
+                            self._prepare_slot(inactive_slot, destination)
                         event = torch.cuda.Event()
                         event.record(self._h2d_stream)
 
@@ -110,6 +124,10 @@ class DraftWeightInstaller:
 
             profile_name = f"online_draft.h2d_commit[version={snapshot.version}]"
             with profile_range(profile_name, self._profile_timeline):
+                if self._h2d_stream is not None:
+                    last_use = torch.cuda.Event()
+                    last_use.record(torch.cuda.current_stream(self._device))
+                    self._last_use[self._active_slot] = last_use
                 self._active_slot = 1 - self._active_slot
                 self._active_version = snapshot.version
                 self._staged = None
@@ -152,6 +170,8 @@ class DraftWeightInstaller:
             destination = self._slots[self._active_slot]
             for name, source in weights:
                 destination[name].copy_(source)
+            if self._prepare_slot is not None:
+                self._prepare_slot(self._active_slot, destination)
 
             self._staged = None
             self._active_version = self._initial_version

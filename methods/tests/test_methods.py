@@ -15,7 +15,7 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
 )
-from online_draft.training.eagle3_batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
 
 from experiments.benchmark import (

@@ -8,25 +8,32 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Generic, TypeVar
 
 import torch
 
+from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.runtime.transport import (
     Eagle3CapturePacket,
     Eagle3CaptureQueue,
     Eagle3PromptContext,
 )
-from online_draft.training.eagle3_batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
+
+BatchT = TypeVar("BatchT")
 
 
 @dataclass(frozen=True, slots=True)
-class Eagle3PreparedRound:
+class PreparedRound(Generic[BatchT]):
     """One CPU batch with request and weight metadata."""
 
     request_id: str
     step_id: int
     source_weight_version: int
-    batch: Eagle3DistillationBatch
+    batch: BatchT
+
+
+Eagle3PreparedRound = PreparedRound[Eagle3DistillationBatch]
 
 
 class Eagle3CaptureRuntime:
@@ -45,6 +52,7 @@ class Eagle3CaptureRuntime:
         on_finish: Callable[[str], object],
         on_queue_size: Callable[[int], None] | None = None,
         profile_timeline: bool = False,
+        cpu_config: CPUWorkerConfig | None = None,
     ) -> None:
         self._hidden_size = hidden_size
         self._num_aux_hidden_states = num_aux_hidden_states
@@ -66,6 +74,7 @@ class Eagle3CaptureRuntime:
             on_close_epoch=self._handle_epoch_close,
             on_queue_size=on_queue_size,
             profile_timeline=profile_timeline,
+            cpu_config=cpu_config,
         )
 
     def submit(self, packet: Eagle3CapturePacket) -> int:
@@ -179,7 +188,7 @@ class Eagle3CaptureRuntime:
         self._last_confirmed_aux_hidden_states = confirmed_aux[-1:].clone()
         self._last_confirmed_position = int(confirmed_positions[-1].item())
 
-        return Eagle3PreparedRound(
+        return PreparedRound(
             request_id=packet.request_id,
             step_id=packet.step_id,
             source_weight_version=packet.source_weight_version,

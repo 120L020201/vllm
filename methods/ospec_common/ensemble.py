@@ -8,7 +8,7 @@ import math
 from dataclasses import dataclass
 
 import torch
-from online_draft.training.eagle3_batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
 
 from methods.tts_common.step import train_batches

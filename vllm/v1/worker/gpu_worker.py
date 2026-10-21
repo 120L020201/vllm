@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
+from functools import partial
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -102,12 +103,14 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
 
 
 if TYPE_CHECKING:
-    from online_draft.runtime.async_pipeline import AsyncEagle3Pipeline
+    from online_draft.runtime.async_pipeline import AsyncDraftPipeline
+    from online_draft.runtime.dflash_capture import DFlashCaptureAdapter
     from online_draft.runtime.vllm_adapter import Eagle3VllmCaptureAdapter
     from online_draft.training.trainer import DraftTrainer
 
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
     from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
         EagleSpeculator,
     )
@@ -183,9 +186,11 @@ class Worker(WorkerBase):
         self._weight_update_active = False
         self._weight_update_is_draft = False
         self._online_draft_trainer: DraftTrainer | None = None
-        self._online_draft_pipeline: AsyncEagle3Pipeline | None = None
-        self._online_draft_capture_adapter: Eagle3VllmCaptureAdapter | None = None
-        self._online_draft_speculator: EagleSpeculator | None = None
+        self._online_draft_pipeline: AsyncDraftPipeline | None = None
+        self._online_draft_capture_adapter: (
+            Eagle3VllmCaptureAdapter | DFlashCaptureAdapter | None
+        ) = None
+        self._online_draft_speculator: EagleSpeculator | DFlashSpeculator | None = None
 
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -482,10 +487,14 @@ class Worker(WorkerBase):
             load_qwen3_eagle3_checkpoint,
             validate_qwen3_eagle3_weights,
         )
-        from online_draft.runtime.async_pipeline import AsyncEagle3Pipeline
+        from online_draft.runtime.async_pipeline import (
+            AsyncDraftPipeline,
+            AsyncEagle3Pipeline,
+        )
         from online_draft.runtime.capture_runtime import Eagle3CaptureRuntime
+        from online_draft.runtime.cpu_worker import CPUWorkerConfig
         from online_draft.runtime.vllm_adapter import Eagle3VllmCaptureAdapter
-        from online_draft.runtime.weight_handoff import Eagle3WeightHandoff
+        from online_draft.runtime.weight_handoff import DraftWeightHandoff
         from online_draft.training.trainer import (
             DraftTrainer,
             TrainerConfig,
@@ -511,34 +520,77 @@ class Worker(WorkerBase):
 
         additional_config = cast(dict[str, Any], self.vllm_config.additional_config)
         online_config = additional_config.get("online_draft", {})
+        cpu_threads = online_config.get("cpu_threads", {})
+        cpu_affinity = online_config.get("cpu_affinity", {})
+        cpu_configs = {
+            role: CPUWorkerConfig(
+                threads=cpu_threads.get(role),
+                cpus=tuple(cpu_affinity.get(role, ())),
+            )
+            for role in ("inference", "capture", "training")
+        }
+        self._online_inference_cpu = cpu_configs["inference"]
         profile_online_draft = envs.VLLM_ONLINE_DRAFT_PROFILE
         log_queue_sizes = online_config.get("log_queue_sizes", False)
+        model_runner = cast(GPUModelRunnerV2, self.model_runner)
+        speculator = model_runner.speculator
+        assert speculator is not None
 
-        cpu_model = load_qwen3_eagle3_checkpoint(
-            draft_model_config.model,
-            dtype=self.vllm_config.model_config.dtype,
-            attention_backend=online_config.get("attention_backend"),
-        )
-        validate_qwen3_eagle3_weights(
-            cpu_model,
-            gpu_draft_model.state_dict(),
-        )
+        is_dflash = speculative_config.method == "dflash"
+        if is_dflash:
+            from online_draft.models.qwen3_dflash import load_qwen3_dflash_from_vllm
+            from online_draft.runtime.dflash_capture import (
+                DFlashCaptureAdapter,
+                DFlashCaptureBuffers,
+            )
+            from online_draft.training.dflash.window import train_dflash_window
+
+            from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+                DFlashSpeculator,
+            )
+
+            if (
+                self.parallel_config.tensor_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+                or self.scheduler_config.max_num_seqs != 1
+                or self.cache_config.enable_prefix_caching
+                or speculator._speculator_name != "DFlash"
+                or self.vllm_config.model_config.hf_config.model_type != "qwen3"
+            ):
+                raise ValueError(
+                    "online DFlash requires one GPU/request and prefix caching disabled"
+                )
+            cpu_model = load_qwen3_dflash_from_vllm(
+                gpu_draft_model,
+                grouped_query_attention=online_config.get(
+                    "grouped_query_attention", False
+                ),
+                selective_last_layer=online_config.get("selective_last_layer", False),
+            )
+        else:
+            cpu_model = load_qwen3_eagle3_checkpoint(
+                draft_model_config.model,
+                dtype=self.vllm_config.model_config.dtype,
+                attention_backend=online_config.get("attention_backend"),
+            )
+            validate_qwen3_eagle3_weights(cpu_model, gpu_draft_model.state_dict())
 
         trainer = DraftTrainer(
             cpu_model,
             TrainerConfig(
                 learning_rate=online_config.get("learning_rate", 1e-5),
-                fused=online_config.get("fused_optimizer", False),
+                fused=online_config.get("fused_optimizer", is_dflash),
                 frozen_parameter_prefixes=tuple(
                     online_config.get("frozen_parameter_prefixes", ())
                 ),
                 check_gradients=online_config.get("check_gradients", True),
+                master_weights=online_config.get("master_weights", False),
             ),
         )
 
-        model_runner = cast(GPUModelRunnerV2, self.model_runner)
-        speculator = model_runner.speculator
-        assert isinstance(speculator, EagleSpeculator)
+        assert isinstance(
+            speculator, DFlashSpeculator if is_dflash else EagleSpeculator
+        )
 
         speculator.configure_online_training(
             trainer.trainable_parameter_names,
@@ -549,43 +601,73 @@ class Worker(WorkerBase):
         installer = speculator.draft_weight_installer
         assert installer is not None
 
-        pipeline = AsyncEagle3Pipeline(
-            trainer=trainer,
-            on_queue_size=(
-                lambda size: logger.info(
-                    "Online draft train queue size: %d",
-                    size,
+        queue_logger = lambda name: (
+            lambda size: logger.info("Online draft %s queue size: %d", name, size)
+        )
+        train_queue_log = queue_logger("train") if log_queue_sizes else None
+        capture_queue_log = queue_logger("capture") if log_queue_sizes else None
+        if is_dflash:
+            max_train_rounds = online_config.get("max_train_rounds", 16)
+            loss_decay_gamma = online_config.get("loss_decay_gamma", 7.0)
+            if max_train_rounds < 0 or not 0 < loss_decay_gamma < float("inf"):
+                raise ValueError(
+                    "DFlash requires max_train_rounds >= 0 and "
+                    "finite loss_decay_gamma > 0"
                 )
+            pipeline = AsyncDraftPipeline(
+                trainer=trainer,
+                train_rounds=partial(
+                    train_dflash_window,
+                    max_train_rounds=max_train_rounds,
+                    loss_decay_gamma=loss_decay_gamma,
+                ),
+                on_queue_size=train_queue_log,
+                profile_timeline=profile_online_draft,
+                cpu_config=cpu_configs["training"],
             )
-            if log_queue_sizes
-            else None,
-            profile_timeline=profile_online_draft,
-        )
-        runtime = Eagle3CaptureRuntime(
-            hidden_size=cpu_model.config.hidden_size,
-            num_aux_hidden_states=cpu_model.config.num_aux_hidden_states,
-            draft_vocab_size=cpu_model.config.draft_vocab_size,
-            feature_dtype=self.vllm_config.model_config.dtype,
-            transfer_chunk_size=1,
-            on_round=pipeline.submit_round,
-            on_epoch_close=pipeline.close_epoch,
-            on_finish=pipeline.finish_request,
-            on_queue_size=(
-                lambda size: logger.info(
-                    "Online draft capture queue size: %d",
-                    size,
-                )
+            adapter = DFlashCaptureAdapter(
+                buffers=DFlashCaptureBuffers(
+                    self.scheduler_config.max_num_batched_tokens,
+                    speculative_config.num_speculative_tokens + 1,
+                    cpu_model.config.hidden_size,
+                    cpu_model.config.vocab_size,
+                    dtype=self.model_config.dtype,
+                    teacher_dtype=self.model_config.head_dtype
+                    or self.model_config.dtype,
+                ),
+                on_round=pipeline.submit_round,
+                on_epoch_close=pipeline.close_epoch,
+                on_finish=pipeline.finish_request,
+                on_queue_size=capture_queue_log,
+                profile_timeline=profile_online_draft,
+                cpu_config=cpu_configs["capture"],
             )
-            if log_queue_sizes
-            else None,
-            profile_timeline=profile_online_draft,
-        )
-        adapter = Eagle3VllmCaptureAdapter(
-            runtime=runtime,
-            target_token_ids=cpu_model.get_target_token_ids().to(self.device),
-            source_weight_version=lambda: installer.active_version,
-        )
-        handoff = Eagle3WeightHandoff(
+        else:
+            pipeline = AsyncEagle3Pipeline(
+                trainer=trainer,
+                on_queue_size=train_queue_log,
+                profile_timeline=profile_online_draft,
+                cpu_config=cpu_configs["training"],
+            )
+            runtime = Eagle3CaptureRuntime(
+                hidden_size=cpu_model.config.hidden_size,
+                num_aux_hidden_states=cpu_model.config.num_aux_hidden_states,
+                draft_vocab_size=cpu_model.config.draft_vocab_size,
+                feature_dtype=self.vllm_config.model_config.dtype,
+                transfer_chunk_size=1,
+                on_round=pipeline.submit_round,
+                on_epoch_close=pipeline.close_epoch,
+                on_finish=pipeline.finish_request,
+                on_queue_size=capture_queue_log,
+                profile_timeline=profile_online_draft,
+                cpu_config=cpu_configs["capture"],
+            )
+            adapter = Eagle3VllmCaptureAdapter(
+                runtime=runtime,
+                target_token_ids=cpu_model.get_target_token_ids().to(self.device),
+                source_weight_version=lambda: installer.active_version,
+            )
+        handoff = DraftWeightHandoff(
             snapshot_source=pipeline,
             installer=installer,
         )
@@ -601,6 +683,9 @@ class Worker(WorkerBase):
         pipeline = self._online_draft_pipeline
         if pipeline is not None:
             pipeline.raise_if_failed()
+        adapter = self._online_draft_capture_adapter
+        if adapter is not None:
+            adapter.raise_if_failed()
 
     def _finish_online_draft_requests(
         self,
@@ -1010,6 +1095,7 @@ class Worker(WorkerBase):
         if speculator is not None:
             adapter = self._online_draft_capture_adapter
             assert adapter is not None
+            self._online_inference_cpu.apply()
             speculator.set_capture_adapter(adapter)
             logger.debug("Online draft capture enabled after warmup")
 

@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 import torch
-from online_draft.training.eagle3_batch import (
+from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
 

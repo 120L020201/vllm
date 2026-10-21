@@ -6,9 +6,9 @@
 from collections.abc import Iterable
 
 from online_draft.models.qwen3_eagle3 import Eagle3KVCache
-from online_draft.training.eagle3_batch import Eagle3DistillationBatch
-from online_draft.training.eagle3_cache import PersistentEagle3KVCache
-from online_draft.training.eagle3_window import (
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.cache import PersistentEagle3KVCache
+from online_draft.training.eagle3.window import (
     Eagle3TrainingWindow,
     Eagle3WindowMode,
     train_eagle3_window,

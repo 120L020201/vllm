@@ -882,14 +882,18 @@ def test_flashinfer_native_prefill_with_sinks(default_vllm_config):
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
 )
-def test_flashinfer_xqa_decode_correctness(default_vllm_config):
-    """FlashInfer should route supported decode through XQA and match SDPA."""
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("model", ["meta-llama/Meta-Llama-3-8B"])
+def test_flashinfer_xqa_decode_correctness(default_vllm_config, causal, model):
+    """XQA matches SDPA without reading GPU sequence lengths back to CPU."""
     supported = current_platform.is_cuda() and (
         current_platform.is_device_capability(90)
         or current_platform.is_device_capability_family(120)
     )
     if not supported:
         pytest.skip("FlashInfer XQA decode requires SM90 or SM12x.")
+    if not causal and not current_platform.is_device_capability_family(120):
+        pytest.skip("Non-causal XQA decode requires SM12x.")
 
     import unittest.mock
 
@@ -914,14 +918,15 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
         *,
         context_len: int,
     ):
-        return (q_idx + context_len) >= kv_idx
+        return (q_idx + context_len) >= kv_idx if causal else q_idx >= 0
 
     batch_spec = BATCH_SPECS["small_decode"]
     vllm_config = create_vllm_config(
-        model_name="meta-llama/Meta-Llama-3-8B",
+        model_name=model,
         max_model_len=max(batch_spec.seq_lens),
         block_size=16,
     )
+    vllm_config.attention_config.use_non_causal = not causal
     device = torch.device(f"{DEVICE_TYPE}:0")
     kv_cache_spec = FullAttentionSpec(
         block_size=vllm_config.cache_config.block_size,
@@ -952,7 +957,14 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
             common_attn_metadata = create_common_attn_metadata(
                 batch_spec, vllm_config.cache_config.block_size, device
             )
-            attn_metadata = builder.build(0, common_attn_metadata)
+            common_attn_metadata.causal = causal
+            with unittest.mock.patch.object(
+                CommonAttentionMetadata,
+                "seq_lens_cpu",
+                new_callable=unittest.mock.PropertyMock,
+                side_effect=AssertionError("XQA must use GPU sequence lengths"),
+            ):
+                attn_metadata = builder.build(0, common_attn_metadata)
 
     expected_cg_support = (
         AttentionCGSupport.UNIFORM_BATCH
@@ -973,9 +985,10 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
 
     _test_backend_correctness(
         batch_spec,
-        "meta-llama/Meta-Llama-3-8B",
+        model,
         [AttentionBackendEnum.FLASHINFER],
         causal_mask_mod,
+        causal=causal,
     )
 
 

@@ -6,8 +6,8 @@
 import logging
 
 import torch
-from online_draft.training.eagle3_batch import Eagle3DistillationBatch
-from online_draft.training.eagle3_distill import project_teacher_distribution
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.distill import project_teacher_distribution
 
 from methods.utils.bridge import PolicyBridge, WeightSnapshot
 

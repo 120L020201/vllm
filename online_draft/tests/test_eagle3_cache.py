@@ -7,15 +7,15 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
 )
-from online_draft.training.eagle3_batch import (
+from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
-from online_draft.training.eagle3_cache import (
+from online_draft.training.eagle3.cache import (
     append_confirmed_to_persistent_cache,
     persistent_cache_length,
     prepare_training_prefix,
 )
-from online_draft.training.eagle3_inputs import (
+from online_draft.training.eagle3.inputs import (
     prepare_eagle3_training_inputs,
 )
 

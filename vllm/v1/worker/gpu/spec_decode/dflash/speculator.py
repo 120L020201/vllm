@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -26,6 +27,13 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
+if TYPE_CHECKING:
+    from online_draft.runtime.dflash_capture import DFlashCaptureAdapter
+    from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
+    from online_draft.runtime.weight_handoff import DraftWeightHandoff
+
+    from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashOnlineState
+
 logger = init_logger(__name__)
 
 
@@ -34,6 +42,10 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self.online_draft_training_enabled = envs.VLLM_ONLINE_DRAFT_TRAIN
+        self.online_state: DFlashOnlineState
+        self.capture_adapter: DFlashCaptureAdapter | None = None
+        self._online_target_model: nn.Module
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -97,6 +109,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         ).repeat(self.max_num_reqs)
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
+        self.query_cudagraph_managers: tuple[DFlashCudaGraphManager, ...] = ()
         self.draft_kv_cache_group_id: int = -1
 
     @property
@@ -129,12 +142,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
-        self.query_cudagraph_manager = DFlashCudaGraphManager(
-            self.vllm_config,
-            self.device,
-            cudagraph_mode,
-            decode_query_len=self.num_query_per_req,
+        self.query_cudagraph_managers = tuple(
+            DFlashCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                cudagraph_mode,
+                decode_query_len=self.num_query_per_req,
+            )
+            for _ in range(2 if self.online_draft_training_enabled else 1)
         )
+        self.query_cudagraph_manager = self.query_cudagraph_managers[0]
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
@@ -143,23 +160,63 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
-        self.query_cudagraph_manager.capture(
-            self._generate_draft,
-            self.input_buffers,
-            self.block_tables,
-            self.attn_groups,
-            self.kv_cache_config,
-            self.max_model_len,
-            causal=self._group_causal,
-            progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
-        )
+        for slot, manager in enumerate(self.query_cudagraph_managers):
+            if self.online_draft_training_enabled:
+                self.online_state.slots.bind(self.online_state.slots.slots[slot])
+            manager.capture(
+                self._generate_draft,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                self.max_model_len,
+                causal=self._group_causal,
+                progress_bar_desc=(
+                    f"Capturing {self._speculator_name.lower()} CUDA graphs"
+                ),
+            )
+        if self.online_draft_training_enabled:
+            self.online_state.slots.bind(self.draft_weight_installer.active_weights)
 
     def load_draft_model(
         self,
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
+        if self.online_draft_training_enabled:
+            self._online_target_model = target_model
         return load_dflash_model(target_model, self.vllm_config)
+
+    def configure_online_training(
+        self, mutable_names, *, profile_timeline=False, log_updates=False
+    ) -> None:
+        from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashOnlineState
+
+        self.online_state = DFlashOnlineState(
+            self._online_target_model,
+            self.model,
+            mutable_names,
+            profile_timeline=profile_timeline,
+            log_updates=log_updates,
+        )
+
+    @property
+    def draft_weight_installer(self) -> "DraftWeightInstaller":
+        return self.online_state.installer
+
+    def set_capture_adapter(self, adapter: "DFlashCaptureAdapter") -> None:
+        self.capture_adapter = adapter
+        self.online_state.adapter = adapter
+
+    def set_weight_handoff(self, handoff: "DraftWeightHandoff") -> None:
+        self.online_state.handoff = handoff
+
+    def on_target_logits_ready(self, logits: torch.Tensor) -> None:
+        if self.capture_adapter is not None:
+            self.capture_adapter.capture_teacher_logits(logits)
+
+    def finish_request(self, request_id, initial_weights) -> None:
+        self.online_state.finish(request_id, initial_weights)
 
     def set_attn(
         self,
@@ -340,12 +397,36 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+        adapter = self.capture_adapter if not dummy_run and not is_profile else None
+        raw_hidden = (
+            torch.cat(aux_hidden_states, dim=-1)
+            if aux_hidden_states
+            else last_hidden_states
+        )
+        if adapter is not None:
+            assert num_reqs == 1
+            final_prefill = (
+                input_batch.num_computed_prefill_tokens_np[0]
+                + input_batch.num_scheduled_tokens[0]
+                >= input_batch.prefill_len_np[0]
             )
-        else:
-            hidden_states = last_hidden_states
+            installed_version = self.online_state.advance(input_batch.req_ids[0])
+        hidden_states = (
+            self.model.combine_hidden_states(raw_hidden)
+            if aux_hidden_states
+            else raw_hidden
+        )
+        if adapter is not None:
+            adapter.capture_target(
+                request_id=input_batch.req_ids[0],
+                fc_output=hidden_states[:num_target_tokens],
+                positions=input_batch.positions[:num_target_tokens],
+                num_rejected=num_rejected[0],
+                num_sampled=num_sampled[0],
+                final_prefill=final_prefill,
+            )
+            if installed_version is not None:
+                self.online_state.close_epoch(input_batch.req_ids[0])
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -420,8 +501,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.context_positions[:num_target_tokens],
             context_slots,
         )
-
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
+        if self.online_draft_training_enabled:
+            self.query_cudagraph_manager = self.query_cudagraph_managers[
+                self.draft_weight_installer.active_slot
+            ]
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
@@ -467,6 +551,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        if adapter is not None:
+            adapter.capture_proposal(
+                self.input_buffers.input_ids[: self.num_query_per_req],
+                self.input_buffers.positions[: self.num_query_per_req],
+                self.draft_weight_installer.active_version,
+            )
         return self.draft_tokens[:num_reqs]
 
 

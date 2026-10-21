@@ -9,7 +9,7 @@ import torch.nn as nn
 
 
 @dataclass(slots=True)
-class Eagle3WeightSlots:
+class DraftWeightSlots:
     """Own two GPU copies of mutable draft-only parameters."""
 
     model: nn.Module
@@ -21,7 +21,7 @@ class Eagle3WeightSlots:
         target_model: nn.Module,
         draft_model: nn.Module,
         mutable_names: Iterable[str],
-    ) -> "Eagle3WeightSlots":
+    ) -> "DraftWeightSlots":
         mutable_names = tuple(mutable_names)
         target_parameter_ids = {
             id(parameter) for parameter in target_model.parameters()
@@ -55,3 +55,6 @@ class Eagle3WeightSlots:
 
         for name, tensor in weights.items():
             parameters[name].data = tensor
+
+
+Eagle3WeightSlots = DraftWeightSlots

@@ -16,6 +16,50 @@ def _slots() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     return active, staging
 
 
+def test_slot_derived_weights_are_prepared_before_commit_and_reset():
+    derived = [torch.zeros(2), torch.zeros(2)]
+
+    def prepare(slot, weights):
+        derived[slot].copy_(weights["weight"] * 2)
+
+    installer = DraftWeightInstaller(
+        _slots(),
+        mutable_names=("weight",),
+        prepare_slot=prepare,
+    )
+    installer.stage(
+        DraftWeightSnapshot.from_named_tensors(
+            [("weight", torch.tensor([3.0, 4.0]))],
+            version=1,
+            pin_memory=False,
+        )
+    )
+    assert installer.active_version == 0
+    torch.testing.assert_close(derived[1], torch.tensor([6.0, 8.0]))
+    assert installer.commit_if_ready() == 1
+    installer.reset((("weight", torch.tensor([1.0, 2.0])),))
+    torch.testing.assert_close(derived[1], torch.tensor([2.0, 4.0]))
+
+
+def test_commit_only_queries_incomplete_transfer():
+    class PendingEvent:
+        def query(self):
+            return False
+
+        def synchronize(self):
+            pytest.fail("commit must not wait for a transfer")
+
+    installer = DraftWeightInstaller(_slots(), mutable_names=("weight",))
+    snapshot = DraftWeightSnapshot.from_named_tensors(
+        [("weight", torch.tensor([3.0, 4.0]))],
+        version=1,
+        pin_memory=False,
+    )
+    installer._staged = (snapshot, PendingEvent())
+    assert installer.commit_if_ready() is None
+    assert installer.active_version == 0
+
+
 def test_snapshot_owns_cpu_copy() -> None:
     source = [("weight", torch.tensor([1.0, 2.0]))]
     snapshot = DraftWeightSnapshot.from_named_tensors(

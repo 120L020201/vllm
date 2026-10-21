@@ -4,8 +4,10 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from online_draft.runtime.draft_weight_installer import DraftWeightInstaller
 from online_draft.runtime.weight_snapshot import DraftWeightSnapshot
 
@@ -16,6 +18,154 @@ from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
 from vllm.v1.worker.gpu.spec_decode.eagle.weight_slots import (
     Eagle3WeightSlots,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@torch.no_grad()
+def test_dflash_graphs_read_each_updated_slot_and_reset_weights(monkeypatch):
+    """Captured pointers must follow slot reuse, including a reset on either slot."""
+    from online_draft.models.qwen3_dflash import (
+        Qwen3DFlashConfig,
+        Qwen3DFlashForCausalLM,
+    )
+
+    from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashWeightSlots
+
+    def cuda_attention(query, context_key, context_value, key, value, mask):
+        return F.scaled_dot_product_attention(
+            query.unsqueeze(0),
+            torch.cat((context_key, key), dim=1).unsqueeze(0),
+            torch.cat((context_value, value), dim=1).unsqueeze(0),
+            attn_mask=mask,
+        ).squeeze(0)
+
+    monkeypatch.setattr(
+        "online_draft.models.qwen3_dflash.context_attention", cuda_attention
+    )
+
+    torch.manual_seed(17)
+    draft = Qwen3DFlashForCausalLM(Qwen3DFlashConfig(16, 32, 2, 1, 8, 2, 23, 2)).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    target = nn.Module()
+    target.embed_tokens, target.lm_head = draft.model.embed_tokens, draft.lm_head
+    draft.model._fused_kv_weight = torch.cat(
+        [
+            layer.self_attn.qkv_proj.weight[layer.self_attn.q_size :]
+            for layer in draft.model.layers
+        ]
+    )
+    draft.model._k_norm_weights = torch.stack(
+        [layer.self_attn.k_norm.weight for layer in draft.model.layers]
+    )
+    mutable = tuple(n for n, p in draft.named_parameters() if p.requires_grad)
+    slots = DFlashWeightSlots(target, draft, mutable)
+    installer = DraftWeightInstaller(
+        slots.slots, mutable_names=mutable, prepare_slot=slots.prepare
+    )
+    initial = tuple((n, p.cpu().clone()) for n, p in installer.active_weights.items())
+    features = torch.randn(5, 32, device="cuda", dtype=torch.bfloat16)
+    context_positions = torch.arange(5, device="cuda")
+    input_ids = torch.tensor([2, 22, 22, 22], device="cuda")
+    positions = torch.arange(5, 9, device="cuda")
+
+    def forward():
+        context = draft.project_context(draft.model.fc(features), context_positions)
+        return draft.lm_head(draft(input_ids, positions, context))
+
+    original = forward().clone()
+    graphs, outputs = [], []
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    for weights in slots.slots:
+        slots.bind(weights)
+        with torch.cuda.stream(stream):
+            forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = forward()
+        graphs.append(graph)
+        outputs.append(output)
+    torch.cuda.current_stream().wait_stream(stream)
+    slots.bind(installer.active_weights)
+
+    for version in (1, 2, 3):
+        installer.stage(
+            DraftWeightSnapshot.from_named_tensors(
+                [(n, p + version * 0.05) for n, p in initial], version=version
+            )
+        )
+        torch.accelerator.synchronize()
+        assert installer.commit_if_ready() == version
+        assert installer.active_slot == version % 2
+        slots.bind(installer.active_weights)
+        graphs[installer.active_slot].replay()
+        torch.testing.assert_close(outputs[installer.active_slot], forward())
+        assert not torch.allclose(outputs[installer.active_slot], original)
+
+        installer.reset(initial)
+        slots.bind(installer.active_weights)
+        graphs[installer.active_slot].replay()
+        torch.testing.assert_close(outputs[installer.active_slot], original)
+
+
+def test_dflash_commit_and_reset_keep_derived_buffers_with_active_parameters():
+    from online_draft.models.qwen3_dflash import (
+        Qwen3DFlashConfig,
+        Qwen3DFlashForCausalLM,
+    )
+
+    from vllm.v1.worker.gpu.spec_decode.dflash.online import DFlashWeightSlots
+
+    draft = Qwen3DFlashForCausalLM(Qwen3DFlashConfig(8, 16, 2, 1, 4, 2, 23, 2))
+    target = nn.Module()
+    target.embed_tokens = draft.model.embed_tokens
+    target.lm_head = draft.lm_head
+    draft.model.layers[0].self_attn.qkv_proj.requires_grad_(False)
+
+    def derived():
+        return (
+            torch.cat(
+                [
+                    layer.self_attn.qkv_proj.weight[layer.self_attn.q_size :]
+                    for layer in draft.model.layers
+                ]
+            ),
+            torch.stack(
+                [layer.self_attn.k_norm.weight for layer in draft.model.layers]
+            ),
+        )
+
+    with torch.no_grad():
+        draft.model._fused_kv_weight, draft.model._k_norm_weights = derived()
+    mutable = tuple(n for n, p in draft.named_parameters() if p.requires_grad)
+    slots = DFlashWeightSlots(target, draft, mutable)
+    installer = DraftWeightInstaller(
+        slots.slots, mutable_names=mutable, prepare_slot=slots.prepare
+    )
+    initial = tuple((n, p.clone()) for n, p in installer.active_weights.items())
+    for version in (1, 2):
+        installer.stage(
+            DraftWeightSnapshot.from_named_tensors(
+                [(n, p + version) for n, p in initial],
+                version=version,
+                pin_memory=False,
+            )
+        )
+        assert installer.commit_if_ready() == version
+        slots.bind(installer.active_weights)
+        expected_kv, expected_norm = derived()
+        torch.testing.assert_close(draft.model._fused_kv_weight, expected_kv)
+        torch.testing.assert_close(draft.model._k_norm_weights, expected_norm)
+        assert (
+            draft.model._hidden_norm_weight.data_ptr()
+            == draft.model.hidden_norm.weight.data_ptr()
+        )
+    installer.reset(initial)
+    slots.bind(installer.active_weights)
+    expected_kv, expected_norm = derived()
+    torch.testing.assert_close(draft.model._fused_kv_weight, expected_kv)
+    torch.testing.assert_close(draft.model._k_norm_weights, expected_norm)
 
 
 def test_only_selected_draft_owned_parameters_receive_slots() -> None:

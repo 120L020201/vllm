@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
 import torch
 from online_draft.runtime.async_pipeline import AsyncEagle3Pipeline
 from online_draft.runtime.capture_runtime import Eagle3PreparedRound
-from online_draft.training.eagle3_batch import Eagle3DistillationBatch
-from online_draft.training.eagle3_window import Eagle3WindowMode
+from online_draft.runtime.cpu_worker import CPUWorkerConfig
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.window import Eagle3WindowMode
 from torch import nn
 
 HIDDEN_SIZE = 2
@@ -18,11 +20,32 @@ AUX_HIDDEN_STATES = 1
 DRAFT_VOCAB_SIZE = 3
 
 
+def test_cpu_worker_settings_do_not_change_inference_thread():
+    """Training parallelism and affinity must stay local to its worker thread."""
+    inference_threads = torch.get_num_threads()
+    inference_cpus = os.sched_getaffinity(0)
+    training_cpu = min(inference_cpus)
+    config = CPUWorkerConfig(threads=1, cpus=(training_cpu,))
+    observed = []
+
+    def run():
+        config.apply()
+        observed.append((torch.get_num_threads(), os.sched_getaffinity(0)))
+
+    worker = Thread(target=run)
+    worker.start()
+    worker.join()
+    assert observed == [(1, {training_cpu})]
+    assert torch.get_num_threads() == inference_threads
+    assert os.sched_getaffinity(0) == inference_cpus
+
+
 @dataclass
 class _FakeTrainer:
     model: nn.Module
     version: int = 0
     reset_count: int = 0
+    last_loss: float | None = None
 
     @property
     def trainable_parameter_names(self) -> tuple[str, ...]:
@@ -96,7 +119,9 @@ def test_bootstrap_and_epoch_close_publish_delayed_snapshots() -> None:
         trainer.version += 1
         trained.set()
         return f"cache-{trainer.version}", SimpleNamespace(
-            model_version=trainer.version
+            model_version=trainer.version,
+            round_count=window.round_count,
+            target_count=1,
         )
 
     pipeline = AsyncEagle3Pipeline(
@@ -144,7 +169,11 @@ def test_queue_size_is_reported_while_training_is_busy() -> None:
         entered.set()
         release.wait(timeout=5)
         trainer.version += 1
-        return persistent_cache, SimpleNamespace(model_version=trainer.version)
+        return persistent_cache, SimpleNamespace(
+            model_version=trainer.version,
+            round_count=window.round_count,
+            target_count=1,
+        )
 
     pipeline = AsyncEagle3Pipeline(
         trainer=trainer,
@@ -173,7 +202,9 @@ def test_finish_resets_pipeline_for_next_request() -> None:
         cache_was_empty.append(persistent_cache is None)
         trainer.version += 1
         return f"cache-{trainer.version}", SimpleNamespace(
-            model_version=trainer.version
+            model_version=trainer.version,
+            round_count=window.round_count,
+            target_count=1,
         )
 
     pipeline = AsyncEagle3Pipeline(

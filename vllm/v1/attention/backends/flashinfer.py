@@ -1356,9 +1356,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "Using FlashInfer for draft model non-causal attention; TRTLLM "
                 "can still be used for target model causal attention."
             )
-        all_uses_trtllm = causal and (
-            (num_prefills == 0 or prefill_use_trtllm)
-            and (num_decodes == 0 or decode_with_flashinfer_trtllm_api)
+        all_uses_trtllm = (num_prefills == 0 or prefill_use_trtllm) and (
+            num_decodes == 0 or decode_with_flashinfer_trtllm_api
         )
 
         if not all_uses_trtllm:

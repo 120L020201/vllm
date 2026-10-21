@@ -43,14 +43,21 @@ def test_shutdown_closes_online_draft_before_model_runner(monkeypatch) -> None:
     assert worker._online_draft_speculator is None
 
 
-def test_online_draft_failure_stops_worker() -> None:
+@pytest.mark.parametrize("component", ["pipeline", "capture_adapter"])
+def test_online_draft_failure_stops_worker(component) -> None:
     def raise_if_failed() -> None:
-        raise RuntimeError("training failed")
+        raise RuntimeError("online worker failed")
 
     worker = object.__new__(Worker)
-    worker._online_draft_pipeline = SimpleNamespace(
-        raise_if_failed=raise_if_failed,
+    worker._online_draft_pipeline = None
+    worker._online_draft_capture_adapter = None
+    setattr(
+        worker,
+        f"_online_draft_{component}",
+        SimpleNamespace(
+            raise_if_failed=raise_if_failed,
+        ),
     )
 
-    with pytest.raises(RuntimeError, match="training failed"):
+    with pytest.raises(RuntimeError, match="online worker failed"):
         Worker._raise_if_online_draft_failed(worker)

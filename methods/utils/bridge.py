@@ -13,11 +13,11 @@ from dataclasses import dataclass
 
 import torch
 from online_draft.models.qwen3_eagle3 import Eagle3KVCache
-from online_draft.training.eagle3_batch import Eagle3DistillationBatch
-from online_draft.training.eagle3_cache import (
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.cache import (
     append_confirmed_window_to_persistent_cache,
 )
-from online_draft.training.eagle3_window import Eagle3TrainingWindow
+from online_draft.training.eagle3.window import Eagle3TrainingWindow
 from online_draft.training.trainer import DraftTrainer
 
 from methods.ospec_common.ensemble import (

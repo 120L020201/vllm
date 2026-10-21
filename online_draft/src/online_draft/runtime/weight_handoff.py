@@ -18,7 +18,7 @@ class _WeightInstaller(Protocol):
     def commit_if_ready(self) -> int | None: ...
 
 
-class Eagle3WeightHandoff:
+class DraftWeightHandoff:
     """Move CPU snapshots to GPU slots and commit completed copies."""
 
     def __init__(
@@ -37,3 +37,6 @@ class Eagle3WeightHandoff:
             self._installer.stage(snapshot)
 
         return self._installer.commit_if_ready()
+
+
+Eagle3WeightHandoff = DraftWeightHandoff

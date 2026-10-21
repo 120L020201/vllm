@@ -6,22 +6,22 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
 )
-from online_draft.training.eagle3_batch import (
+from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
-from online_draft.training.eagle3_cache import (
+from online_draft.training.eagle3.cache import (
     persistent_cache_length,
     prepare_training_window_spine,
 )
-from online_draft.training.eagle3_distill import (
+from online_draft.training.eagle3.distill import (
     forward_kl_loss,
     window_forward_kl_loss,
 )
-from online_draft.training.eagle3_inputs import (
+from online_draft.training.eagle3.inputs import (
     prepare_eagle3_confirmed_path_inputs,
     prepare_eagle3_training_inputs,
 )
-from online_draft.training.eagle3_window import (
+from online_draft.training.eagle3.window import (
     Eagle3TrainingWindow,
 )
 

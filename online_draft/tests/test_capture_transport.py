@@ -8,6 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from online_draft.runtime.capture_runtime import Eagle3CaptureRuntime
+from online_draft.runtime.dflash_capture import (
+    DFlashCaptureAdapter,
+    DFlashCaptureBuffers,
+)
 from online_draft.runtime.transport import (
     Eagle3CapturePacket,
     Eagle3CaptureQueue,
@@ -26,6 +30,83 @@ class _CaptureRuntime:
 
     def finish_request(self, request_id: str) -> None:
         self.finished.append(request_id)
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 3])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_dflash_bootstrap_chunks_and_teacher_alignment(accepted, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    rounds = []
+    done = Event()
+    adapter = DFlashCaptureAdapter(
+        buffers=DFlashCaptureBuffers(
+            8, 4, 16, 23, dtype=torch.float32, teacher_dtype=torch.float32
+        ),
+        on_round=rounds.append,
+        on_epoch_close=lambda _: done.set(),
+        on_finish=lambda _: None,
+    )
+
+    def capture(start, count, rejected=0, sampled=0, final=True):
+        adapter.capture_target(
+            request_id="r",
+            fc_output=torch.full((count, 16), float(start), device=device),
+            positions=torch.arange(start, start + count, device=device),
+            num_rejected=torch.tensor(rejected, dtype=torch.int32, device=device),
+            num_sampled=torch.tensor(sampled, dtype=torch.int32, device=device),
+            final_prefill=final,
+        )
+
+    try:
+        capture(0, 2, final=False)
+        capture(2, 3, sampled=1)
+        input_ids = torch.tensor([2, 22, 22, 22], dtype=torch.int32, device=device)
+        query_positions = torch.arange(5, 9, device=device)
+        adapter.capture_proposal(input_ids, query_positions, 7)
+        input_ids.zero_()
+        query_positions.zero_()
+        teacher = torch.arange(4 * 23, device=device).reshape(4, 23).float()
+        adapter.capture_teacher_logits(teacher)
+        teacher.zero_()  # The engine may mutate its logits after the hook.
+        capture(5, 4, rejected=3 - accepted, sampled=accepted + 1)
+        adapter.close_epoch("r")
+        assert done.wait(5)
+        adapter.raise_if_failed()
+        assert len(rounds) == 1
+        prepared = rounds[0]
+        assert prepared.source_weight_version == 7
+        assert prepared.step_id == 0
+        batch = prepared.batch
+        assert batch.prompt_fc.shape == (5, 16)
+        assert batch.confirmed_fc.shape == (accepted + 1, 16)
+        assert batch.input_ids.tolist() == [2, 22, 22, 22]
+        assert batch.teacher_probabilities.shape == (min(accepted + 1, 3), 23)
+        expected = torch.arange(23).float().softmax(-1)
+        torch.testing.assert_close(batch.teacher_probabilities[0], expected)
+        assert batch.rejection_position == (accepted if accepted < 3 else None)
+        done.clear()
+        anchor = 6 + accepted
+        adapter.capture_proposal(
+            torch.tensor([7, 22, 22, 22], device=device),
+            torch.arange(anchor, anchor + 4, device=device),
+            8,
+        )
+        adapter.capture_teacher_logits(torch.zeros(4, 23, device=device))
+        capture(anchor, 4, rejected=3, sampled=1)
+        adapter.close_epoch("r")
+        assert done.wait(5)
+        adapter.raise_if_failed()
+        # The next D2H reuses staging storage; submitted batches own their data.
+        assert batch.positions.tolist() == [5, 6, 7, 8]
+        assert batch.confirmed_fc.unique().item() == 5
+        assert batch.prompt_fc[:2].sum().item() == 0
+        torch.testing.assert_close(batch.teacher_probabilities[0], expected)
+        assert rounds[1].batch.prompt_fc is None
+        adapter.finish_request("r")
+        assert adapter.completed_rounds == 0
+    finally:
+        adapter.close()
 
 
 def _packet(

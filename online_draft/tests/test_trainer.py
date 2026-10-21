@@ -22,6 +22,31 @@ class TinyModel(nn.Module):
         return self.trainable(inputs) + self.frozen(inputs)
 
 
+def test_master_weights_accumulate_small_updates_and_reset_between_requests():
+    """Updates below one BF16 ULP must accumulate in the FP32 master."""
+    model = nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.weight.fill_(1)
+    trainer = DraftTrainer(
+        model,
+        TrainerConfig(
+            learning_rate=1e-4, fused=True, master_weights=True, check_gradients=False
+        ),
+    )
+    for _ in range(30):
+        trainer.backward_and_step(model.weight.float().sum())
+    assert model.weight.item() < 1
+    assert model.weight.grad is None
+    state = next(iter(trainer.optimizer.state.values()))
+    assert state["exp_avg"].dtype == torch.float32
+    assert state["exp_avg_sq"].dtype == torch.float32
+    trainer.reset()
+    assert model.weight.item() == 1
+    assert not trainer.optimizer.state
+    trainer.backward_and_step(model.weight.float().sum())
+    assert model.weight.item() == 1
+
+
 def test_successful_step_updates_only_trainable_parameters() -> None:
     torch.manual_seed(0)
 

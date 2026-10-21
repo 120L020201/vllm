@@ -11,19 +11,19 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3ForCausalLM,
 )
 from online_draft.runtime import profile_range
-from online_draft.training.eagle3_batch import (
+from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
-from online_draft.training.eagle3_cache import (
+from online_draft.training.eagle3.cache import (
     PersistentEagle3KVCache,
     append_confirmed_window_to_persistent_cache,
     persistent_cache_length,
     prepare_training_window_spine,
 )
-from online_draft.training.eagle3_distill import (
+from online_draft.training.eagle3.distill import (
     window_forward_kl_loss,
 )
-from online_draft.training.eagle3_inputs import (
+from online_draft.training.eagle3.inputs import (
     prepare_eagle3_confirmed_path_inputs,
     prepare_eagle3_proposal_window_inputs,
 )

@@ -23,6 +23,7 @@ class TrainerConfig:
     fused: bool = False
     frozen_parameter_prefixes: tuple[str, ...] = ()
     check_gradients: bool = True
+    master_weights: bool = False
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
@@ -59,8 +60,14 @@ class DraftTrainer:
             for name, parameter in self._trainable_named_parameters
         )
 
+        self._optimizer_parameters = [
+            parameter.detach().float().clone().requires_grad_()
+            if self.config.master_weights
+            else parameter
+            for _, parameter in self._trainable_named_parameters
+        ]
         self.optimizer = torch.optim.AdamW(
-            [parameter for _, parameter in self._trainable_named_parameters],
+            self._optimizer_parameters,
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             fused=self.config.fused,
@@ -84,6 +91,8 @@ class DraftTrainer:
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
+        if self.config.master_weights:
+            self.model.zero_grad(set_to_none=True)
 
     def clear_optimizer_state(self) -> None:
         self.optimizer.state.clear()
@@ -97,6 +106,11 @@ class DraftTrainer:
             strict=True,
         ):
             parameter.copy_(initial_weight)
+        if self.config.master_weights:
+            for master, (_, initial) in zip(
+                self._optimizer_parameters, self._initial_weights, strict=True
+            ):
+                master.copy_(initial)
 
         self.clear_optimizer_state()
         self._version = 0
@@ -150,7 +164,24 @@ class DraftTrainer:
                     raise ValueError("nonfinite gradients")
 
             with profile_range("online_draft.optimizer", profile_timeline):
+                if self.config.master_weights:
+                    for master, (_, parameter) in zip(
+                        self._optimizer_parameters,
+                        self._trainable_named_parameters,
+                        strict=True,
+                    ):
+                        master.grad = (
+                            None if parameter.grad is None else parameter.grad.float()
+                        )
                 self.optimizer.step()
+                if self.config.master_weights:
+                    with torch.no_grad():
+                        for master, (_, parameter) in zip(
+                            self._optimizer_parameters,
+                            self._trainable_named_parameters,
+                            strict=True,
+                        ):
+                            parameter.copy_(master)
         except Exception:
             self.zero_grad()
             raise

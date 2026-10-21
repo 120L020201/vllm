@@ -8,12 +8,12 @@ from online_draft.models.qwen3_eagle3 import (
     Eagle3KVCache,
     Qwen3Eagle3ForCausalLM,
 )
-from online_draft.training.eagle3_batch import (
+from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
 
 if TYPE_CHECKING:
-    from online_draft.training.eagle3_window import (
+    from online_draft.training.eagle3.window import (
         Eagle3TrainingWindow,
     )
 

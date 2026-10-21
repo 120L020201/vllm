@@ -10,10 +10,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from queue import Queue
 from threading import Event, Lock, Thread
+from typing import Protocol, Self, cast
 
 import torch
 
 from online_draft.runtime import profile_range
+from online_draft.runtime.cpu_worker import CPUWorkerConfig
 
 
 def _copy_to_cpu(
@@ -100,6 +102,10 @@ class Eagle3CapturePacket:
 
     ready: torch.cuda.Event | None = None
 
+    @property
+    def device(self) -> torch.device:
+        return self.proposal_token_input_embeds.device
+
     def to_cpu(
         self,
         *,
@@ -170,7 +176,17 @@ class _CloseEpoch:
     request_id: str
 
 
-class Eagle3CaptureQueue:
+class CapturePacket(Protocol):
+    request_id: str
+    ready: torch.cuda.Event | None
+
+    @property
+    def device(self) -> torch.device: ...
+
+    def to_cpu(self, *, non_blocking: bool = False) -> Self: ...
+
+
+class CaptureQueue:
     """Transfer GPU packet chunks to the CPU worker in FIFO order."""
 
     def __init__(
@@ -178,13 +194,14 @@ class Eagle3CaptureQueue:
         *,
         transfer_chunk_size: int,
         consume_chunk: Callable[
-            [tuple[Eagle3CapturePacket, ...]],
+            [tuple[CapturePacket, ...]],
             None,
         ],
         on_finish: Callable[[str], None],
         on_close_epoch: Callable[[str], None],
         on_queue_size: Callable[[int], None] | None = None,
         profile_timeline: bool = False,
+        cpu_config: CPUWorkerConfig | None = None,
     ) -> None:
         if transfer_chunk_size <= 0:
             raise ValueError("transfer_chunk_size must be positive")
@@ -195,6 +212,7 @@ class Eagle3CaptureQueue:
         self._on_close_epoch = on_close_epoch
         self._on_queue_size = on_queue_size
         self._profile_timeline = profile_timeline
+        self._cpu_config = cpu_config
         self._queue: Queue[object] = Queue()
         self._stop = object()
 
@@ -203,12 +221,12 @@ class Eagle3CaptureQueue:
 
         self._worker = Thread(
             target=self._run,
-            name="eagle3-capture",
+            name="online-draft-capture",
             daemon=True,
         )
         self._worker.start()
 
-    def submit(self, packet: Eagle3CapturePacket) -> int:
+    def submit(self, packet: CapturePacket) -> int:
         self.raise_if_failed()
         self._queue.put_nowait(packet)
         queue_size = self._queue.qsize()
@@ -247,7 +265,7 @@ class Eagle3CaptureQueue:
             raise error
 
     def _run(self) -> None:
-        chunk: list[Eagle3CapturePacket] = []
+        chunk: list[CapturePacket] = []
         active_request_id: str | None = None
         d2h_stream: torch.cuda.Stream | None = None
 
@@ -264,10 +282,10 @@ class Eagle3CaptureQueue:
                 else:
                     if d2h_stream is None:
                         d2h_stream = torch.cuda.Stream(
-                            device=chunk[0].proposal_token_input_embeds.device,
+                            device=chunk[0].device,
                         )
 
-                    cpu_packets: list[Eagle3CapturePacket] = []
+                    cpu_packets: list[CapturePacket] = []
                     with torch.cuda.stream(d2h_stream):
                         for packet in chunk:
                             assert packet.ready is not None
@@ -294,6 +312,10 @@ class Eagle3CaptureQueue:
                 if item is self._stop:
                     return
 
+                if self._cpu_config is not None:
+                    config, self._cpu_config = self._cpu_config, None
+                    config.apply()
+
                 if isinstance(item, _FinishRequest):
                     if (
                         active_request_id is not None
@@ -308,6 +330,9 @@ class Eagle3CaptureQueue:
                     active_request_id = None
                     continue
 
+                if self._error is not None:
+                    continue
+
                 if isinstance(item, _CloseEpoch):
                     if active_request_id != item.request_id:
                         raise RuntimeError("closed epoch does not match active request")
@@ -316,8 +341,7 @@ class Eagle3CaptureQueue:
                     self._on_close_epoch(item.request_id)
                     continue
 
-                packet = item
-                assert isinstance(packet, Eagle3CapturePacket)
+                packet = cast(CapturePacket, item)
 
                 if active_request_id is None:
                     active_request_id = packet.request_id
@@ -333,7 +357,6 @@ class Eagle3CaptureQueue:
             except Exception as error:
                 chunk.clear()
                 self._set_error(error)
-                return
             finally:
                 if isinstance(item, _FinishRequest):
                     item.done.set()
@@ -343,3 +366,6 @@ class Eagle3CaptureQueue:
         with self._error_lock:
             if self._error is None:
                 self._error = error
+
+
+Eagle3CaptureQueue = CaptureQueue
