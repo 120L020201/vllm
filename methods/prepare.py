@@ -83,12 +83,6 @@ DATASETS = (
         revision="2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9",
         split="train",
     ),
-    DatasetSpec(
-        name="longwriter_6k",
-        repo_id="zai-org/LongWriter-6k",
-        revision="0db15c0624f19d63e2efe1021595af933cc5b6cc",
-        split="train",
-    ),
 )
 
 MODELS = (

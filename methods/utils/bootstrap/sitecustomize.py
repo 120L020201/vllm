@@ -9,3 +9,7 @@ if os.environ.get("OSD_METHOD") in {"tts", "random_sampling", "ospec"}:
     from methods.utils.gpu_factory import install
 
     install()
+elif os.environ.get("OSD_METHOD") == "online_draft":
+    from methods.utils.cpu_stats import install
+
+    install()

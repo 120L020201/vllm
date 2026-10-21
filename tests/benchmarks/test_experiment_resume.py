@@ -13,11 +13,6 @@ from experiments.benchmark import (
     _request_config,
     _select_benchmark_records,
 )
-from experiments.prepare_datasets import (
-    DATASET_REVISIONS,
-    EXPECTED_ROWS,
-    _format_longwriter,
-)
 
 
 def _write_dataset(path: Path, prompts: list[str]) -> None:
@@ -113,29 +108,6 @@ def test_sampled_resume_keeps_only_selected_questions(tmp_path: Path) -> None:
     assert completed == {("first", 1), ("first", 3)}
     assert restart is None
     assert discarded == 2
-
-
-def test_longwriter_formatter_keeps_only_the_generation_prompt() -> None:
-    """LongWriter preparation omits the very large reference completion."""
-    formatted = _format_longwriter(
-        {
-            "messages": [
-                {"role": "user", "content": "Write a long report."},
-                {"role": "assistant", "content": "large reference output"},
-            ]
-        },
-        2,
-    )
-
-    assert DATASET_REVISIONS["LongWriter-6k"] == (
-        "0db15c0624f19d63e2efe1021595af933cc5b6cc"
-    )
-    assert EXPECTED_ROWS["LongWriter-6k"] == 6000
-    assert formatted == {
-        "id": "LongWriter-6k-3",
-        "benchmark": "LongWriter-6k",
-        "prompt": "Write a long report.",
-    }
 
 
 def test_question_resume_keeps_successful_questions(tmp_path: Path) -> None:

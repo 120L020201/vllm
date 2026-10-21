@@ -40,10 +40,14 @@ GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 GPU_ATTENTION_BACKEND=${GPU_ATTENTION_BACKEND:-FLASHINFER}
 FLASHINFER_AUTOTUNE=${FLASHINFER_AUTOTUNE:-0}
 WARMUP_TOKENS=${WARMUP_TOKENS:-16}
-CHECK_GRADIENTS=${CHECK_GRADIENTS:-1}
+CHECK_GRADIENTS=${CHECK_GRADIENTS:-0}
 FROZEN_PARAMETER_PREFIXES=${FROZEN_PARAMETER_PREFIXES:-}
 FUSED_OPTIMIZER=${FUSED_OPTIMIZER:-1}
-LOG_UPDATES=${LOG_UPDATES:-0}
+if [[ "$METHOD" == online_draft ]]; then
+  LOG_UPDATES=${LOG_UPDATES:-1}
+else
+  LOG_UPDATES=${LOG_UPDATES:-0}
+fi
 CPU_TRAINING_ATTENTION_BACKEND=${CPU_TRAINING_ATTENTION_BACKEND:-flash_attention}
 VLLM_ONLINE_DRAFT_TRAIN=${VLLM_ONLINE_DRAFT_TRAIN:-}
 VLLM_ONLINE_DRAFT_PROFILE=${VLLM_ONLINE_DRAFT_PROFILE:-0}
@@ -148,6 +152,12 @@ if [[ "$VLLM_ONLINE_DRAFT_PROFILE" == 1 && "$VLLM_ONLINE_DRAFT_TRAIN" != 1 ]]; t
 fi
 export VLLM_ONLINE_DRAFT_TRAIN VLLM_ONLINE_DRAFT_PROFILE
 
+server_url="http://$HOST:$PORT"
+if [[ "$DRY_RUN" != 1 ]]; then
+  server_url=$("$PYTHON_BIN" "$ROOT_DIR/experiments/server_guard.py" check-port \
+    --host "$HOST" --port "$PORT") || die "server address is unavailable; no server was started"
+fi
+
 if [[ -n "$RUN_LOG" ]]; then
   mkdir -p "$(dirname "$RUN_LOG")"
   if [[ "$RESUME" == 1 ]]; then
@@ -241,12 +251,13 @@ if [[ "$TRUST_REMOTE_CODE" == 1 ]]; then
   common_server_args+=(--trust-remote-code)
 fi
 
+export OSD_STATS_FILE="$STATS_FILE"
+
 if [[ "$METHOD" == base ]]; then
   server_command=(
     "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL"
     "${common_server_args[@]}"
   )
-  export OSD_STATS_FILE="$STATS_FILE"
 else
   methods_method=$METHOD
   [[ "$METHOD" == eagle3 ]] && methods_method=eagle
@@ -292,6 +303,7 @@ if [[ "$DRY_RUN" == 1 ]]; then
   printf 'training: cpu_online=%s profile=%s\n' "$VLLM_ONLINE_DRAFT_TRAIN" "$VLLM_ONLINE_DRAFT_PROFILE"
   printf 'benchmark: %q' "$PYTHON_BIN"
   printf ' %q' "$ROOT_DIR/experiments/benchmark.py"
+  printf ' --method %q' "$METHOD"
   printf ' --data-dir %q --benchmarks %q --max-model-len %q --max-output-tokens %q' \
     "$DATA_DIR" "$BENCHMARKS" "$MAX_MODEL_LEN" "$MAX_OUTPUT_TOKENS"
   printf ' --max-prompt-tokens %q --temperature %q --top-p %q --top-k %q' \
@@ -440,20 +452,14 @@ if [[ "$MONITOR" == 1 ]]; then
   monitor_pid=$!
 fi
 
-for _ in $(seq 1 300); do
-  if curl -fsS "http://$HOST:$PORT/health" >/dev/null 2>&1; then
-    break
-  fi
-  if ! kill -0 "$server_pid" 2>/dev/null; then
-    echo "server exited before readiness; see $SERVER_LOG" >&2
-    exit 1
-  fi
-  sleep 1
-done
-curl -fsS "http://$HOST:$PORT/health" >/dev/null || die "server did not become ready"
+"$PYTHON_BIN" "$ROOT_DIR/experiments/server_guard.py" wait \
+  --host "$HOST" --port "$PORT" --pid "$server_pid" \
+  || die "server did not become ready with an owned listener; see $SERVER_LOG"
+kill -0 "$server_pid" 2>/dev/null || die "server exited before benchmark; see $SERVER_LOG"
 
 PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" "$ROOT_DIR/experiments/benchmark.py" \
-  --base-url "http://$HOST:$PORT" \
+  --method "$METHOD" \
+  --base-url "$server_url" \
   --model "$MODEL" \
   --data-dir "$DATA_DIR" \
   --benchmarks "$BENCHMARKS" \

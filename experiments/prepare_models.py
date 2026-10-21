@@ -64,7 +64,7 @@ def _parse_args() -> argparse.Namespace:
         action="append",
         choices=tuple(MODEL_SPECS),
         dest="model_sizes",
-        help="download this target/draft pair; may be repeated",
+        help="download this target/draft pair; may be repeated (default: no downloads)",
     )
     parser.add_argument("--max-workers", type=int, default=8)
     parser.add_argument("--force", action="store_true")
@@ -142,9 +142,12 @@ def _prepare_model(
 
 def main() -> None:
     args = _parse_args()
+    if not args.model_sizes:
+        print("No models selected; specify --model-size to download.", flush=True)
+        return
     if args.max_workers < 1:
         raise ValueError("max-workers must be positive")
-    for size in args.model_sizes or MODEL_SPECS:
+    for size in args.model_sizes:
         for spec in MODEL_SPECS[size]:
             _prepare_model(
                 args.output_dir,

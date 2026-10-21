@@ -12,12 +12,55 @@ cd "$ROOT_DIR"
 PYTHON_BIN=${PYTHON_BIN:-${VIRTUAL_ENV:-$ROOT_DIR/.venv}/bin/python}
 DATA_DIR=${DATA_DIR:-/srv/Datasets}
 MODEL_DIR=${MODEL_DIR:-/srv/Models}
-DATASETS=${DATASETS-aime2026 gpqa_diamond mmlu-pro-computer_science livecodebench-lite LongBench-v2 LongWriter-6k}
-MODEL_SIZES=${MODEL_SIZES-4b 8b}
+DATASETS=${DATASETS:-}
+MODEL_SIZES=${MODEL_SIZES:-}
 HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
 MAX_WORKERS=${MAX_WORKERS:-8}
 FORCE=${FORCE:-0}
 DRY_RUN=${DRY_RUN:-0}
+
+cli_datasets=()
+cli_model_sizes=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dataset|--model-size)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        echo "prepare.sh: $1 requires a value" >&2
+        exit 2
+      fi
+      if [[ "$1" == --dataset ]]; then
+        cli_datasets+=("$2")
+      else
+        cli_model_sizes+=("$2")
+      fi
+      shift 2
+      ;;
+    -h|--help)
+      printf '%s\n' \
+        'Usage: bash experiments/prepare.sh [--dataset NAME] [--model-size 4b|8b]' \
+        'No datasets or models are selected by default. Options may be repeated.' \
+        'DATASETS and MODEL_SIZES also accept space-separated selections.' \
+        'CLI selections override the corresponding environment variable.' \
+        'Set DRY_RUN=1 to print commands without downloading.'
+      exit 0
+      ;;
+    *)
+      echo "prepare.sh: unknown argument: $1 (see --help)" >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ ${#cli_datasets[@]} -gt 0 ]]; then
+  DATASETS="${cli_datasets[*]}"
+fi
+if [[ ${#cli_model_sizes[@]} -gt 0 ]]; then
+  MODEL_SIZES="${cli_model_sizes[*]}"
+fi
+
+if [[ -z "${DATASETS//[[:space:]]/}" && -z "${MODEL_SIZES//[[:space:]]/}" ]]; then
+  echo "prepare.sh: nothing selected; use DATASETS/MODEL_SIZES or --dataset/--model-size"
+  exit 0
+fi
 
 [[ -x "$PYTHON_BIN" ]] || {
   echo "prepare.sh: PYTHON_BIN is not executable: $PYTHON_BIN" >&2
@@ -50,12 +93,12 @@ if [[ "$FORCE" == 1 ]]; then
 fi
 
 if [[ "$DRY_RUN" == 1 ]]; then
-  if [[ -n "$DATASETS" ]]; then
+  if [[ -n "${DATASETS//[[:space:]]/}" ]]; then
     printf 'datasets:'
     printf ' %q' "${dataset_command[@]}"
     printf '\n'
   fi
-  if [[ -n "$MODEL_SIZES" ]]; then
+  if [[ -n "${MODEL_SIZES//[[:space:]]/}" ]]; then
     printf 'models:'
     printf ' %q' "${model_command[@]}"
     printf '\n'
@@ -67,11 +110,11 @@ echo "prepare.sh: datasets='${DATASETS:-<skip>}' -> $DATA_DIR"
 echo "prepare.sh: model_sizes='${MODEL_SIZES:-<skip>}' -> $MODEL_DIR"
 echo "prepare.sh: endpoint=$HF_ENDPOINT max_workers=$MAX_WORKERS"
 
-if [[ -n "$DATASETS" ]]; then
+if [[ -n "${DATASETS//[[:space:]]/}" ]]; then
   echo "prepare.sh: starting dataset preparation"
   "${dataset_command[@]}"
 fi
-if [[ -n "$MODEL_SIZES" ]]; then
+if [[ -n "${MODEL_SIZES//[[:space:]]/}" ]]; then
   echo "prepare.sh: starting model preparation"
   "${model_command[@]}"
 fi

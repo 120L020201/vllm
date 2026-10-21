@@ -27,7 +27,6 @@ DATASET_REVISIONS = {
     "mmlu-pro-computer_science": "b189ec765aa7ed75c8acfea42df31fdae71f97be",
     "livecodebench-lite": "0fe84c3912ea0c4d4a78037083943e8f0c4dd505",
     "LongBench-v2": "2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9",
-    "LongWriter-6k": "0db15c0624f19d63e2efe1021595af933cc5b6cc",
 }
 EXPECTED_ROWS = {
     "aime2026": 30,
@@ -35,7 +34,6 @@ EXPECTED_ROWS = {
     "mmlu-pro-computer_science": 410,
     "livecodebench-lite": 1055,
     "LongBench-v2": 503,
-    "LongWriter-6k": 6000,
 }
 
 
@@ -51,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
         action="append",
         choices=tuple(EXPECTED_ROWS),
         dest="datasets",
-        help="prepare only this dataset; may be repeated",
+        help="prepare this dataset; may be repeated (default: no downloads)",
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -69,8 +67,8 @@ def _format_aime(row: dict[str, Any], index: int) -> dict[str, Any]:
         "id": f"aime2026-{index + 1}",
         "benchmark": "aime2026",
         "prompt": (
-            "Solve the following AIME problem. Reason step by step, and put "
-            "the final integer answer in \\boxed{} only at the end.\n\n"
+            "Reason step by step, and put the final integer answer "
+            "in \\boxed{} only at the end.\n\n"
             f"Problem:\n{problem}"
         ),
         "answer": row["answer"],
@@ -87,8 +85,7 @@ def _format_gpqa(row: dict[str, Any], index: int) -> dict[str, Any]:
         "id": f"gpqa-diamond-{index + 1}",
         "benchmark": "gpqa_diamond",
         "prompt": (
-            "Answer the following graduate-level science multiple-choice "
-            "question. Reason step by step, then give the final choice letter "
+            "Reason step by step, and put the final integer answer "
             "in \\boxed{} only at the end.\n\n"
             f"Question:\n{row['Question']}\n\nChoices:\n{_choices(options)}"
         ),
@@ -102,9 +99,8 @@ def _format_mmlu(row: dict[str, Any], index: int) -> dict[str, Any]:
         "id": f"mmlu-pro-computer_science-{index + 1}",
         "benchmark": "mmlu-pro-computer_science",
         "prompt": (
-            "Answer the following computer science multiple-choice question. "
-            "Reason step by step, then give the final choice letter in "
-            "\\boxed{} only at the end.\n\n"
+            "Reason step by step, and put the final integer answer "
+            "in \\boxed{} only at the end.\n\n"
             f"Question:\n{row['question']}\n\n"
             f"Choices:\n{_choices(row['options'])}"
         ),
@@ -120,8 +116,7 @@ def _format_livecodebench(row: dict[str, Any], index: int) -> dict[str, Any]:
         "id": f"livecodebench-lite-{index + 1}",
         "benchmark": "livecodebench-lite",
         "prompt": (
-            "Solve the following programming problem. Reason step by step, "
-            "then provide the final accepted solution code.\n\n"
+            "Reason step by step, then provide the final accepted solution code.\n\n"
             f"Problem:\n{row['question_content']}{starter}"
         ),
         "source": row,
@@ -134,35 +129,13 @@ def _format_longbench(row: dict[str, Any], index: int) -> dict[str, Any]:
         "id": f"LongBench-v2-{index + 1}",
         "benchmark": "LongBench-v2",
         "prompt": (
-            "Read the complete context and answer the multiple-choice question. "
-            "Reason step by step, then give the final choice letter in "
-            "\\boxed{} only at the end.\n\n"
+            "Reason step by step, and put the final integer answer "
+            "in \\boxed{} only at the end.\n\n"
             f"Context:\n{row['context']}\n\nQuestion:\n{row['question']}\n\n"
             f"Choices:\n{_choices(options)}"
         ),
         "answer": row["answer"],
         "source": row,
-    }
-
-
-def _format_longwriter(row: dict[str, Any], index: int) -> dict[str, Any]:
-    messages = row.get("messages")
-    if not isinstance(messages, list):
-        raise TypeError("LongWriter-6k row must contain a messages list")
-    prompt = next(
-        (
-            message.get("content")
-            for message in messages
-            if isinstance(message, dict) and message.get("role") == "user"
-        ),
-        None,
-    )
-    if not isinstance(prompt, str) or not prompt:
-        raise ValueError("LongWriter-6k row must contain a user prompt")
-    return {
-        "id": f"LongWriter-6k-{index + 1}",
-        "benchmark": "LongWriter-6k",
-        "prompt": prompt,
     }
 
 
@@ -281,15 +254,6 @@ def _load_dataset_rows(
             cache_dir,
         )
         return list(load_dataset("json", data_files=str(path), split="train"))
-    if name == "LongWriter-6k":
-        path = _download_dataset_file(
-            endpoint,
-            "zai-org/LongWriter-6k",
-            revision,
-            "long.jsonl",
-            cache_dir,
-        )
-        return _read_jsonl(path)
     raise ValueError(f"unsupported dataset: {name}")
 
 
@@ -341,14 +305,16 @@ def _write_dataset(
 
 def main() -> None:
     args = _parse_args()
-    selected = tuple(args.datasets or EXPECTED_ROWS)
+    if not args.datasets:
+        print("No datasets selected; specify --dataset to download.", flush=True)
+        return
+    selected = tuple(args.datasets)
     formatters = {
         "aime2026": _format_aime,
         "gpqa_diamond": _format_gpqa,
         "mmlu-pro-computer_science": _format_mmlu,
         "livecodebench-lite": _format_livecodebench,
         "LongBench-v2": _format_longbench,
-        "LongWriter-6k": _format_longwriter,
     }
     missing = []
     for name in selected:

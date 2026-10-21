@@ -73,9 +73,15 @@ GPQA Diamond 是 Hugging Face 受控数据集。第一次下载前，需要在�
 .venv/bin/hf auth login
 ```
 
-## 2. 一键下载数据和模型
+## 2. 按需下载数据和模型
 
-默认下载六个完整数据集、Qwen3-4B/8B target 模型，以及对应 EAGLE3 draft：
+默认不下载任何模型或数据集。直接运行 `bash experiments/prepare.sh` 会提示
+未选择下载项并退出，不启动 Python 下载器，也不创建下载目录。只有显式设置
+`DATASETS`、`MODEL_SIZES` 或传入 `--dataset`、`--model-size` 时才下载对应项；
+不再需要用 `MODEL_SIZES=""` 或 `DATASETS=""` 关闭另一类下载。已导出的环境
+变量也算显式选择。
+
+例如，显式下载五个完整数据集、Qwen3-4B/8B target 模型及对应 EAGLE3 draft：
 
 ```bash
 nohup env \
@@ -84,7 +90,7 @@ nohup env \
   PYTHON_BIN="$PWD/.venv/bin/python" \
   DATA_DIR=/srv/Datasets \
   MODEL_DIR=/srv/Models \
-  DATASETS="aime2026 gpqa_diamond mmlu-pro-computer_science livecodebench-lite LongBench-v2 LongWriter-6k" \
+  DATASETS="aime2026 gpqa_diamond mmlu-pro-computer_science livecodebench-lite LongBench-v2" \
   MODEL_SIZES="4b 8b" \
   MAX_WORKERS=8 \
   bash experiments/prepare.sh \
@@ -102,7 +108,7 @@ Python 无缓冲输出。如果日志仍为 0 字节且 `ps` 中没有 `prepare.
 `prepare_datasets.py`/`prepare_models.py`，说明命令没有真正启动；可先执行：
 
 ```bash
-DRY_RUN=1 bash experiments/prepare.sh
+DRY_RUN=1 bash experiments/prepare.sh --dataset aime2026 --model-size 4b
 ```
 
 确认路径后再运行后台命令。
@@ -121,22 +127,38 @@ HF_ENDPOINT=https://hf-mirror.com \
 bash experiments/prepare.sh
 ```
 
-只下载数据集：
+只下载选定数据集（未设置 `MODEL_SIZES` 时不会下载模型）：
 
 ```bash
-MODEL_SIZES="" bash experiments/prepare.sh
+DATASETS="aime2026 gpqa_diamond" bash experiments/prepare.sh
 ```
 
-只下载模型：
+只下载选定模型及对应 draft（未设置 `DATASETS` 时不会下载数据集）：
 
 ```bash
-DATASETS="" MODEL_SIZES="4b 8b" bash experiments/prepare.sh
+MODEL_SIZES="4b 8b" bash experiments/prepare.sh
+```
+
+也可以使用命令行选项，每个选项可重复。指定某类命令行选项时，会覆盖该类
+环境变量的选择，不影响另一类：
+
+```bash
+bash experiments/prepare.sh --dataset aime2026 --dataset gpqa_diamond
+bash experiments/prepare.sh --model-size 8b
+bash experiments/prepare.sh --dataset aime2026 --model-size 8b
 ```
 
 仅查看即将执行的命令：
 
 ```bash
 DRY_RUN=1 DATASETS="aime2026" MODEL_SIZES="4b" bash experiments/prepare.sh
+```
+
+直接运行底层 Python 下载器也默认不下载，必须显式选择，可重复传入选项：
+
+```bash
+.venv/bin/python experiments/prepare_datasets.py --dataset aime2026
+.venv/bin/python experiments/prepare_models.py --model-size 8b
 ```
 
 ## 3. 完整数据集
@@ -150,7 +172,6 @@ DRY_RUN=1 DATASETS="aime2026" MODEL_SIZES="4b" bash experiments/prepare.sh
 | MMLU-Pro Computer Science | `mmlu-pro-computer_science.jsonl` | 410 |
 | LiveCodeBench Lite release v6 | `livecodebench-lite.jsonl` | 1055 |
 | LongBench v2 | `LongBench-v2.jsonl` | 503 |
-| LongWriter-6k | `LongWriter-6k.jsonl` | 6000 |
 
 检查实际条数：
 
@@ -160,8 +181,7 @@ wc -l \
   /srv/Datasets/gpqa_diamond.jsonl \
   /srv/Datasets/mmlu-pro-computer_science.jsonl \
   /srv/Datasets/livecodebench-lite.jsonl \
-  /srv/Datasets/LongBench-v2.jsonl \
-  /srv/Datasets/LongWriter-6k.jsonl
+  /srv/Datasets/LongBench-v2.jsonl
 ```
 
 数据准备器固定官方 revision，并且只有在完整条数校验通过后才原子发布最终
@@ -187,6 +207,15 @@ Hugging Face `datasets` 去探测不存在的远程 `*.py` loader；未完成的
 
 ## 5. Benchmark 通用配置
 
+`run.sh` 默认使用 `HOST=127.0.0.1 PORT=8000`。启动前会尝试绑定该地址；
+端口已被占用时立即报错，不启动新服务、不复用或关闭旧服务，也不清空本次
+配置指向的已有日志、结果和统计文件。可以显式设置 `PORT=8001` 换一个端口。
+启动后，只有本次启动的进程仍存活、它或其子进程拥有该地址的监听 socket，
+并且 `/health` 返回 200，才开始 benchmark。健康请求最多等待 2 秒，
+总就绪等待最多 300 秒；无法确认监听归属时不会放行。`DRY_RUN=1` 不探测端口。
+`HOST=0.0.0.0` / `HOST=::` 仍用于服务绑定，但客户端分别连接本机
+`127.0.0.1` / `::1`。
+
 推荐的 benchmark 列表为：
 
 ```bash
@@ -211,8 +240,7 @@ BENCHMARKS="aime2026[10]"
 
 相同 `SEED` 会选择相同题目，也会作为 OpenAI 请求的生成 seed，并传给在线
 方法的随机策略。更换 seed 或抽样数量时，断点恢复会自动丢弃配置不匹配的旧
-结果。LongWriter-6k 有 6000 条长文本生成指令，通常应按需使用
-`LongWriter-6k(N)`，而不是直接全量运行。
+结果。
 
 默认配置：
 
@@ -391,12 +419,25 @@ trainer。脚本自动设置 `VLLM_ONLINE_DRAFT_TRAIN=1`，其他入口自动设
 不再使用 `eagle3 + VLLM_ONLINE_DRAFT_TRAIN=1` 的组合；与入口冲突的环境变量
 会报错，请移除旧开关并改用新入口。CPU trainer 的默认配置为：
 
-- `CHECK_GRADIENTS=1`
+- `CHECK_GRADIENTS=0`
 - `FROZEN_PARAMETER_PREFIXES=`（空，即不冻结）
 - `FUSED_OPTIMIZER=1`
-- `LOG_UPDATES=0`
+- `LOG_UPDATES=1`
 - `CPU_TRAINING_ATTENTION_BACKEND=flash_attention`
 - `VLLM_ONLINE_DRAFT_PROFILE=0`
+- `OMP_NUM_THREADS=20`，`MKL_NUM_THREADS` 默认跟随 `OMP_NUM_THREADS`
+
+这些 CPU 训练默认值与 `methods/artifacts/scripts/benchmark_aime_2026_online.py`
+一致，可通过环境变量覆盖。两者共用 `online_draft.runtime` 的捕获、传输和训练
+实现：后台独立 D2H stream 将投影后的 teacher logits 复制到 pinned CPU buffer，
+再由 CPU 构造 FP32 teacher probabilities。默认 BF16 logits 在 `D=7`、
+`V_d=32000` 时占 448,000 字节（约 0.448 MB），不包含 hidden states 等其他数据。
+confirmed embeddings 直接从 GPU draft prefill 捕获，没有 sampled token IDs 的
+CPU→GPU 回传。传输包仍包含 `num_sampled`；原生路径不计算 teacher coverage。
+
+`methods/utils/adapter.py`、`bridge.py` 和 `factory.py` 是保留的旧 CPU policy
+实现，当前 `methods.run` 的任何入口都不会安装它们。`online_draft` 的 bootstrap
+仅附加统计回调；TTS/OSpec 使用 `gpu_factory.py`，训练数据常驻 GPU。
 
 多个冻结前缀使用逗号分隔。示例：
 
@@ -422,20 +463,33 @@ FUSED_OPTIMIZER=1 LOG_UPDATES=1 \
 每道题完成后，外层日志会输出：
 
 ```text
-aime2026-10: AL=2.825, updates=1105, tokens=24987, time=720.8s, tokens/s=34.67, prefill=410 tokens/0.112s/3660.71 tokens/s, decode=24986 tokens/287.400s/86.94 tokens/s
+aime2026-10: AL=2.825, weight_installs=120, cpu_rounds/train=8.25, tokens=24987, time=720.8s, tokens/s=34.67, prefill=410 tokens/0.112s/3660.71 tokens/s, decode=24986 tokens/287.400s/86.94 tokens/s
 ```
 
 指标含义：
 
 - `AL`：`1 + accepted draft tokens / speculative rounds`；Base 为 `1.000`。
-- `updates`：该请求实际完成的 GPU optimizer step 数；Base/EAGLE3 为 0。
+- `weight_installs`：该请求期间新训练权重实际安装到 GPU draft 推理模型的次数，
+  不包括恢复初始权重；不是 optimizer step 数。Base/EAGLE3 为 0。
+- `cpu_rounds/train`：CPU 每次成功训练平均使用的 speculative proposal 轮数，
+  即成功训练窗口包含的轮数之和除以训练次数。一轮不是一个生成 token；不包含
+  warmup 或请求结束时未训练的尾部轮次。仅 CPU `online_draft` 适用，
+  TTS/OSpec/Base/EAGLE3 或没有完成 CPU 训练时显示 `N/A`。
 - `tokens`：API 返回的 completion token 数。
-- `time`：请求端到端时间，包括该请求同步 GPU 更新的时间。
+- `time`：请求端到端时间，包括 HTTP 请求、该请求后台训练/权重安装收尾等待，
+  以及请求后的服务端指标读取；不包含 warmup。
 - `tokens/s`：`tokens / time`。
 - `prefill`：该题的 prompt token 数、vLLM 服务端 prefill 时间和 prefill
   tokens/s；prefill 时间包含首个输出 token。
 - `decode`：该题首 token 之后的输出 token 数、vLLM 服务端 decode 时间和
   decode tokens/s。
+
+JSONL 使用 `weight_installs` 和 `cpu_rounds_per_train` 保存上述训练指标，不再
+输出含义容易混淆的 `updates` 字段。统计文件缺失、损坏或等待未完成时，
+训练指标显示 `N/A`、JSON 写为 `null`，不再误报为 0。CPU warmup 处理结束后
+才开始正式计时和计数；这些统计独立于 `LOG_UPDATES`，无需打开逐次训练日志。
+OSpec 在 chunk 边界合并并安装权重，一次合并算一次安装，不按三个 learner 的
+optimizer step 数累计；尚未到 chunk 边界的题目可以正常显示安装次数为 0。
 
 `run.sh` 会先切换到仓库根目录，并在启动时生成一次格式为
 `YYYYMMDD_HHMMSS` 的 `RUN_TIMESTAMP`。默认运行目录为：

@@ -66,7 +66,7 @@ def build_parser():
     parser.add_argument(
         "--check-gradients",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="check gradients in the optional built-in CPU online trainer",
     )
     parser.add_argument(
@@ -77,7 +77,8 @@ def build_parser():
     parser.add_argument(
         "--log-updates",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
+        help="log weight updates (enabled by default for online_draft)",
     )
     parser.add_argument("--frozen-parameter-prefixes", default="")
     parser.add_argument(
@@ -91,6 +92,9 @@ def build_parser():
 
 def configure(args):
     cpu_online = str(int(args.method == "online_draft"))
+    log_updates = args.log_updates
+    if log_updates is None:
+        log_updates = args.method == "online_draft"
     if os.environ.get("VLLM_ONLINE_DRAFT_TRAIN") not in (None, "", cpu_online):
         raise ValueError(
             "VLLM_ONLINE_DRAFT_TRAIN conflicts with the selected method; "
@@ -149,6 +153,11 @@ def configure(args):
             require_gpu=not args.dry_run,
         )
     env = os.environ.copy()
+    if args.method == "online_draft":
+        omp_threads = env.setdefault("OMP_NUM_THREADS", "20")
+        env.setdefault("MKL_NUM_THREADS", omp_threads)
+        if int(omp_threads) < 1:
+            raise ValueError("OMP_NUM_THREADS must be a positive integer")
     env.update(
         {
             # The opt-in bootstrap installs observation hooks on the V2 runner.
@@ -166,7 +175,7 @@ def configure(args):
             "OSD_EPSILON": str(args.epsilon),
             "OSD_KEEP_WEIGHTS": str(int(args.keep_weights)),
             "OSD_FUSED_OPTIMIZER": str(int(args.fused_optimizer)),
-            "OSD_LOG_UPDATES": str(int(args.log_updates)),
+            "OSD_LOG_UPDATES": str(int(log_updates)),
             "PYTHONPATH": os.pathsep.join(
                 (str(BOOTSTRAP), str(ROOT), env.get("PYTHONPATH", ""))
             ),
@@ -223,7 +232,7 @@ def configure(args):
                     "fused_optimizer": args.fused_optimizer,
                     "frozen_parameter_prefixes": prefixes,
                     "check_gradients": args.check_gradients,
-                    "log_updates": args.log_updates,
+                    "log_updates": log_updates,
                 }
             },
             separators=(",", ":"),

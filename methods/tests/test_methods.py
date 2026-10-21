@@ -3,6 +3,7 @@
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import psutil
 import torch
 from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3Config,
@@ -19,17 +21,28 @@ from online_draft.models.qwen3_eagle3 import (
 from online_draft.training.eagle3_batch import Eagle3DistillationBatch
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
 
+from experiments import prepare_datasets as dataset_preparation
+from experiments import prepare_models as model_preparation
 from experiments.benchmark import (
     _acceptance_length,
     _completion_tokens,
     _fetch_spec_metrics,
     _output_token_limit,
     _parse_benchmark_specs,
+    _read_worker_stats,
     _request_body,
     _select_benchmark_records,
+    _training_metrics,
+    _wait_for_worker,
 )
 from experiments.prepare_datasets import _download_dataset_file, _line_count
 from experiments.prepare_models import MODEL_SPECS, _validate_model
+from experiments.server_guard import (
+    _owns_listener,
+    check_port_available,
+    server_url,
+    wait_for_server,
+)
 from methods.prepare import (
     DATASETS,
     MODELS,
@@ -46,6 +59,7 @@ from methods.run import (
     build_parser,
     configure,
 )
+from methods.utils.cpu_stats import attach_cpu_stats
 from methods.utils.gpu_factory import (
     _is_intermediate_prefill_chunk,
     _request_ids_to_reset,
@@ -145,12 +159,14 @@ class LauncherTest(unittest.TestCase):
         for method in ("eagle", "online_draft", "tts", "random_sampling", "ospec"):
             args = build_parser().parse_args((method, "--dry-run"))
             command, env = configure(args)
-            commands.append(command)
+            config_index = command.index("--additional-config")
+            commands.append(command[:config_index] + command[config_index + 2 :])
             self.assertEqual(env["OSD_METHOD"], method)
             self.assertEqual(env["VLLM_USE_V2_MODEL_RUNNER"], "1")
             self.assertEqual(
                 env["VLLM_ONLINE_DRAFT_TRAIN"], str(int(method == "online_draft"))
             )
+            self.assertEqual(env["OSD_LOG_UPDATES"], str(int(method == "online_draft")))
             self.assertIn("--max-num-seqs", command)
             self.assertIn("1", command)
             self.assertIn("-cc.cudagraph_mode=FULL_AND_PIECEWISE", command)
@@ -212,9 +228,12 @@ class LauncherTest(unittest.TestCase):
                     "flash_attention",
                 )
 
-    def test_cpu_online_trainer_defaults_match_run_configuration(self):
+    def test_cpu_online_trainer_defaults_match_artifact_configuration(self):
         args = build_parser().parse_args(("online_draft", "--dry-run"))
-        command, _ = configure(args)
+        with patch.dict(os.environ):
+            os.environ.pop("OMP_NUM_THREADS", None)
+            os.environ.pop("MKL_NUM_THREADS", None)
+            command, env = configure(args)
 
         self.assertEqual(
             self._online_draft_config(command),
@@ -223,29 +242,34 @@ class LauncherTest(unittest.TestCase):
                 "learning_rate": 1e-5,
                 "fused_optimizer": True,
                 "frozen_parameter_prefixes": [],
-                "check_gradients": True,
-                "log_updates": False,
+                "check_gradients": False,
+                "log_updates": True,
             },
         )
+        self.assertEqual(env["OMP_NUM_THREADS"], "20")
+        self.assertEqual(env["MKL_NUM_THREADS"], "20")
 
     def test_cpu_online_trainer_options_are_configurable(self):
         args = build_parser().parse_args(
             (
                 "online_draft",
                 "--dry-run",
-                "--no-check-gradients",
+                "--check-gradients",
                 "--no-fused-optimizer",
-                "--log-updates",
+                "--no-log-updates",
                 "--frozen-parameter-prefixes",
                 "model.embed_tokens, lm_head",
             )
         )
-        command, _ = configure(args)
+        with patch.dict(os.environ, {"OMP_NUM_THREADS": "8", "MKL_NUM_THREADS": "4"}):
+            command, env = configure(args)
         config = self._online_draft_config(command)
 
-        self.assertFalse(config["check_gradients"])
+        self.assertTrue(config["check_gradients"])
         self.assertFalse(config["fused_optimizer"])
-        self.assertTrue(config["log_updates"])
+        self.assertFalse(config["log_updates"])
+        self.assertEqual(env["OMP_NUM_THREADS"], "8")
+        self.assertEqual(env["MKL_NUM_THREADS"], "4")
         self.assertEqual(
             config["frozen_parameter_prefixes"],
             ["model.embed_tokens", "lm_head"],
@@ -387,6 +411,10 @@ class RunScriptTest(unittest.TestCase):
                 )
                 if method == "online_draft":
                     self.assertIn("-m methods.run online_draft", result.stdout)
+                    self.assertIn("--no-check-gradients", result.stdout)
+                    self.assertIn("--log-updates", result.stdout)
+                elif method in ("tts", "ospec"):
+                    self.assertIn("--no-log-updates", result.stdout)
 
     def test_training_resume_is_rejected_before_creating_outputs(self):
         for method in ("online_draft", "tts", "ospec"):
@@ -395,6 +423,96 @@ class RunScriptTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("does not support RESUME=1", result.stderr)
                 self.assertFalse((self.directory / "results").exists())
+
+    def test_occupied_port_is_rejected_before_changing_existing_outputs(self):
+        files = {
+            name: self.directory / name.lower()
+            for name in ("RUN_LOG", "SERVER_LOG", "STATS_FILE", "OUTPUT_FILE")
+        }
+        for path in files.values():
+            path.write_text("keep existing run\n", encoding="utf-8")
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            result = self._run(
+                "base",
+                DRY_RUN="0",
+                RESUME="0",
+                HOST="127.0.0.1",
+                PORT=str(listener.getsockname()[1]),
+                **{name: str(path) for name, path in files.items()},
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("cannot bind", result.stderr)
+            self.assertTrue(
+                listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+            )
+        self.assertFalse((self.directory / "results").exists())
+        for path in files.values():
+            self.assertEqual(path.read_text(encoding="utf-8"), "keep existing run\n")
+
+    def test_readiness_accepts_a_real_server_owned_by_the_launched_process(self):
+        program = """\
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_port, flush=True)
+server.serve_forever()
+"""
+        server = subprocess.Popen(
+            [sys.executable, "-c", program],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(server.communicate, timeout=5)
+        self.addCleanup(server.terminate)
+        port = server.stdout.readline().strip()
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(self.root / "experiments" / "server_guard.py"),
+                "wait",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                port,
+                "--pid",
+                str(server.pid),
+                "--timeout",
+                "2",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stats_path_is_exported_to_every_training_method(self):
+        path = str(self.directory / "stats.json")
+        for method in ("online_draft", "tts", "ospec"):
+            with self.subTest(method=method):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'trap \'printenv OSD_STATS_FILE\' EXIT; source "$1" "$2"',
+                        "test",
+                        str(self.root / "experiments" / "run.sh"),
+                        method,
+                    ],
+                    env={**self.env, "STATS_FILE": path},
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1], path)
 
     def test_inference_resume_remains_configurable(self):
         for method in ("base", "eagle3"):
@@ -427,7 +545,196 @@ class RunScriptTest(unittest.TestCase):
                     self.assertIn("requires the online_draft entry", result.stderr)
 
 
+class ServerGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.process = MagicMock(pid=123)
+        self.process.is_running.return_value = True
+        self.process.status.return_value = psutil.STATUS_RUNNING
+        self.enterContext(
+            patch("experiments.server_guard.psutil.Process", return_value=self.process)
+        )
+        self.opener = MagicMock()
+        response = self.opener.open.return_value.__enter__.return_value
+        response.status = 200
+        response.geturl.return_value = "http://127.0.0.1:8000/health"
+        self.enterContext(
+            patch(
+                "experiments.server_guard.urllib.request.build_opener",
+                return_value=self.opener,
+            )
+        )
+
+    def test_another_healthy_server_cannot_satisfy_readiness(self):
+        with (
+            patch("experiments.server_guard._owns_listener", return_value=False),
+            patch("experiments.server_guard.time.monotonic", side_effect=[0, 0, 1, 2]),
+            patch("experiments.server_guard.time.sleep"),
+            self.assertRaises(TimeoutError),
+        ):
+            wait_for_server("127.0.0.1", 8000, 123, timeout=1)
+        self.opener.open.assert_not_called()
+
+    def test_exited_launcher_is_rejected_before_health_probe(self):
+        self.process.is_running.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "exited"):
+            wait_for_server("127.0.0.1", 8000, 123)
+        self.opener.open.assert_not_called()
+
+    def test_process_exit_during_successful_health_probe_is_rejected(self):
+        self.process.is_running.side_effect = [True, False]
+        with (
+            patch("experiments.server_guard._owns_listener", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "exited"),
+        ):
+            wait_for_server("127.0.0.1", 8000, 123)
+
+    def test_ready_owned_server_uses_a_bounded_health_probe(self):
+        with patch(
+            "experiments.server_guard._owns_listener", return_value=True
+        ) as owned:
+            wait_for_server("127.0.0.1", 8000, 123)
+        self.opener.open.assert_called_once_with(
+            "http://127.0.0.1:8000/health", timeout=2.0
+        )
+        self.assertEqual(owned.call_count, 2)
+
+    def test_listener_must_match_address_and_port_in_the_process_tree(self):
+        self.process.net_connections.return_value = []
+        child = MagicMock()
+        self.process.children.return_value = [child]
+        child.net_connections.return_value = [
+            SimpleNamespace(
+                status=psutil.CONN_LISTEN,
+                laddr=SimpleNamespace(ip="127.0.0.1", port=8000),
+            )
+        ]
+        self.assertTrue(_owns_listener(self.process, {"127.0.0.1"}, 8000))
+        self.assertFalse(_owns_listener(self.process, {"127.0.0.2"}, 8000))
+        self.assertFalse(_owns_listener(self.process, {"127.0.0.1"}, 8001))
+
+    def test_bind_probe_rejects_a_listener_and_accepts_a_released_port(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            listener.listen()
+            with self.assertRaisesRegex(RuntimeError, "cannot bind"):
+                check_port_available("127.0.0.1", port)
+        check_port_available("127.0.0.1", port)
+
+    def test_wildcard_listener_uses_a_local_client_address(self):
+        self.assertEqual(server_url("0.0.0.0", 8000), "http://127.0.0.1:8000")
+        self.assertEqual(server_url("::", 8000), "http://[::1]:8000")
+        self.assertEqual(server_url("::1", 8000), "http://[::1]:8000")
+
+
 class PreparationTest(unittest.TestCase):
+    def _prepare_script(self, *args, **env):
+        root = Path(__file__).resolve().parents[2]
+        return subprocess.run(
+            ["bash", str(root / "experiments" / "prepare.sh"), *args],
+            env={"PATH": os.defpath, "PYTHON_BIN": sys.executable, **env},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_unselected_assets_do_not_start_python_or_create_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for selection in ({}, {"DATASETS": "", "MODEL_SIZES": " \t"}):
+                with self.subTest(selection=selection):
+                    result = self._prepare_script(
+                        PYTHON_BIN=f"{directory}/missing-python",
+                        DATA_DIR=f"{directory}/datasets",
+                        MODEL_DIR=f"{directory}/models",
+                        **selection,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("nothing selected", result.stdout)
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_only_explicitly_selected_asset_classes_are_scheduled(self):
+        cases = (
+            ((), {"DATASETS": "aime2026"}, True, False),
+            ((), {"MODEL_SIZES": "8b"}, False, True),
+            ((), {"DATASETS": "aime2026", "MODEL_SIZES": "8b"}, True, True),
+            (("--dataset", "aime2026"), {}, True, False),
+            (("--model-size", "8b"), {}, False, True),
+            (("--dataset", "aime2026", "--model-size", "8b"), {}, True, True),
+        )
+        for args, env, datasets, models in cases:
+            with self.subTest(args=args, env=env):
+                result = self._prepare_script(*args, DRY_RUN="1", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("datasets:" in result.stdout, datasets)
+                self.assertEqual("models:" in result.stdout, models)
+                if datasets:
+                    self.assertIn("--dataset aime2026", result.stdout)
+                if models:
+                    self.assertIn("--model-size 8b", result.stdout)
+
+    def test_repeated_cli_selections_override_only_the_matching_environment(self):
+        result = self._prepare_script(
+            "--dataset",
+            "aime2026",
+            "--dataset",
+            "gpqa_diamond",
+            DATASETS="LongBench-v2",
+            MODEL_SIZES="8b",
+            DRY_RUN="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--dataset aime2026 --dataset gpqa_diamond", result.stdout)
+        self.assertNotIn("LongBench-v2", result.stdout)
+        self.assertIn("--model-size 8b", result.stdout)
+
+    def test_invalid_prepare_arguments_fail_before_downloading(self):
+        for args in (("--unknown",), ("--dataset",), ("--model-size", "--dataset")):
+            with self.subTest(args=args):
+                result = self._prepare_script(
+                    *args, PYTHON_BIN="/missing-python", DATASETS="aime2026"
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertNotIn("PYTHON_BIN", result.stderr)
+                self.assertNotIn("starting", result.stdout)
+
+    def test_python_downloaders_require_explicit_selections(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("builtins.print"),
+            patch.object(dataset_preparation, "_load_dataset_rows") as load_rows,
+            patch.object(dataset_preparation, "_write_dataset") as write_dataset,
+            patch.object(model_preparation, "_prepare_model") as prepare_model,
+        ):
+            output = Path(directory) / "assets"
+            argv = ["prepare", "--output-dir", str(output)]
+            with patch.object(sys, "argv", argv):
+                dataset_preparation.main()
+                model_preparation.main()
+            load_rows.assert_not_called()
+            write_dataset.assert_not_called()
+            prepare_model.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_python_downloaders_prepare_only_requested_assets(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(dataset_preparation, "_load_dataset_rows") as load_rows,
+            patch.object(dataset_preparation, "_write_dataset"),
+            patch.object(model_preparation, "_prepare_model") as prepare_model,
+        ):
+            argv = ["prepare", "--output-dir", directory]
+            with patch.object(sys, "argv", [*argv, "--dataset", "aime2026"]):
+                dataset_preparation.main()
+            with patch.object(sys, "argv", [*argv, "--model-size", "8b"]):
+                model_preparation.main()
+            self.assertEqual(
+                [call.args[0] for call in load_rows.call_args_list], ["aime2026"]
+            )
+            self.assertEqual(
+                [call.args[1] for call in prepare_model.call_args_list],
+                list(MODEL_SPECS["8b"]),
+            )
+
     def test_manifest_contains_every_requested_artifact(self):
         self.assertEqual(
             {spec.name for spec in DATASETS},
@@ -438,7 +745,6 @@ class PreparationTest(unittest.TestCase):
                 "computer_science",
                 "livecodebench_lite",
                 "longbench_v2",
-                "longwriter_6k",
             },
         )
         self.assertEqual(
@@ -668,13 +974,62 @@ class BenchmarkLoggingTest(unittest.TestCase):
                 stats.begin_request()
                 stats.enqueue()
                 stats.complete(3)
+                stats.record_weight_install()
+                stats.record_cpu_train(4)
                 stats.end_request()
             payload = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(
             payload,
-            {"active_requests": 0, "pending": 0, "updates": 3},
+            {
+                "active_requests": 0,
+                "pending": 0,
+                "updates": 3,
+                "weight_installs": 1,
+                "cpu_train_calls": 1,
+                "cpu_train_rounds": 4,
+            },
         )
+
+    def test_missing_or_invalid_stats_do_not_report_zero_installs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stats.json"
+            self.assertIsNone(_read_worker_stats(path))
+            for payload in ("{", "{}", '{"updates": 3}'):
+                path.write_text(payload, encoding="utf-8")
+                self.assertIsNone(_read_worker_stats(path))
+        self.assertEqual(_training_metrics(None, None, "tts"), (None, None))
+        self.assertEqual(_training_metrics(None, None, "base"), (0, None))
+
+    def test_training_metrics_use_completed_request_deltas(self):
+        before = {
+            "active_requests": 0,
+            "pending": 0,
+            "weight_installs": 3,
+            "cpu_train_calls": 4,
+            "cpu_train_rounds": 10,
+        }
+        after = {
+            **before,
+            "weight_installs": 5,
+            "cpu_train_calls": 7,
+            "cpu_train_rounds": 22,
+        }
+        self.assertEqual(_training_metrics(before, after, "online_draft"), (2, 4.0))
+        self.assertEqual(_training_metrics(before, before, "online_draft"), (0, None))
+        self.assertEqual(_training_metrics(after, before, "online_draft"), (None, None))
+
+    def test_busy_worker_timeout_is_not_a_complete_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stats.json"
+            with patch.dict(os.environ, {"OSD_STATS_FILE": str(path)}):
+                stats = WorkerStats()
+                stats.begin_request()
+                self.assertIsNone(_wait_for_worker(path, timeout=0))
+                stats.end_request()
+                self.assertEqual(
+                    _wait_for_worker(path, timeout=0)["weight_installs"], 0
+                )
 
     def test_metrics_parser_ignores_per_position_counters(self):
         metrics = """\
@@ -696,6 +1051,99 @@ vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 7
 
 
 class PolicyTest(unittest.TestCase):
+    def test_cpu_stats_count_training_windows_and_installs_separately(self):
+        speculator = SimpleNamespace(
+            propose=MagicMock(),
+            install_committed_weights=MagicMock(),
+            finish_request=MagicMock(),
+        )
+        pipeline = SimpleNamespace(_train_window=MagicMock())
+        stats = attach_cpu_stats(speculator, pipeline)
+        speculator.propose(SimpleNamespace(req_ids=["question"]))
+        for rounds in (1, 5):
+            pipeline._train_window(None, SimpleNamespace(rounds=[None] * rounds))
+        speculator.install_committed_weights("question")
+        speculator.finish_request("question")
+
+        self.assertEqual(stats.cpu_train_calls, 2)
+        self.assertEqual(stats.cpu_train_rounds, 6)
+        self.assertEqual(stats.weight_installs, 1)
+        self.assertEqual(stats.active_requests, 0)
+
+    def test_cpu_warmup_is_drained_but_not_counted(self):
+        speculator = SimpleNamespace(
+            propose=MagicMock(),
+            install_committed_weights=MagicMock(),
+            finish_request=MagicMock(),
+        )
+        pipeline = SimpleNamespace(_train_window=MagicMock())
+        stats = attach_cpu_stats(speculator, pipeline)
+        request_id = "chatcmpl-_warmup_run_sh"
+        speculator.propose(SimpleNamespace(req_ids=[request_id]))
+        self.assertEqual(stats.active_requests, 1)
+        pipeline._train_window(None, SimpleNamespace(rounds=[None]))
+        speculator.install_committed_weights(request_id)
+        speculator.finish_request(request_id)
+        self.assertEqual((stats.cpu_train_calls, stats.weight_installs), (0, 0))
+        self.assertEqual(stats.active_requests, 0)
+
+    def test_failed_cpu_training_or_install_is_not_counted(self):
+        speculator = SimpleNamespace(
+            propose=MagicMock(),
+            install_committed_weights=MagicMock(side_effect=RuntimeError("install")),
+            finish_request=MagicMock(),
+        )
+        pipeline = SimpleNamespace(
+            _train_window=MagicMock(side_effect=ValueError("train"))
+        )
+        stats = attach_cpu_stats(speculator, pipeline)
+        speculator.propose(SimpleNamespace(req_ids=["question"]))
+        with self.assertRaises(ValueError):
+            pipeline._train_window(None, SimpleNamespace(rounds=[None]))
+        with self.assertRaises(RuntimeError):
+            speculator.install_committed_weights("question")
+        self.assertEqual((stats.cpu_train_calls, stats.weight_installs), (0, 0))
+
+    def test_gpu_installs_exclude_initial_weight_restoration(self):
+        from methods.utils.gpu_adapter import GpuOnlineEagle3Adapter
+
+        stats = WorkerStats()
+        bridge = SimpleNamespace(
+            stats=stats,
+            maybe_apply_pending_weights=MagicMock(
+                side_effect=[
+                    SimpleNamespace(version=1),
+                    SimpleNamespace(version=0),
+                    None,
+                ]
+            ),
+        )
+        adapter = GpuOnlineEagle3Adapter(None, bridge, depth=2)
+        with patch.object(adapter, "_apply_snapshot"):
+            for _ in range(3):
+                adapter.apply_weights()
+        self.assertEqual(stats.weight_installs, 1)
+
+    def test_gpu_request_is_not_idle_until_final_weights_are_installed(self):
+        from methods.utils.gpu_adapter import GpuOnlineEagle3Adapter
+
+        stats = WorkerStats()
+        stats.begin_request()
+        bridge = SimpleNamespace(
+            stats=stats,
+            reset_request=lambda request_id: stats.end_request(),
+            maybe_apply_pending_weights=lambda: SimpleNamespace(version=1),
+        )
+        adapter = GpuOnlineEagle3Adapter(None, bridge, depth=2)
+        with patch.object(
+            adapter,
+            "_apply_snapshot",
+            side_effect=lambda snapshot: self.assertEqual(stats.pending, 1),
+        ):
+            adapter.reset_request("question")
+        self.assertEqual((stats.pending, stats.active_requests), (0, 0))
+        self.assertEqual(stats.weight_installs, 1)
+
     def test_adapter_ignores_http_warmup_request(self):
         from methods.utils.gpu_adapter import GpuOnlineEagle3Adapter
 

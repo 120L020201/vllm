@@ -196,6 +196,8 @@ class GpuOnlineEagle3Adapter:
         if snapshot is None:
             return
         self._apply_snapshot(snapshot)
+        if snapshot.version > 0:
+            self.bridge.stats.record_weight_install()
         if not self._logged_first_weight_apply:
             logger.info(
                 "applied first online EAGLE3 CUDA snapshot: version=%d",
@@ -236,8 +238,12 @@ class GpuOnlineEagle3Adapter:
         self._num_sampled = None
         self._request_id = None
         self._step_id = 0
-        self.bridge.reset_request(request_id)
-        self.apply_weights()
+        self.bridge.stats.enqueue()
+        try:
+            self.bridge.reset_request(request_id)
+            self.apply_weights()
+        finally:
+            self.bridge.stats.complete(0)
 
     def shutdown(self) -> None:
         self._trace = None

@@ -21,7 +21,7 @@ import regex as re
 
 ResultKey = tuple[str, int]
 ResumeMode = Literal["none", "question", "dataset"]
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
 
 _SPEC_METRIC_KEYS = ("drafts", "draft_tokens", "accepted_tokens")
 _REQUEST_TIMING_METRICS = {
@@ -44,6 +44,9 @@ class BenchmarkSpec:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--method", choices=("base", "eagle3", "online_draft", "tts", "ospec")
+    )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--data-dir", type=Path, required=True)
@@ -348,29 +351,53 @@ def _fetch_spec_metrics(base_url: str) -> dict[str, int] | None:
     return metrics["spec_decode"]
 
 
-def _read_worker_stats(path: Path | None) -> dict[str, int]:
+def _read_worker_stats(path: Path | None) -> dict[str, int] | None:
     if path is None or not path.is_file():
-        return {"active_requests": 0, "updates": 0, "pending": 0}
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return {
-            "active_requests": int(payload.get("active_requests", 0)),
-            "updates": int(payload.get("updates", 0)),
-            "pending": int(payload.get("pending", 0)),
-        }
-    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-        return {"active_requests": 0, "updates": 0, "pending": 0}
+        keys = (
+            "active_requests",
+            "pending",
+            "weight_installs",
+            "cpu_train_calls",
+            "cpu_train_rounds",
+        )
+        stats = {key: payload[key] for key in keys}
+        if any(type(value) is not int or value < 0 for value in stats.values()):
+            return None
+        return stats
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
+        return None
 
 
-def _wait_for_worker(path: Path | None, timeout: float) -> dict[str, int]:
+def _wait_for_worker(path: Path | None, timeout: float) -> dict[str, int] | None:
     deadline = time.monotonic() + timeout
     stats = _read_worker_stats(path)
-    while (
-        stats["pending"] > 0 or stats["active_requests"] > 0
-    ) and time.monotonic() < deadline:
+    while stats is not None and (stats["pending"] > 0 or stats["active_requests"] > 0):
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(0.05)
         stats = _read_worker_stats(path)
     return stats
+
+
+def _training_metrics(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+    method: str | None,
+) -> tuple[int | None, float | None]:
+    if method in ("base", "eagle3"):
+        return 0, None
+    if before is None or after is None:
+        return None, None
+    if any(stats["active_requests"] or stats["pending"] for stats in (before, after)):
+        return None, None
+    keys = ("weight_installs", "cpu_train_calls", "cpu_train_rounds")
+    installs, calls, rounds = (after[key] - before[key] for key in keys)
+    if min(installs, calls, rounds) < 0:
+        return None, None
+    return installs, rounds / calls if calls else None
 
 
 def _acceptance_length(
@@ -811,8 +838,8 @@ def main() -> None:
                     args.max_output_tokens,
                     args.max_prompt_tokens,
                 )
+                worker_before = _wait_for_worker(args.stats_file, args.request_timeout)
                 metrics_before = _fetch_server_metrics(args.base_url)
-                worker_before = _read_worker_stats(args.stats_file)
                 started = time.monotonic()
                 try:
                     response = _request(args, prompt, max_tokens=output_limit)
@@ -820,9 +847,10 @@ def main() -> None:
                 except (urllib.error.HTTPError, urllib.error.URLError) as exc:
                     response = None
                     error = f"{type(exc).__name__}: {exc}"
-                worker_after = _wait_for_worker(
-                    args.stats_file,
-                    args.request_timeout,
+                worker_after = (
+                    _wait_for_worker(args.stats_file, args.request_timeout)
+                    if error is None
+                    else None
                 )
                 metrics_after = _fetch_server_metrics(args.base_url)
                 elapsed = time.monotonic() - started
@@ -848,7 +876,11 @@ def main() -> None:
                 timing = _request_timing_delta(timing_before, timing_after)
                 phase_performance = _phase_performance(response, timing)
                 tokens = int(phase_performance["completion_tokens"] or 0)
-                updates = worker_after["updates"] - worker_before["updates"]
+                weight_installs, cpu_rounds_per_train = _training_metrics(
+                    worker_before,
+                    worker_after,
+                    args.method,
+                )
                 acceptance_length = _acceptance_length(spec_before, spec_after)
                 tokens_per_second = tokens / elapsed if elapsed > 0 else 0.0
                 record_id = record.get("id") or f"{benchmark}-{line_number}"
@@ -865,7 +897,8 @@ def main() -> None:
                     "error": error,
                     "acceptance_length": acceptance_length,
                     "spec_decode": spec_decode,
-                    "updates": updates,
+                    "weight_installs": weight_installs,
+                    "cpu_rounds_per_train": cpu_rounds_per_train,
                     "tokens": tokens,
                     "elapsed_seconds": elapsed,
                     "tokens_per_second": tokens_per_second,
@@ -887,9 +920,19 @@ def main() -> None:
                     phase_performance["decode_seconds"],
                     phase_performance["decode_tokens_per_second"],
                 )
+                installs_log = (
+                    str(weight_installs) if weight_installs is not None else "N/A"
+                )
+                cpu_train_log = (
+                    f"{cpu_rounds_per_train:.2f}"
+                    if cpu_rounds_per_train is not None
+                    else "N/A"
+                )
                 print(
                     f"{record_id}: AL={acceptance_length:.3f}, "
-                    f"updates={updates}, tokens={tokens}, time={elapsed:.1f}s, "
+                    f"weight_installs={installs_log}, "
+                    f"cpu_rounds/train={cpu_train_log}, "
+                    f"tokens={tokens}, time={elapsed:.1f}s, "
                     f"tokens/s={tokens_per_second:.2f}, {prefill_log}, "
                     f"{decode_log}",
                     flush=True,

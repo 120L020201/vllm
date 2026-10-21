@@ -13,6 +13,14 @@ the online callbacks. The built-in `online_draft` path still forces GPU draft
 prefill/decode to eager at runtime, despite the requested graph configuration.
 Chunked prefill and prefix caching are disabled by default.
 
+`online_draft` uses the same native `online_draft.runtime` capture, pinned D2H
+transport, and CPU trainer as `artifacts/scripts/benchmark_aime_2026_online.py`.
+Its defaults also match that script: gradient checks off, weight-update logging
+on, and `OMP_NUM_THREADS=20` with `MKL_NUM_THREADS` following it unless overridden.
+The bootstrap only adds statistics callbacks for this method. The legacy CPU
+policy implementation in `utils/adapter.py`, `utils/bridge.py`, and
+`utils/factory.py` is not installed by any current launcher entry.
+
 ```bash
 .venv/bin/python -m methods.run eagle --port 8000
 .venv/bin/python -m methods.run online_draft --port 8004
@@ -78,7 +86,6 @@ selection. Revisions are pinned so comparisons can be reproduced.
 | `computer_science` | `TIGER-Lab/MMLU-Pro` | `test`, computer science only |
 | `livecodebench_lite` | `livecodebench/code_generation_lite` | `release_v6` |
 | `longbench_v2` | `THUDM/LongBench-v2` | `train` |
-| `longwriter_6k` | `zai-org/LongWriter-6k` | `train` |
 
 ## Run the artifact AIME scripts directly
 
@@ -144,18 +151,27 @@ waits for `/health`, sends every prompt in `BENCHMARKS` to the chat completions
 API, and writes incremental JSONL output. The benchmark files are read as
 `$DATA_DIR/<benchmark>.jsonl`.
 
+Before launching, `run.sh` rejects an occupied `HOST:PORT` without changing
+existing outputs or stopping the old service. Readiness requires the launched
+process to remain alive, a matching listener owned by it or its descendants, and
+a successful `/health` response. Probes time out after two seconds, with a
+300-second startup deadline. Set another `PORT` if needed; `DRY_RUN=1` skips the
+port probe. Wildcard binds use a loopback address for benchmark requests.
+
 Prepare the complete benchmark files with:
 
 ```bash
 HF_ENDPOINT=https://hf-mirror.com \
-  .venv/bin/python experiments/prepare_datasets.py --output-dir /srv/Datasets
+  .venv/bin/python experiments/prepare_datasets.py --output-dir /srv/Datasets \
+  --dataset aime2026 --dataset gpqa_diamond \
+  --dataset mmlu-pro-computer_science --dataset livecodebench-lite \
+  --dataset LongBench-v2
 ```
 
 The command validates the complete official row counts and writes
 `aime2026.jsonl` (30), `gpqa_diamond.jsonl` (198),
-`mmlu-pro-computer_science.jsonl` (410), `livecodebench-lite.jsonl` (1055),
-`LongBench-v2.jsonl` (503), and `LongWriter-6k.jsonl` (6000). It refuses to
-overwrite existing files unless
+`mmlu-pro-computer_science.jsonl` (410), `livecodebench-lite.jsonl` (1055), and
+`LongBench-v2.jsonl` (503). It refuses to overwrite existing files unless
 `--force` is supplied.
 
 To prepare selected datasets and model pairs through one command, use:
@@ -167,12 +183,18 @@ HF_ENDPOINT=https://hf-mirror.com \
 bash experiments/prepare.sh
 ```
 
-`experiments/prepare.sh` defaults to all six complete datasets under
-`/srv/Datasets` and the Qwen3 4B/8B target plus matching EAGLE3 checkpoints
-under `/srv/Models`. Existing complete files and model directories are
-validated and skipped. Use `DATASETS=""` or `MODEL_SIZES=""` to skip either
-class, and `DRY_RUN=1` to inspect the resolved commands. GPQA requires prior
-acceptance of its Hugging Face access terms and an authenticated token.
+`experiments/prepare.sh` downloads nothing by default. Explicitly select datasets
+with `DATASETS` or repeated `--dataset NAME` options, and model pairs with
+`MODEL_SIZES` or repeated `--model-size 4b|8b` options. Unselected classes are
+skipped; an already exported environment variable also counts as a selection.
+CLI options override the corresponding environment variable. Dataset and model
+output directories still default to `/srv/Datasets` and `/srv/Models`.
+Existing complete files and model directories are validated and skipped.
+Use `DRY_RUN=1` to inspect the resolved commands. The Python entry points
+`experiments/prepare_datasets.py` and `experiments/prepare_models.py` also require
+explicit `--dataset` / `--model-size` selections; omitting them downloads nothing.
+GPQA requires prior acceptance of its Hugging Face access terms and an
+authenticated token.
 
 The default benchmark list is:
 
@@ -192,20 +214,29 @@ BENCHMARKS="aime2026(15) gpqa_diamond livecodebench-lite mmlu-pro-computer_scien
 bash experiments/run.sh base
 ```
 
-LongWriter-6k contains 6000 long-generation prompts, so use
-`LongWriter-6k(N)` unless a full run is intentional. For example,
-`LongWriter-6k[10]` runs only its tenth prompt.
-
 After every request the foreground experiment log prints:
 
 ```text
-aime2026-10: AL=2.825, updates=1105, tokens=24987, time=720.8s, tokens/s=34.67, prefill=410 tokens/0.112s/3660.71 tokens/s, decode=24986 tokens/287.400s/86.94 tokens/s
+aime2026-10: AL=2.825, weight_installs=120, cpu_rounds/train=8.25, tokens=24987, time=720.8s, tokens/s=34.67, prefill=410 tokens/0.112s/3660.71 tokens/s, decode=24986 tokens/287.400s/86.94 tokens/s
 ```
 
 `AL` is `1 + accepted draft tokens / speculative rounds`, and is `1.000` for
-the base method. `updates` is the number of completed GPU optimizer steps,
-`tokens` is the completion token count, and time includes synchronous GPU
-updates belonging to the request. Prefill and decode use vLLM's server-side
+the base method. `weight_installs` counts newly trained weight installations into
+the GPU inference draft, excluding initial-weight restoration. It is not an
+optimizer-step count: one OSpec chunk merge counts as one installation.
+`cpu_rounds/train` is the total proposal rounds in successfully trained CPU
+windows divided by the number of those training calls. It excludes warmup and
+untrained trailing rounds, and is `N/A` for GPU training or no completed CPU
+training. The JSONL fields are `weight_installs` and `cpu_rounds_per_train`;
+they replace the old `updates` field. Missing, invalid or incomplete statistics
+produce `N/A` / JSON `null`, not a misleading zero.
+
+These counters work with `LOG_UPDATES=0`. CPU statistics are attached by
+`methods/utils/cpu_stats.py` without modifying vLLM sources or artifacts scripts.
+The launcher exports `OSD_STATS_FILE` for every method. `tokens` is the completion
+token count; time includes the HTTP request, its background cleanup and weight
+installation wait, and the following server-metrics read. Warmup is excluded.
+Prefill and decode use vLLM's server-side
 request phase timers. The decode count excludes the first output token because
 vLLM attributes that token to prefill.
 
