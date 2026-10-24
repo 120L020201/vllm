@@ -93,6 +93,7 @@ def _make_speculator(
     )
 
     speculator = object.__new__(_TestSpeculator)
+    speculator.explicit_input_embeds = False
     speculator.supports_mm_inputs = False
     speculator.vllm_config = None
     speculator.input_buffers = SimpleNamespace(
@@ -151,6 +152,7 @@ def test_mm_support_configured_after_model_load(monkeypatch):
 
 def test_load_model_keeps_mm_support_for_capable_drafter(monkeypatch):
     speculator = object.__new__(_TestSpeculator)
+    speculator.explicit_input_embeds = False
     speculator.supports_mm_inputs = False
     speculator.inputs_embeds = None
     speculator.vllm_config = SimpleNamespace(model_config=object())
@@ -175,6 +177,7 @@ def test_load_model_keeps_mm_support_for_capable_drafter(monkeypatch):
 
 def test_load_model_disables_mm_support_for_text_only_drafter(monkeypatch):
     speculator = object.__new__(_TestSpeculator)
+    speculator.explicit_input_embeds = False
     speculator.supports_mm_inputs = False
     speculator.inputs_embeds = None
     speculator.vllm_config = SimpleNamespace(model_config=object())
@@ -442,3 +445,60 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
+
+
+def test_draft_decode_captures_the_hidden_state_each_step_consumes(monkeypatch):
+    """Online training replays decode step j from its inputs, so the captured
+    hidden must be the one the step read, not its output or a buffer the
+    forward has since updated in place."""
+    hidden_size = 4
+    speculator = object.__new__(_TestSpeculator)
+    speculator.explicit_input_embeds = True
+    speculator.hidden_size = hidden_size
+    speculator.num_speculative_steps = 3
+    speculator.dtype = torch.float32
+    speculator.device = torch.device("cpu")
+    speculator._draft_capture_input_embeds = None
+    speculator._draft_capture_recurrent_hidden_states = None
+    speculator._ensure_draft_capture_buffers(1)
+    speculator._draft_capture_length = 0
+    # _prefill leaves the anchor's output hidden (h4) as the first decode input.
+    speculator.hidden_states = torch.zeros(2, hidden_size)
+    speculator.hidden_states[0] = 4.0
+    # get_proposal_snapshot also returns the draft prefill tensors.
+    speculator.last_prefill_input_embeds = torch.zeros(1, hidden_size)
+    speculator.last_prefill_positions = torch.tensor([4])
+    speculator.last_prefill_length = torch.tensor(1)
+    speculator.idx_mapping = torch.zeros(1, dtype=torch.long)
+    speculator.input_buffers = SimpleNamespace(positions=torch.tensor([5]))
+    speculator._prepare_eplb_forward = lambda num_tokens: None
+    speculator.current_draft_step = torch.tensor(1)
+    speculator.temperature = speculator.seeds = speculator.draft_logits = None
+    speculator.draft_tokens = torch.zeros(1, 3, dtype=torch.long)
+    speculator.max_model_len = 64
+    speculator.sample_draft = lambda *args: torch.zeros(1, dtype=torch.long)
+
+    outputs = iter([5.0, 6.0])
+
+    def run_model(*args, **kwargs):
+        value = next(outputs)
+        speculator.last_input_embeds = torch.full((1, hidden_size), -value)
+        # Fused add-RMSNorm updates the first layer's residual in place.
+        speculator.hidden_states[:1].add_(100.0)
+        output = torch.full((1, hidden_size), value)
+        return output, output
+
+    def update_draft_inputs(
+        draft_tokens, step, hidden, tokens, next_hidden, *args, **kwargs
+    ):
+        next_hidden[:1].copy_(hidden[:1])
+
+    speculator._run_model = run_model
+    monkeypatch.setattr(spec_module, "update_draft_inputs", update_draft_inputs)
+
+    for _ in range(2):
+        speculator._generate_draft(1, 1, None, None, None)
+
+    snapshot = speculator.get_proposal_snapshot()
+    assert snapshot.draft_recurrent_hidden_states[:, 0].tolist() == [4.0, 5.0]
+    assert snapshot.draft_token_input_embeds[:, 0].tolist() == [-5.0, -6.0]
