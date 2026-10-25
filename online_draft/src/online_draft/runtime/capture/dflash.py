@@ -19,7 +19,7 @@ from online_draft.runtime.capture.base import (
 from online_draft.runtime.contracts import PreparedRound
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.runtime.transport import PinnedStaging
-from online_draft.training.dflash.window import DFlashBatch
+from online_draft.training.dflash.batch import DFlashBatch
 
 
 class DFlashCaptureBuffers(CaptureBuffers):

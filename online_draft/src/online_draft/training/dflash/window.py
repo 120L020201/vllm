@@ -4,24 +4,11 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from online_draft.models.qwen3_dflash import ContextKV, Qwen3DFlashForCausalLM
 from online_draft.runtime import profile_range
+from online_draft.training.dflash.batch import DFlashBatch
+from online_draft.training.dflash.distill import dflash_kl_loss, position_weights
 from online_draft.training.trainer import DraftTrainer
-
-
-@dataclass(frozen=True)
-class DFlashBatch:
-    input_ids: torch.Tensor
-    positions: torch.Tensor
-    prompt_fc: torch.Tensor | None
-    confirmed_fc: torch.Tensor
-    teacher_probabilities: torch.Tensor
-    rejection_position: int | None
-
-    @property
-    def anchor(self) -> int:
-        return int(self.positions[0])
 
 
 @dataclass(frozen=True)
@@ -44,22 +31,6 @@ class DFlashWindowResult:
     persistent_cache_length: int
 
 
-def position_weights(rounds: tuple[DFlashBatch, ...], gamma: float = 7.0):
-    """DFlash Eq. 4: first predicted position has weight one in every block."""
-    offsets = torch.cat(
-        [torch.arange(len(batch.teacher_probabilities)) for batch in rounds]
-    )
-    return torch.exp(-offsets.float() / gamma)
-
-
-def dflash_kl_loss(logits, teacher, weights):
-    """Forward KL at T=1, normalized by the supervised position weights."""
-    per_position = F.kl_div(
-        F.log_softmax(logits.float(), dim=-1), teacher.detach(), reduction="none"
-    ).sum(dim=-1)
-    return (per_position * weights).sum() / weights.sum()
-
-
 def append_context(prefix: ContextKV | None, suffix: ContextKV) -> ContextKV:
     if prefix is None:
         return suffix
@@ -67,6 +38,11 @@ def append_context(prefix: ContextKV | None, suffix: ContextKV) -> ContextKV:
         (torch.cat((pk, sk), dim=1), torch.cat((pv, sv), dim=1))
         for (pk, pv), (sk, sv) in zip(prefix, suffix, strict=True)
     )
+
+
+def _first_query_round(rounds: tuple[DFlashBatch, ...], max_train_rounds: int) -> int:
+    """Rounds before this index only contribute context, not query blocks."""
+    return max(0, len(rounds) - max_train_rounds) if max_train_rounds else 0
 
 
 def forward_dflash_window(
@@ -83,19 +59,20 @@ def forward_dflash_window(
     anchors, block_ids = [], []
     context_length = old_length
     query_length = 0
-    first_query = max(0, len(rounds) - max_train_rounds) if max_train_rounds else 0
+    first_query = _first_query_round(rounds, max_train_rounds)
     for index, batch in enumerate(rounds):
         features = batch.prompt_fc if index == 0 else rounds[index - 1].confirmed_fc
         if features is not None:
             context_length += features.shape[0]
             new_features.append(features)
-        assert context_length == batch.anchor
+        if context_length != batch.anchor:
+            raise ValueError("each DFlash round must start where its context ends")
         if index < first_query:
             continue
         query_count = batch.input_ids.numel()
         anchors.extend([batch.anchor] * query_count)
         block_ids.extend([index] * query_count)
-        count = batch.teacher_probabilities.shape[0]
+        count = batch.target_count
         selected_rows.append(torch.arange(query_length + 1, query_length + count + 1))
         query_length += query_count
         teachers.append(batch.teacher_probabilities)
@@ -107,7 +84,8 @@ def forward_dflash_window(
                 torch.cat(new_features), torch.arange(old_length, context_length)
             ),
         )
-    assert context is not None
+    if context is None:
+        raise ValueError("DFlash training needs context before the first anchor")
     blocks = torch.tensor(block_ids)
     attention_mask = torch.cat(
         (
@@ -141,15 +119,24 @@ def train_dflash_window(
     loss_decay_gamma: float = 7.0,
 ) -> tuple[DFlashCache, DFlashWindowResult]:
     """Train recent complete blocks; append all confirmed target context KV."""
-    model: Qwen3DFlashForCausalLM = trainer.model
+    model = trainer.model
+    if not isinstance(model, Qwen3DFlashForCausalLM):
+        raise TypeError("DFlash training requires Qwen3DFlashForCausalLM")
+    for batch in rounds:
+        batch.validate(
+            hidden_size=model.config.hidden_size,
+            vocab_size=model.config.vocab_size,
+            feature_dtype=model.model.fc.weight.dtype,
+        )
+
     old_length = 0 if cache is None else cache.length
+    selected = rounds[_first_query_round(rounds, max_train_rounds) :]
     with torch.inference_mode(False), torch.enable_grad():
         with profile_range("online_draft.forward", profile_timeline):
             logits, teacher = forward_dflash_window(
                 model, rounds, cache, max_train_rounds
             )
         with profile_range("online_draft.loss", profile_timeline):
-            selected = rounds[-max_train_rounds:] if max_train_rounds else rounds
             loss = dflash_kl_loss(
                 logits, teacher, position_weights(selected, loss_decay_gamma)
             )
@@ -177,6 +164,6 @@ def train_dflash_window(
         model_version=trainer.version,
         loss=loss_value,
         round_count=len(selected),
-        target_count=sum(batch.teacher_probabilities.shape[0] for batch in selected),
+        target_count=sum(batch.target_count for batch in selected),
         persistent_cache_length=end,
     )

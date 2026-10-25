@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from dataclasses import replace
+
 import pytest
 import torch
 from online_draft.models.cpu_attention import (
@@ -13,12 +15,11 @@ from online_draft.models.qwen3_dflash import (
     Qwen3DFlashConfig,
     Qwen3DFlashForCausalLM,
 )
+from online_draft.training.dflash.batch import DFlashBatch
+from online_draft.training.dflash.distill import dflash_kl_loss, position_weights
 from online_draft.training.dflash.window import (
-    DFlashBatch,
     append_context,
-    dflash_kl_loss,
     forward_dflash_window,
-    position_weights,
     train_dflash_window,
 )
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
@@ -326,3 +327,31 @@ def test_training_fewer_blocks_preserves_context_and_gradient_boundary():
     assert result.target_count == 3
     assert cache.length == 12
     assert cache.segments == ((12, 1),)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"positions": torch.arange(6, 10)}, "prompt_fc must cover"),
+        ({"positions": torch.tensor([5, 6, 8, 9])}, "contiguous from the anchor"),
+        ({"teacher_probabilities": torch.ones(3, 23) / 23}, "teacher_probabilities"),
+        ({"rejection_position": None}, "rejection_position"),
+        ({"confirmed_fc": torch.randn(2, 8).bfloat16()}, "confirmed_fc must use"),
+    ],
+)
+def test_batch_validation_rejects_inconsistent_rounds(change, message):
+    """Malformed rounds fail before they can silently change supervision."""
+    batch = make_batch(5, 1, prompt=True)
+    batch.validate(hidden_size=8, vocab_size=23, feature_dtype=torch.float32)
+    with pytest.raises(ValueError, match=message):
+        replace(batch, **change).validate(
+            hidden_size=8, vocab_size=23, feature_dtype=torch.float32
+        )
+
+
+def test_window_rejects_rounds_that_skip_context():
+    model = tiny_model()
+    trainer = DraftTrainer(model)
+    rounds = (make_batch(5, 1, prompt=True), make_batch(8, 0))
+    with pytest.raises(ValueError, match="start where its context ends"):
+        train_dflash_window(trainer, rounds, None)
