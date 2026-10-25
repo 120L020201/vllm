@@ -7,7 +7,10 @@ from unittest.mock import Mock
 import pytest
 
 import vllm.v1.worker.gpu_worker as gpu_worker
-from vllm.v1.worker.gpu.online_draft import OnlineDraftRuntime
+from vllm.v1.worker.gpu.online_draft import (
+    OnlineDraftRuntime,
+    _validate_online_draft_config,
+)
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -106,3 +109,49 @@ def test_finish_uses_initial_weights_only_after_capture_is_enabled() -> None:
     speculator.capture_adapter = runtime.capture_adapter
     runtime.finish_requests({"request-0"})
     speculator.finish_request.assert_called_once_with("request-0", initial_weights)
+
+
+def _online_config(method: str, **overrides) -> SimpleNamespace:
+    settings = {
+        "max_num_seqs": 1,
+        "enable_prefix_caching": False,
+        "model_type": "qwen3",
+        **overrides,
+    }
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(method=method),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, pipeline_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=settings["max_num_seqs"], enable_chunked_prefill=True
+        ),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=settings["enable_prefix_caching"]
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=settings["model_type"])
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "name"),
+    [("eagle3", "EAGLE3"), ("dflash", "DFlash")],
+)
+def test_online_draft_config_lists_unmet_requirements(method, name) -> None:
+    """Both methods accept chunked prefill but need one contiguous request."""
+    speculator = SimpleNamespace(_speculator_name="DFlash")
+    _validate_online_draft_config(_online_config(method), speculator)
+
+    config = _online_config(method, max_num_seqs=2, enable_prefix_caching=True)
+    with pytest.raises(
+        ValueError,
+        match=f"online {name} requires max_num_seqs=1, enable_prefix_caching=False",
+    ):
+        _validate_online_draft_config(config, speculator)
+
+
+def test_online_eagle3_rejects_other_speculative_methods() -> None:
+    with pytest.raises(ValueError, match="online EAGLE3 requires method=eagle3"):
+        _validate_online_draft_config(_online_config("eagle"), Mock())

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -16,21 +16,49 @@ from online_draft.runtime.contracts import CapturePacket
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 
 
-def copy_to_cpu(
-    tensor: torch.Tensor,
-    *,
-    non_blocking: bool,
-) -> torch.Tensor:
-    cpu_tensor = torch.empty_like(
-        tensor,
-        device="cpu",
-        pin_memory=non_blocking,
-    )
-    cpu_tensor.copy_(
-        tensor.detach(),
-        non_blocking=non_blocking,
-    )
-    return cpu_tensor
+class PinnedStaging:
+    """Pinned D2H destinations reused by the serial capture worker.
+
+    Each copy overwrites the previous one for the same name, so the capture
+    queue must consume one packet per transfer, and consumers must clone
+    whatever they keep beyond that packet.
+    """
+
+    def __init__(
+        self,
+        layouts: Mapping[str, tuple[tuple[int, ...], torch.dtype]],
+    ) -> None:
+        with torch.inference_mode(False):
+            self.tensors = {
+                name: torch.empty(
+                    shape,
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=torch.cuda.is_available(),
+                )
+                for name, (shape, dtype) in layouts.items()
+            }
+
+    def copy(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        non_blocking: bool,
+    ) -> torch.Tensor:
+        storage = self.tensors[name]
+        if tensor.dtype != storage.dtype:
+            raise ValueError(
+                f"{name} uses {tensor.dtype}, but staging stores {storage.dtype}"
+            )
+        if tensor.numel() > storage.numel():
+            raise ValueError(
+                f"{name} has {tensor.numel()} elements, "
+                f"but staging holds {storage.numel()}"
+            )
+
+        destination = storage.view(-1)[: tensor.numel()].view(tensor.shape)
+        destination.copy_(tensor.detach(), non_blocking=non_blocking)
+        return destination
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,27 +73,22 @@ class _CloseEpoch:
 
 
 class CaptureQueue:
-    """Transfer GPU packet chunks to the CPU worker in FIFO order."""
+    """Transfer GPU packets to the CPU worker one at a time in FIFO order.
+
+    One packet per transfer lets packets reuse a single pinned staging area.
+    """
 
     def __init__(
         self,
         *,
-        transfer_chunk_size: int,
-        consume_chunk: Callable[
-            [tuple[CapturePacket, ...]],
-            None,
-        ],
+        consume: Callable[[CapturePacket], None],
         on_finish: Callable[[str], None],
         on_close_epoch: Callable[[str], None],
         on_queue_size: Callable[[int], None] | None = None,
         profile_timeline: bool = False,
         cpu_config: CPUWorkerConfig | None = None,
     ) -> None:
-        if transfer_chunk_size <= 0:
-            raise ValueError("transfer_chunk_size must be positive")
-
-        self._transfer_chunk_size = transfer_chunk_size
-        self._consume_chunk = consume_chunk
+        self._consume = consume
         self._on_finish = on_finish
         self._on_close_epoch = on_close_epoch
         self._on_queue_size = on_queue_size
@@ -123,45 +146,29 @@ class CaptureQueue:
             raise error
 
     def _run(self) -> None:
-        chunk: list[CapturePacket] = []
         active_request_id: str | None = None
         d2h_stream: torch.cuda.Stream | None = None
 
-        def consume_chunk() -> None:
+        def consume(packet: CapturePacket) -> None:
             nonlocal d2h_stream
 
-            if not chunk:
-                return
-
-            name = f"online_draft.d2h[rounds={len(chunk)}]"
-            with profile_range(name, self._profile_timeline):
-                if chunk[0].ready is None:
-                    cpu_chunk = tuple(packet.to_cpu() for packet in chunk)
+            with profile_range("online_draft.d2h", self._profile_timeline):
+                if packet.ready is None:
+                    cpu_packet = packet.to_cpu()
                 else:
                     if d2h_stream is None:
-                        d2h_stream = torch.cuda.Stream(
-                            device=chunk[0].device,
-                        )
+                        d2h_stream = torch.cuda.Stream(device=packet.device)
 
-                    cpu_packets: list[CapturePacket] = []
                     with torch.cuda.stream(d2h_stream):
-                        for packet in chunk:
-                            assert packet.ready is not None
-                            d2h_stream.wait_event(packet.ready)
-                            cpu_packets.append(
-                                packet.to_cpu(non_blocking=True),
-                            )
-
+                        d2h_stream.wait_event(packet.ready)
+                        cpu_packet = packet.to_cpu(non_blocking=True)
                         copy_done = torch.cuda.Event()
                         copy_done.record(d2h_stream)
 
                     copy_done.synchronize()
-                    cpu_chunk = tuple(cpu_packets)
 
-            name = f"online_draft.prepare[rounds={len(cpu_chunk)}]"
-            with profile_range(name, self._profile_timeline):
-                self._consume_chunk(cpu_chunk)
-            chunk.clear()
+            with profile_range("online_draft.prepare", self._profile_timeline):
+                self._consume(cpu_packet)
 
         while True:
             item = self._queue.get()
@@ -183,7 +190,6 @@ class CaptureQueue:
                             "finished request does not match active request"
                         )
 
-                    chunk.clear()
                     self._on_finish(item.request_id)
                     active_request_id = None
                     continue
@@ -195,7 +201,6 @@ class CaptureQueue:
                     if active_request_id != item.request_id:
                         raise RuntimeError("closed epoch does not match active request")
 
-                    consume_chunk()
                     self._on_close_epoch(item.request_id)
                     continue
 
@@ -208,12 +213,8 @@ class CaptureQueue:
                         "capture queue received multiple active requests"
                     )
 
-                chunk.append(packet)
-
-                if len(chunk) == self._transfer_chunk_size:
-                    consume_chunk()
+                consume(packet)
             except Exception as error:
-                chunk.clear()
                 self._set_error(error)
             finally:
                 if isinstance(item, _FinishRequest):

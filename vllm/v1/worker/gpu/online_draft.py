@@ -9,12 +9,12 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from online_draft.models import (
-    load_qwen3_eagle3_checkpoint,
-    validate_qwen3_eagle3_weights,
-)
+from online_draft.models import load_qwen3_eagle3_from_vllm
 from online_draft.runtime.async_pipeline import AsyncDraftPipeline
-from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
+from online_draft.runtime.capture.eagle3 import (
+    Eagle3CaptureAdapter,
+    Eagle3CaptureBuffers,
+)
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.training.eagle3.window import train_eagle3_rounds
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
@@ -63,6 +63,35 @@ class OnlineDraftRuntime:
         self.pipeline.close()
 
 
+def _validate_online_draft_config(vllm_config: VllmConfig, speculator: Any) -> None:
+    """Reject configs that break one request's contiguous capture history."""
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    parallel_config = vllm_config.parallel_config
+
+    if speculative_config.method == "dflash":
+        name = "DFlash"
+        supported_method = speculator._speculator_name == "DFlash"
+    else:
+        name = "EAGLE3"
+        supported_method = speculative_config.method == "eagle3"
+
+    requirements = {
+        f"method={name.lower()}": supported_method,
+        "tensor_parallel_size=1": parallel_config.tensor_parallel_size == 1,
+        "pipeline_parallel_size=1": parallel_config.pipeline_parallel_size == 1,
+        "max_num_seqs=1": vllm_config.scheduler_config.max_num_seqs == 1,
+        "enable_prefix_caching=False": (
+            not vllm_config.cache_config.enable_prefix_caching
+        ),
+        "qwen3 target": vllm_config.model_config.hf_config.model_type == "qwen3",
+    }
+
+    unmet = [requirement for requirement, ok in requirements.items() if not ok]
+    if unmet:
+        raise ValueError(f"online {name} requires {', '.join(unmet)}")
+
+
 def create_online_draft(
     vllm_config: VllmConfig,
     model_runner: GPUModelRunner,
@@ -71,9 +100,6 @@ def create_online_draft(
     """Build the CPU training pipeline and connect it to the loaded speculator."""
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
-
-    draft_model_config = speculative_config.draft_model_config
-    assert draft_model_config is not None
 
     gpu_draft_model = model_runner.get_draft_model()
     assert gpu_draft_model is not None
@@ -95,6 +121,7 @@ def create_online_draft(
     assert speculator is not None
 
     is_dflash = speculative_config.method == "dflash"
+    _validate_online_draft_config(vllm_config, speculator)
     if is_dflash:
         from online_draft.models.qwen3_dflash import load_qwen3_dflash_from_vllm
         from online_draft.runtime.capture.dflash import (
@@ -107,42 +134,34 @@ def create_online_draft(
             DFlashSpeculator,
         )
 
-        if (
-            vllm_config.parallel_config.tensor_parallel_size != 1
-            or vllm_config.parallel_config.pipeline_parallel_size != 1
-            or vllm_config.scheduler_config.max_num_seqs != 1
-            or vllm_config.cache_config.enable_prefix_caching
-            or speculator._speculator_name != "DFlash"
-            or vllm_config.model_config.hf_config.model_type != "qwen3"
-        ):
-            raise ValueError(
-                "online DFlash requires one GPU/request and prefix caching disabled"
-            )
         cpu_model = load_qwen3_dflash_from_vllm(
             gpu_draft_model,
             grouped_query_attention=online_config.get("grouped_query_attention", False),
             selective_last_layer=online_config.get("selective_last_layer", False),
         )
     else:
-        cpu_model = load_qwen3_eagle3_checkpoint(
-            draft_model_config.model,
-            dtype=vllm_config.model_config.dtype,
+        cpu_model = load_qwen3_eagle3_from_vllm(
+            gpu_draft_model,
             attention_backend=online_config.get("attention_backend"),
         )
-        validate_qwen3_eagle3_weights(cpu_model, gpu_draft_model.state_dict())
 
     trainer = DraftTrainer(
         cpu_model,
         TrainerConfig(
             learning_rate=online_config.get("learning_rate", 1e-5),
-            fused=online_config.get("fused_optimizer", is_dflash),
+            fused=online_config.get("fused_optimizer", True),
             frozen_parameter_prefixes=tuple(
                 online_config.get("frozen_parameter_prefixes", ())
             ),
-            check_gradients=online_config.get("check_gradients", True),
+            check_gradients=online_config.get("check_gradients", False),
             master_weights=online_config.get("master_weights", False),
         ),
     )
+
+    if is_dflash:
+        assert not any(
+            name.startswith("model.fc.") for name in trainer.trainable_parameter_names
+        ), "online DFlash captures FC output and installs weights after FC"
 
     assert isinstance(speculator, DFlashSpeculator if is_dflash else EagleSpeculator)
 
@@ -194,6 +213,7 @@ def create_online_draft(
                 teacher_dtype=vllm_config.model_config.head_dtype
                 or vllm_config.model_config.dtype,
             ),
+            source_weight_version=lambda: installer.active_version,
             on_round=pipeline.submit_round,
             on_epoch_close=pipeline.close_epoch,
             on_finish=pipeline.finish_request,
@@ -202,14 +222,24 @@ def create_online_draft(
             cpu_config=cpu_configs["capture"],
         )
     else:
+        draft_config = cpu_model.config
         adapter = Eagle3CaptureAdapter(
+            buffers=Eagle3CaptureBuffers(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                speculative_config.num_speculative_tokens,
+                draft_config.hidden_size,
+                draft_config.num_aux_hidden_states,
+                draft_config.draft_vocab_size,
+                dtype=vllm_config.model_config.dtype,
+                teacher_dtype=vllm_config.model_config.head_dtype
+                or vllm_config.model_config.dtype,
+            ),
             target_token_ids=cpu_model.get_target_token_ids().to(device),
             source_weight_version=lambda: installer.active_version,
-            hidden_size=cpu_model.config.hidden_size,
-            num_aux_hidden_states=cpu_model.config.num_aux_hidden_states,
-            draft_vocab_size=cpu_model.config.draft_vocab_size,
+            hidden_size=draft_config.hidden_size,
+            num_aux_hidden_states=draft_config.num_aux_hidden_states,
+            draft_vocab_size=draft_config.draft_vocab_size,
             feature_dtype=vllm_config.model_config.dtype,
-            transfer_chunk_size=1,
             on_round=pipeline.submit_round,
             on_epoch_close=pipeline.close_epoch,
             on_finish=pipeline.finish_request,

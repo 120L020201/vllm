@@ -1,42 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from typing import Protocol
 
 import torch
-import torch.nn as nn
-from online_draft.runtime.capture.eagle3 import Eagle3CaptureAdapter
+from online_draft.runtime.contracts import CaptureAdapter
 from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.spec_decode.weight_slots import DraftWeightSlots
 
 logger = init_logger(__name__)
 
 
-class Eagle3OnlineState:
-    """Own EAGLE3 weight installation and request lifecycle state."""
+class OnlineWeightSlots(Protocol):
+    """Two GPU parameter slots that a draft model can bind."""
+
+    @property
+    def slots(
+        self,
+    ) -> tuple[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor]]: ...
+
+    @property
+    def owned_names(self) -> tuple[str, ...]: ...
+
+    def bind(self, weights: Mapping[str, torch.Tensor]) -> None: ...
+
+
+class DraftOnlineState:
+    """Own draft weight installation and request lifecycle state."""
 
     def __init__(
         self,
-        target_model: nn.Module,
-        draft_model: nn.Module,
-        mutable_names: Iterable[str],
+        slots: OnlineWeightSlots,
         *,
+        prepare_slot: Callable[[int, Mapping[str, torch.Tensor]], None] | None = None,
         profile_timeline: bool,
         log_updates: bool,
     ) -> None:
-        self.slots = DraftWeightSlots.from_models(
-            target_model, draft_model, mutable_names
-        )
+        self.slots = slots
         self.installer = DraftWeightInstaller(
-            slots=self.slots.slots,
-            mutable_names=self.slots.owned_names,
+            slots=slots.slots,
+            mutable_names=slots.owned_names,
+            prepare_slot=prepare_slot,
             profile_timeline=profile_timeline,
         )
-        self.adapter: Eagle3CaptureAdapter
+        self.adapter: CaptureAdapter
         self.poll_snapshot: Callable[[], DraftWeightSnapshot | None]
         self.log_updates = log_updates
+        self.finished_request: dict | None = None
         self._last_installed_round = 0
 
     def advance(self) -> int | None:
@@ -66,6 +78,11 @@ class Eagle3OnlineState:
         request_id: str,
         initial_weights: Iterable[tuple[str, torch.Tensor]],
     ) -> None:
+        self.finished_request = {
+            "request_id": request_id,
+            "gpu_version": self.installer.active_version,
+            "completed_rounds": self.adapter.completed_rounds,
+        }
         self.adapter.finish_request(request_id)
         self.installer.reset(initial_weights)
         self.slots.bind(self.installer.active_weights)

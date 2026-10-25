@@ -49,45 +49,6 @@ def project_teacher_distribution(
     return teacher_probabilities.detach(), coverage.detach()
 
 
-def forward_kl_loss(
-    student_logits: torch.Tensor,
-    teacher_probabilities: torch.Tensor,
-    rejection_position: int | None,
-) -> torch.Tensor:
-    """Compute rejection-weighted forward KL.
-
-    Args:
-        student_logits: Draft logits shaped [draft_length, draft_vocab_size].
-        teacher_probabilities: Teacher probabilities with the same shape.
-        rejection_position: Zero-based rejected draft position, or None when
-            every draft token was accepted.
-
-    Returns:
-        A scalar FP32 forward-KL loss.
-
-    Raises:
-        TypeError: If rejection_position is not an integer or None.
-        ValueError: If inputs or rejection_position are invalid.
-    """
-    _validate_distillation_inputs(
-        student_logits,
-        teacher_probabilities,
-    )
-
-    draft_length = student_logits.shape[0]
-    position_weights = _make_position_weights(
-        draft_length=draft_length,
-        rejection_position=rejection_position,
-        device=student_logits.device,
-    )
-
-    return _compute_weighted_forward_kl(
-        student_logits=student_logits,
-        teacher_probabilities=teacher_probabilities,
-        position_weights=position_weights,
-    )
-
-
 def window_forward_kl_loss(
     student_logits: torch.Tensor,
     teacher_probabilities: torch.Tensor,
@@ -203,31 +164,6 @@ def _compute_weighted_forward_kl(
         raise ValueError("distillation loss must be finite")
 
     return loss
-
-
-def _make_position_weights(
-    draft_length: int,
-    rejection_position: int | None,
-    device: torch.device,
-) -> torch.Tensor:
-    if rejection_position is not None:
-        if isinstance(rejection_position, bool) or not isinstance(
-            rejection_position, int
-        ):
-            raise TypeError("rejection_position must be an integer or None")
-        if not 0 <= rejection_position < draft_length:
-            raise ValueError("rejection_position must be within the draft sequence")
-
-    rejection_target_mask = torch.zeros(
-        (draft_length,),
-        dtype=torch.bool,
-        device=device,
-    )
-
-    if rejection_position is not None:
-        rejection_target_mask[rejection_position] = True
-
-    return _make_masked_position_weights(rejection_target_mask)
 
 
 def _make_masked_position_weights(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
@@ -32,3 +33,26 @@ class CapturePacket(Protocol):
     def device(self) -> torch.device: ...
 
     def to_cpu(self, *, non_blocking: bool = False) -> Self: ...
+
+
+class CaptureAdapter(Protocol):
+    """Inference-thread capture interface shared by online draft methods.
+
+    capture_target and capture_proposal take model-specific tensors.
+    """
+
+    capture_target: Callable[..., None]
+    capture_proposal: Callable[..., None]
+
+    @property
+    def completed_rounds(self) -> int: ...
+
+    def capture_teacher_logits(self, logits: torch.Tensor) -> None: ...
+
+    def close_epoch(self, request_id: str) -> None: ...
+
+    def finish_request(self, request_id: str) -> None: ...
+
+    def raise_if_failed(self) -> None: ...
+
+    def close(self) -> None: ...

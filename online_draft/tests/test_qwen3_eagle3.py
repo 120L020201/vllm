@@ -11,7 +11,6 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3ForCausalLM,
     convert_angelslim_eagle3_state_dict,
     load_qwen3_eagle3_checkpoint,
-    validate_qwen3_eagle3_weights,
 )
 from safetensors.torch import save_file
 
@@ -29,67 +28,6 @@ def _make_config() -> Qwen3Eagle3Config:
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
     )
-
-
-def _make_source_state_dict() -> dict[str, torch.Tensor]:
-    return {
-        "d2t": torch.tensor([0, 1, 2, 3, 4, 4]),
-        "t2d": torch.zeros(10, dtype=torch.bool),
-        "midlayer.self_attn.q_proj.weight": torch.randn(4, 8),
-        "midlayer.self_attn.k_proj.weight": torch.randn(2, 8),
-        "midlayer.self_attn.v_proj.weight": torch.randn(2, 8),
-        "midlayer.self_attn.o_proj.weight": torch.randn(4, 4),
-        "midlayer.mlp.gate_proj.weight": torch.randn(8, 4),
-        "midlayer.mlp.up_proj.weight": torch.randn(8, 4),
-        "midlayer.mlp.down_proj.weight": torch.randn(4, 8),
-        "midlayer.hidden_norm.weight": torch.randn(4),
-        "midlayer.input_layernorm.weight": torch.randn(4),
-        "midlayer.post_attention_layernorm.weight": torch.randn(4),
-        "norm.weight": torch.randn(4),
-        "fc.weight": torch.randn(4, 12),
-        "lm_head.weight": torch.randn(6, 4),
-    }
-
-
-def test_config_from_dict() -> None:
-    config = Qwen3Eagle3Config.from_dict(
-        {
-            "hidden_size": 4096,
-            "intermediate_size": 12288,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8,
-            "num_hidden_layers": 1,
-            "vocab_size": 151936,
-            "draft_vocab_size": 32000,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 1000000.0,
-        }
-    )
-
-    assert config.hidden_size == 4096
-    assert config.head_dim == 128
-    assert config.num_aux_hidden_states == 3
-    assert config.target_vocab_size == 151936
-    assert config.draft_vocab_size == 32000
-    assert config.attention_backend is Eagle3AttentionBackend.EAGER
-
-
-def test_config_parses_flash_attention_backend() -> None:
-    config = Qwen3Eagle3Config.from_dict(
-        {
-            "hidden_size": 4,
-            "intermediate_size": 8,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 2,
-            "num_hidden_layers": 1,
-            "vocab_size": 10,
-            "draft_vocab_size": 6,
-            "attention_backend": "flash_attention",
-        }
-    )
-
-    assert config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
 
 
 def test_attention_supports_query_width_different_from_hidden_size() -> None:
@@ -115,41 +53,6 @@ def test_attention_supports_query_width_different_from_hidden_size() -> None:
         hidden_states=torch.randn(2, 4),
     )
     assert output.hidden_states.shape == (2, 4)
-
-
-def test_checkpoint_conversion() -> None:
-    source = _make_source_state_dict()
-    converted = convert_angelslim_eagle3_state_dict(source)
-    model = Qwen3Eagle3ForCausalLM(_make_config())
-
-    assert set(converted) == set(model.state_dict())
-
-    expected_qkv = torch.cat(
-        (
-            source["midlayer.self_attn.q_proj.weight"],
-            source["midlayer.self_attn.k_proj.weight"],
-            source["midlayer.self_attn.v_proj.weight"],
-        ),
-        dim=0,
-    )
-    expected_gate_up = torch.cat(
-        (
-            source["midlayer.mlp.gate_proj.weight"],
-            source["midlayer.mlp.up_proj.weight"],
-        ),
-        dim=0,
-    )
-
-    torch.testing.assert_close(
-        converted["model.layers.0.self_attn.qkv_proj.weight"],
-        expected_qkv,
-    )
-    torch.testing.assert_close(
-        converted["model.layers.0.mlp.gate_up_proj.weight"],
-        expected_gate_up,
-    )
-
-    model.load_state_dict(converted, strict=True)
 
 
 def test_cached_forward_matches_full_forward() -> None:
@@ -301,6 +204,102 @@ def test_bfloat16_training_step() -> None:
         assert state["step"].dtype == torch.float32
 
 
+def _make_source_state_dict() -> dict[str, torch.Tensor]:
+    return {
+        "d2t": torch.tensor([0, 1, 2, 3, 4, 4]),
+        "t2d": torch.zeros(10, dtype=torch.bool),
+        "midlayer.self_attn.q_proj.weight": torch.randn(4, 8),
+        "midlayer.self_attn.k_proj.weight": torch.randn(2, 8),
+        "midlayer.self_attn.v_proj.weight": torch.randn(2, 8),
+        "midlayer.self_attn.o_proj.weight": torch.randn(4, 4),
+        "midlayer.mlp.gate_proj.weight": torch.randn(8, 4),
+        "midlayer.mlp.up_proj.weight": torch.randn(8, 4),
+        "midlayer.mlp.down_proj.weight": torch.randn(4, 8),
+        "midlayer.hidden_norm.weight": torch.randn(4),
+        "midlayer.input_layernorm.weight": torch.randn(4),
+        "midlayer.post_attention_layernorm.weight": torch.randn(4),
+        "norm.weight": torch.randn(4),
+        "fc.weight": torch.randn(4, 12),
+        "lm_head.weight": torch.randn(6, 4),
+    }
+
+
+def test_config_from_dict() -> None:
+    config = Qwen3Eagle3Config.from_dict(
+        {
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 1,
+            "vocab_size": 151936,
+            "draft_vocab_size": 32000,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+        }
+    )
+
+    assert config.hidden_size == 4096
+    assert config.head_dim == 128
+    assert config.num_aux_hidden_states == 3
+    assert config.target_vocab_size == 151936
+    assert config.draft_vocab_size == 32000
+    assert config.attention_backend is Eagle3AttentionBackend.EAGER
+
+
+def test_config_parses_flash_attention_backend() -> None:
+    config = Qwen3Eagle3Config.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 2,
+            "num_hidden_layers": 1,
+            "vocab_size": 10,
+            "draft_vocab_size": 6,
+            "attention_backend": "flash_attention",
+        }
+    )
+
+    assert config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
+
+
+def test_checkpoint_conversion() -> None:
+    source = _make_source_state_dict()
+    converted = convert_angelslim_eagle3_state_dict(source)
+    model = Qwen3Eagle3ForCausalLM(_make_config())
+
+    assert set(converted) == set(model.state_dict())
+
+    expected_qkv = torch.cat(
+        (
+            source["midlayer.self_attn.q_proj.weight"],
+            source["midlayer.self_attn.k_proj.weight"],
+            source["midlayer.self_attn.v_proj.weight"],
+        ),
+        dim=0,
+    )
+    expected_gate_up = torch.cat(
+        (
+            source["midlayer.mlp.gate_proj.weight"],
+            source["midlayer.mlp.up_proj.weight"],
+        ),
+        dim=0,
+    )
+
+    torch.testing.assert_close(
+        converted["model.layers.0.self_attn.qkv_proj.weight"],
+        expected_qkv,
+    )
+    torch.testing.assert_close(
+        converted["model.layers.0.mlp.gate_up_proj.weight"],
+        expected_gate_up,
+    )
+
+    model.load_state_dict(converted, strict=True)
+
+
 @pytest.mark.parametrize("checkpoint_format", ["bin", "safetensors"])
 def test_load_checkpoint_from_directory(tmp_path: Path, checkpoint_format: str) -> None:
     torch.manual_seed(3)
@@ -348,27 +347,3 @@ def test_load_checkpoint_from_directory(tmp_path: Path, checkpoint_format: str) 
     assert (
         flash_model.config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
     )
-
-
-def test_validate_qwen3_eagle3_weights() -> None:
-    model = Qwen3Eagle3ForCausalLM(_make_config())
-
-    validate_qwen3_eagle3_weights(
-        model,
-        model.state_dict(),
-    )
-
-
-def test_validate_qwen3_eagle3_weights_rejects_different_values() -> None:
-    model = Qwen3Eagle3ForCausalLM(_make_config())
-    source_state_dict = dict(model.state_dict())
-
-    weight = source_state_dict["model.fc.weight"].clone()
-    weight.view(-1)[0] += 1
-    source_state_dict["model.fc.weight"] = weight
-
-    with pytest.raises(ValueError, match="value mismatch"):
-        validate_qwen3_eagle3_weights(
-            model,
-            source_state_dict,
-        )

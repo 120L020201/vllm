@@ -29,11 +29,8 @@ logger = init_logger(__name__)
 
 @dataclass(slots=True)
 class DraftProposalSnapshot:
-    """GPU tensors captured from one completed draft proposal."""
+    """GPU draft rows after the anchor from one completed proposal."""
 
-    prefill_input_embeds: torch.Tensor
-    prefill_positions: torch.Tensor
-    prefill_length: torch.Tensor
     draft_token_input_embeds: torch.Tensor
     draft_recurrent_hidden_states: torch.Tensor
 
@@ -102,18 +99,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
     def get_proposal_snapshot(self) -> DraftProposalSnapshot:
-        if self.last_prefill_input_embeds is None:
-            raise RuntimeError("draft prefill has not run")
-        if self.last_prefill_positions is None:
-            raise RuntimeError("draft prefill positions are missing")
-        if self.last_prefill_length is None:
-            raise RuntimeError("draft prefill length is missing")
-
         if self._draft_capture_input_embeds is None:
-            token_input_embeds = self.last_prefill_input_embeds.new_empty(
-                (0, self.hidden_size)
-            )
-            recurrent_hidden_states = self.last_prefill_input_embeds.new_empty(
+            token_input_embeds = self.hidden_states.new_empty((0, self.hidden_size))
+            recurrent_hidden_states = self.hidden_states.new_empty(
                 (0, self.hidden_size)
             )
         else:
@@ -126,9 +114,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             ]
 
         return DraftProposalSnapshot(
-            prefill_input_embeds=self.last_prefill_input_embeds,
-            prefill_positions=self.last_prefill_positions,
-            prefill_length=self.last_prefill_length,
             draft_token_input_embeds=token_input_embeds,
             draft_recurrent_hidden_states=recurrent_hidden_states,
         )
@@ -772,6 +757,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
+
+        if self.explicit_input_embeds:
+            assert self._draft_capture_recurrent_hidden_states is not None
+            capture_start = self._draft_capture_length
+            capture_end = capture_start + num_reqs
+            # Record the hidden state this step consumes: training replays the
+            # step from its inputs, and the forward may update the buffer in place.
+            hidden_capture = self._draft_capture_recurrent_hidden_states
+            hidden_capture[capture_start:capture_end].copy_(
+                self.hidden_states[:num_reqs]
+            )
+
         # Run the draft model forward pass.
         last_hidden_states, hidden_states = self._run_model(
             num_tokens_padded,
@@ -784,19 +781,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if self.explicit_input_embeds:
             assert self.last_input_embeds is not None
             assert self._draft_capture_input_embeds is not None
-            assert self._draft_capture_recurrent_hidden_states is not None
-
-            start = self._draft_capture_length
-            end = start + num_reqs
-
-            self._draft_capture_input_embeds[start:end].copy_(
+            self._draft_capture_input_embeds[capture_start:capture_end].copy_(
                 self.last_input_embeds[:num_reqs]
             )
-            self._draft_capture_recurrent_hidden_states[start:end].copy_(
-                hidden_states[:num_reqs]
-            )
-
-            self._draft_capture_length = end
+            self._draft_capture_length = capture_end
 
         last_hidden_states = last_hidden_states[:num_reqs]
 

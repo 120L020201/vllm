@@ -9,7 +9,7 @@ from .qwen3_eagle3 import (
     Qwen3Eagle3ForCausalLM,
     convert_angelslim_eagle3_state_dict,
     load_qwen3_eagle3_checkpoint,
-    validate_qwen3_eagle3_weights,
+    load_qwen3_eagle3_from_vllm,
 )
 
 __all__ = [
@@ -20,5 +20,5 @@ __all__ = [
     "Qwen3Eagle3ForCausalLM",
     "convert_angelslim_eagle3_state_dict",
     "load_qwen3_eagle3_checkpoint",
-    "validate_qwen3_eagle3_weights",
+    "load_qwen3_eagle3_from_vllm",
 ]

@@ -15,7 +15,7 @@ from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
 from online_draft.training.eagle3.cache import (
-    append_confirmed_to_persistent_cache,
+    append_confirmed_window_to_persistent_cache,
     persistent_cache_length,
 )
 from online_draft.training.eagle3.window import (
@@ -467,9 +467,9 @@ def test_later_confirmed_path_window_preserves_fixed_history() -> None:
         draft_length=2,
         rejection_position=0,
     )
-    persistent_cache = append_confirmed_to_persistent_cache(
+    persistent_cache = append_confirmed_window_to_persistent_cache(
         model,
-        history_batch,
+        Eagle3TrainingWindow((history_batch,)),
         persistent_cache=None,
     )
     old_cache = tuple(

@@ -243,21 +243,11 @@ def _apply_rotary_embedding(
     if head_dim % 2 != 0:
         raise ValueError("head dimension must be even")
 
-    frequency_indices = torch.arange(
-        0,
-        head_dim,
-        2,
-        dtype=torch.float32,
-        device=query.device,
+    cosine, sine = _rotary_cosine_and_sine(
+        positions.to(query.device), head_dim, rope_theta
     )
-    inverse_frequencies = 1.0 / (rope_theta ** (frequency_indices / head_dim))
-    frequencies = torch.outer(
-        positions.to(device=query.device, dtype=torch.float32),
-        inverse_frequencies,
-    )
-
-    cosine = frequencies.cos().to(dtype=query.dtype).unsqueeze(0)
-    sine = frequencies.sin().to(dtype=query.dtype).unsqueeze(0)
+    cosine = cosine.to(dtype=query.dtype).unsqueeze(0)
+    sine = sine.to(dtype=query.dtype).unsqueeze(0)
 
     rotated_query = _rotate_with_cosine_and_sine(
         query,
@@ -270,6 +260,24 @@ def _apply_rotary_embedding(
         sine,
     )
     return rotated_query, rotated_key
+
+
+def _rotary_cosine_and_sine(
+    positions: torch.Tensor,
+    head_dim: int,
+    rope_theta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP32 NeoX RoPE cosine and sine shaped [tokens, head_dim // 2]."""
+    frequency_indices = torch.arange(
+        0,
+        head_dim,
+        2,
+        dtype=torch.float32,
+        device=positions.device,
+    )
+    inverse_frequencies = 1.0 / (rope_theta ** (frequency_indices / head_dim))
+    frequencies = torch.outer(positions.to(dtype=torch.float32), inverse_frequencies)
+    return frequencies.cos(), frequencies.sin()
 
 
 def _rotate_with_cosine_and_sine(
@@ -999,6 +1007,126 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         return target_token_ids
 
 
+_VLLM_ATTENTION_SCALES = (
+    ".attn._q_scale",
+    ".attn._k_scale",
+    ".attn._v_scale",
+    ".attn._prob_scale",
+)
+
+
+def load_qwen3_eagle3_from_vllm(
+    gpu_model: nn.Module,
+    *,
+    attention_backend: Eagle3AttentionBackend | str | None = None,
+) -> Qwen3Eagle3ForCausalLM:
+    """Copy the loaded vLLM EAGLE3 draft into a trainable CPU model.
+
+    Structure, norm, and RoPE settings are read from the GPU modules rather
+    than config.json, so the CPU model computes what the GPU draft computes.
+    Settings this CPU model does not implement are rejected.
+
+    Args:
+        gpu_model: Loaded ``Eagle3LlamaForCausalLM`` draft.
+        attention_backend: CPU attention implementation; defaults to eager.
+
+    Returns:
+        A CPU model holding copies of the draft-owned GPU weights.
+
+    Raises:
+        ValueError: If the draft uses a setting the CPU model does not support,
+            or its weights do not match the CPU parameter layout.
+    """
+    config = gpu_model.config
+    draft = gpu_model.model
+    layers = draft.layers
+    attention = layers[0].self_attn
+    rotary = attention.rotary_emb
+
+    unsupported = {
+        "aux hidden states disabled": not draft.use_aux_hidden_state,
+        "parallel drafting": getattr(gpu_model, "use_parallel_drafting", False),
+        "logit scale": gpu_model.logits_processor.scale != 1.0,
+        "partial rotary": rotary.rotary_dim != rotary.head_size,
+        "non-NeoX rotary": not rotary.is_neox_style,
+        "attention scaling": attention.scaling != attention.head_dim**-0.5,
+        "missing draft-to-target map": gpu_model.draft_id_to_target_id is None,
+    }
+    if any(unsupported.values()):
+        names = ", ".join(name for name, found in unsupported.items() if found)
+        raise ValueError(f"online EAGLE3 CPU model does not support: {names}")
+
+    cpu_config = Qwen3Eagle3Config(
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        num_attention_heads=attention.total_num_heads,
+        num_key_value_heads=attention.total_num_kv_heads,
+        head_dim=attention.head_dim,
+        num_hidden_layers=len(layers),
+        target_vocab_size=config.vocab_size,
+        draft_vocab_size=config.draft_vocab_size,
+        rms_norm_eps=layers[0].input_layernorm.variance_epsilon,
+        rope_theta=float(rotary.base),
+        attention_bias=attention.qkv_proj.bias is not None,
+        norm_before_residual=bool(getattr(config, "norm_before_residual", False)),
+        norm_before_fc=draft.norm_before_fc,
+        norm_output=draft.norm_output,
+        num_aux_hidden_states=draft.num_aux_hidden_states,
+        fc_norm=draft.fc_norm is not None,
+        attention_backend=(
+            Eagle3AttentionBackend.EAGER
+            if attention_backend is None
+            else _parse_attention_backend(attention_backend)
+        ),
+    )
+    _validate_vllm_rotary(rotary, cpu_config.head_dim, cpu_config.rope_theta)
+
+    with torch.inference_mode(False), torch.device("meta"):
+        model = Qwen3Eagle3ForCausalLM(cpu_config)
+
+    source = gpu_model.state_dict()
+    # Embeddings are shared with the target; KV-cache quantization scales are
+    # runtime attention state. Neither is a trainable draft weight.
+    draft_owned = {
+        name
+        for name in source
+        if name != "model.embed_tokens.weight"
+        and not name.endswith(_VLLM_ATTENTION_SCALES)
+    }
+    if draft_owned != set(model.state_dict()):
+        missing = sorted(set(model.state_dict()) - draft_owned)
+        extra = sorted(draft_owned - set(model.state_dict()))
+        raise ValueError(
+            f"EAGLE3 draft weights do not match the CPU layout: "
+            f"missing={missing}, unsupported={extra}"
+        )
+
+    with torch.inference_mode(False):
+        weights = {
+            name: source[name].detach().to(device="cpu", copy=True)
+            for name in model.state_dict()
+        }
+        model.load_state_dict(weights, assign=True)
+    return model
+
+
+def _validate_vllm_rotary(rotary: nn.Module, head_dim: int, rope_theta: float) -> None:
+    """Check that vLLM's precomputed RoPE table equals the CPU formula.
+
+    This also rejects RoPE scaling variants, whose tables differ.
+    """
+    cache = rotary.cos_sin_cache
+    positions = torch.arange(min(cache.shape[0], 4096))
+    cosine, sine = _rotary_cosine_and_sine(positions, head_dim, rope_theta)
+    expected = torch.cat((cosine, sine), dim=-1)
+    actual = cache[: positions.numel()].detach().float().cpu()
+    tolerance = 1e-4 if cache.dtype == torch.float32 else 1e-2
+    if actual.shape != expected.shape or not torch.allclose(
+        actual, expected, rtol=0, atol=tolerance
+    ):
+        raise ValueError("vLLM EAGLE3 RoPE does not match the CPU RoPE")
+
+
 def convert_angelslim_eagle3_state_dict(
     state_dict: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -1052,7 +1180,10 @@ def load_qwen3_eagle3_checkpoint(
     dtype: torch.dtype = torch.float32,
     attention_backend: Eagle3AttentionBackend | str | None = None,
 ) -> Qwen3Eagle3ForCausalLM:
-    """Load an AngelSlim Qwen3 EAGLE3 checkpoint.
+    """Load an AngelSlim Qwen3 EAGLE3 checkpoint from disk.
+
+    Used by the methods harness. Online training copies the loaded vLLM
+    draft with load_qwen3_eagle3_from_vllm instead.
 
     Args:
         model_directory: Directory containing config.json and model weights.
@@ -1099,22 +1230,3 @@ def load_qwen3_eagle3_checkpoint(
     model.load_state_dict(converted_state_dict, strict=True)
 
     return model
-
-
-def validate_qwen3_eagle3_weights(
-    model: Qwen3Eagle3ForCausalLM,
-    source_state_dict: Mapping[str, torch.Tensor],
-) -> None:
-    """Validate CPU weights against the loaded vLLM draft model."""
-
-    for name, cpu_tensor in model.state_dict().items():
-        source_tensor = source_state_dict[name]
-
-        if source_tensor.shape != cpu_tensor.shape:
-            raise ValueError(f"EAGLE3 weight shape mismatch: {name}")
-
-        if source_tensor.dtype != cpu_tensor.dtype:
-            raise ValueError(f"EAGLE3 weight dtype mismatch: {name}")
-
-        if not torch.equal(cpu_tensor, source_tensor.detach().cpu()):
-            raise ValueError(f"EAGLE3 weight value mismatch: {name}")

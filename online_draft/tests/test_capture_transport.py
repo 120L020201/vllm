@@ -3,7 +3,6 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,9 +12,22 @@ from online_draft.runtime.capture.dflash import (
 )
 from online_draft.runtime.capture.eagle3 import (
     Eagle3CaptureAdapter,
+    Eagle3CaptureBuffers,
     Eagle3CapturePacket,
 )
-from online_draft.runtime.transport import CaptureQueue
+from online_draft.runtime.transport import CaptureQueue, PinnedStaging
+
+
+def _eagle3_buffers(num_aux_hidden_states: int = 1) -> Eagle3CaptureBuffers:
+    return Eagle3CaptureBuffers(
+        8,
+        2,
+        2,
+        num_aux_hidden_states,
+        2,
+        dtype=torch.float32,
+        teacher_dtype=torch.float32,
+    )
 
 
 @pytest.mark.parametrize("accepted", [0, 1, 3])
@@ -25,7 +37,9 @@ def test_dflash_bootstrap_chunks_and_teacher_alignment(accepted, device):
         pytest.skip("requires CUDA")
     rounds = []
     done = Event()
+    version = 7
     adapter = DFlashCaptureAdapter(
+        source_weight_version=lambda: version,
         buffers=DFlashCaptureBuffers(
             8, 4, 16, 23, dtype=torch.float32, teacher_dtype=torch.float32
         ),
@@ -49,7 +63,7 @@ def test_dflash_bootstrap_chunks_and_teacher_alignment(accepted, device):
         capture(2, 3, sampled=1)
         input_ids = torch.tensor([2, 22, 22, 22], dtype=torch.int32, device=device)
         query_positions = torch.arange(5, 9, device=device)
-        adapter.capture_proposal(input_ids, query_positions, 7)
+        adapter.capture_proposal(input_ids=input_ids, positions=query_positions)
         input_ids.zero_()
         query_positions.zero_()
         teacher = torch.arange(4 * 23, device=device).reshape(4, 23).float()
@@ -73,10 +87,10 @@ def test_dflash_bootstrap_chunks_and_teacher_alignment(accepted, device):
         assert batch.rejection_position == (accepted if accepted < 3 else None)
         done.clear()
         anchor = 6 + accepted
+        version = 8
         adapter.capture_proposal(
-            torch.tensor([7, 22, 22, 22], device=device),
-            torch.arange(anchor, anchor + 4, device=device),
-            8,
+            input_ids=torch.tensor([7, 22, 22, 22], device=device),
+            positions=torch.arange(anchor, anchor + 4, device=device),
         )
         adapter.capture_teacher_logits(torch.zeros(4, 23, device=device))
         capture(anchor, 4, rejected=3, sampled=1)
@@ -94,10 +108,10 @@ def test_dflash_bootstrap_chunks_and_teacher_alignment(accepted, device):
         # A new request starts a fresh prompt and continuous history at position 0.
         done.clear()
         capture(0, 2, sampled=1, request_id="next")
+        version = 0
         adapter.capture_proposal(
-            torch.tensor([3, 22, 22, 22], device=device),
-            torch.arange(2, 6, device=device),
-            0,
+            input_ids=torch.tensor([3, 22, 22, 22], device=device),
+            positions=torch.arange(2, 6, device=device),
         )
         adapter.capture_teacher_logits(torch.zeros(4, 23, device=device))
         capture(2, 4, rejected=3, sampled=1, request_id="next")
@@ -120,30 +134,23 @@ def _packet(
     return Eagle3CapturePacket(
         request_id="request-0",
         step_id=step_id,
-        source_weight_version=0,
-        prompt_context=None,
-        proposal_token_input_embeds=torch.zeros(1, 2, device=device),
-        proposal_recurrent_hidden_states=torch.zeros(1, 2, device=device),
+        proposal=None,
         teacher_logits=torch.zeros(2, 3, device=device),
-        verify_row_indices=torch.tensor([0], device=device),
-        target_aux_hidden_states=(torch.zeros(1, 2, device=device),),
-        num_sampled=torch.tensor(1, device=device),
-        confirmed_prefill_input_embeds=torch.zeros(1, 2, device=device),
-        confirmed_prefill_positions=torch.tensor([0], device=device),
-        confirmed_prefill_length=torch.tensor(1, device=device),
+        input_embeds=torch.zeros(1, 2, device=device),
+        positions=torch.tensor([0], device=device),
+        aux_hidden_states=torch.zeros(1, 2, device=device),
+        metadata=torch.tensor([1, 1], device=device),
+        buffers=_eagle3_buffers(),
     )
 
 
-def test_close_epoch_flushes_packets_before_marker() -> None:
+def test_close_epoch_follows_submitted_packets() -> None:
     events: list[object] = []
     queue_sizes: list[int] = []
     closed = Event()
 
     queue = CaptureQueue(
-        transfer_chunk_size=8,
-        consume_chunk=lambda packets: events.append(
-            ("rounds", [packet.step_id for packet in packets])
-        ),
+        consume=lambda packet: events.append(("round", packet.step_id)),
         on_finish=lambda request_id: None,
         on_close_epoch=lambda request_id: (
             events.append(("close", request_id)),
@@ -159,7 +166,7 @@ def test_close_epoch_flushes_packets_before_marker() -> None:
 
         assert closed.wait(timeout=5)
         assert events == [
-            ("rounds", [0]),
+            ("round", 0),
             ("close", "request-0"),
         ]
     finally:
@@ -174,10 +181,8 @@ def test_cuda_packet_uses_pinned_d2h_buffers() -> None:
     consumed: list[Eagle3CapturePacket] = []
     copied = Event()
 
-    def consume(
-        packets: tuple[Eagle3CapturePacket, ...],
-    ) -> None:
-        consumed.extend(packets)
+    def consume(packet: Eagle3CapturePacket) -> None:
+        consumed.append(packet)
         copied.set()
 
     packet = _packet(0, "cuda")
@@ -185,8 +190,7 @@ def test_cuda_packet_uses_pinned_d2h_buffers() -> None:
     packet.ready.record(torch.cuda.current_stream())
 
     queue = CaptureQueue(
-        transfer_chunk_size=1,
-        consume_chunk=consume,
+        consume=consume,
         on_finish=lambda request_id: None,
         on_close_epoch=lambda request_id: None,
     )
@@ -201,7 +205,7 @@ def test_cuda_packet_uses_pinned_d2h_buffers() -> None:
         assert cpu_packet.ready is None
         assert cpu_packet.teacher_logits.device.type == "cpu"
         assert cpu_packet.teacher_logits.is_pinned()
-        assert cpu_packet.verify_row_indices.is_pinned()
+        assert cpu_packet.metadata.is_pinned()
         assert torch.equal(
             cpu_packet.teacher_logits,
             torch.zeros(2, 3),
@@ -210,8 +214,8 @@ def test_cuda_packet_uses_pinned_d2h_buffers() -> None:
         queue.close()
 
 
-def test_finish_discards_tail_and_waits_for_callback() -> None:
-    consumed: list[tuple[Eagle3CapturePacket, ...]] = []
+def test_finish_follows_submitted_packets_and_waits_for_callback() -> None:
+    consumed: list[Eagle3CapturePacket] = []
     finished: list[str] = []
     callback_started = Event()
     release_callback = Event()
@@ -222,8 +226,7 @@ def test_finish_discards_tail_and_waits_for_callback() -> None:
         finished.append(request_id)
 
     queue = CaptureQueue(
-        transfer_chunk_size=8,
-        consume_chunk=consumed.append,
+        consume=consumed.append,
         on_finish=on_finish,
         on_close_epoch=lambda request_id: None,
     )
@@ -243,7 +246,7 @@ def test_finish_discards_tail_and_waits_for_callback() -> None:
             release_callback.set()
             result.result(timeout=5)
 
-        assert consumed == []
+        assert [packet.step_id for packet in consumed] == [0]
         assert finished == ["request-0"]
     finally:
         release_callback.set()
@@ -254,20 +257,20 @@ def test_adapter_finishes_request_without_captured_proposal() -> None:
     finished: list[str] = []
 
     adapter = Eagle3CaptureAdapter(
+        buffers=_eagle3_buffers(),
         target_token_ids=torch.tensor([1, 3]),
         source_weight_version=lambda: 0,
         hidden_size=2,
         num_aux_hidden_states=1,
         draft_vocab_size=2,
         feature_dtype=torch.float32,
-        transfer_chunk_size=8,
         on_round=lambda prepared_round: None,
         on_epoch_close=lambda request_id: None,
         on_finish=finished.append,
     )
 
     try:
-        assert adapter.finish_request("request-0") == 0
+        adapter.finish_request("request-0")
 
         assert finished == ["request-0"]
     finally:
@@ -275,13 +278,14 @@ def test_adapter_finishes_request_without_captured_proposal() -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_next_prefill_builds_aligned_rounds_across_requests(device) -> None:
+def test_eagle3_rounds_restart_history_for_each_request(device) -> None:
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     rounds = []
     closed = Event()
     version = 0
     adapter = Eagle3CaptureAdapter(
+        buffers=_eagle3_buffers(),
         target_token_ids=torch.tensor([1, 3], device=device),
         source_weight_version=lambda: version,
         hidden_size=2,
@@ -292,68 +296,102 @@ def test_next_prefill_builds_aligned_rounds_across_requests(device) -> None:
         on_epoch_close=lambda _: closed.set(),
         on_finish=lambda _: None,
     )
+
+    def capture(request_id, start, rows, confirmed, sampled):
+        embeds = torch.arange(start, start + rows, device=device).float()
+        adapter.capture_target(
+            request_id=request_id,
+            input_embeds=embeds[:, None].repeat(1, 2),
+            positions=torch.arange(start, start + rows, device=device),
+            aux_hidden_states=[embeds[:, None].repeat(1, 2) + 100],
+            confirmed_length=torch.tensor(confirmed, device=device),
+            num_sampled=torch.tensor(sampled, dtype=torch.int32, device=device),
+            final_prefill=True,
+        )
+        adapter.capture_proposal(
+            token_input_embeds=torch.tensor([[12.0, 13.0]], device=device),
+            recurrent_hidden_states=torch.tensor([[14.0, 15.0]], device=device),
+        )
+
     try:
         for request_id in ("request-0", "request-1"):
-            for step_id, anchor in enumerate((4, 5)):
-                closed.clear()
-                version = 7 + step_id
-                target_aux = (torch.tensor([[1.0, 2.0], [3.0, 4.0]], device=device),)
-                adapter.capture_proposal(
-                    request_id=request_id,
-                    verify_row_indices=torch.tensor([1], device=device),
-                    target_aux_hidden_states=target_aux,
-                    proposal=SimpleNamespace(
-                        prefill_input_embeds=torch.tensor(
-                            [[10.0, 11.0]], device=device
-                        ),
-                        prefill_positions=torch.tensor([anchor], device=device),
-                        prefill_length=torch.tensor(1, device=device),
-                        draft_token_input_embeds=torch.tensor(
-                            [[12.0, 13.0]], device=device
-                        ),
-                        draft_recurrent_hidden_states=torch.tensor(
-                            [[14.0, 15.0]], device=device
-                        ),
-                    ),
-                )
-                version += 1
+            closed.clear()
+            version = 7
+            capture(request_id, 0, 4, confirmed=4, sampled=1)
+            for step_id, start in enumerate((4, 5)):
+                version = 8 + step_id
                 teacher = torch.arange(8, device=device).reshape(2, 4).float()
                 adapter.capture_teacher_logits(teacher)
                 teacher.zero_()
-                confirmed = torch.tensor([[20.0, 21.0]], device=device)
-                adapter.capture_prefill(
-                    request_id=request_id,
-                    verify_row_indices=torch.tensor([1], device=device),
-                    target_aux_hidden_states=target_aux,
-                    num_sampled=1,
-                    prefill_input_embeds=confirmed,
-                    prefill_positions=torch.tensor([anchor + 1], device=device),
-                    prefill_length=torch.tensor(1, device=device),
-                )
-                confirmed.zero_()
-                adapter.close_epoch(request_id)
-                assert closed.wait(5)
-                adapter.raise_if_failed()
-                prepared = rounds[-1]
-                assert prepared.request_id == request_id
-                assert prepared.step_id == step_id
-                assert prepared.source_weight_version == 7 + step_id
-                batch = prepared.batch
-                assert batch.prefill_positions.tolist() == [anchor]
-                assert batch.prefill_input_embeds.tolist() == (
-                    [[10.0, 11.0]] if step_id == 0 else [[20.0, 21.0]]
-                )
-                assert batch.prefill_aux_hidden_states.tolist() == (
-                    [[1.0, 2.0]] if step_id == 0 else [[3.0, 4.0]]
-                )
-                assert batch.confirmed_input_embeds.tolist() == [[20.0, 21.0]]
-                torch.testing.assert_close(
-                    batch.teacher_probabilities,
-                    torch.tensor([[1.0, 3.0], [5.0, 7.0]]).softmax(-1),
-                )
-                assert adapter.completed_rounds == step_id + 1
+                capture(request_id, start, 3, confirmed=1, sampled=1)
+            adapter.close_epoch(request_id)
+            assert closed.wait(5)
+            adapter.raise_if_failed()
+            assert adapter.completed_rounds == 2
+            first, second = rounds[-2:]
+            assert [first.step_id, second.step_id] == [0, 1]
+            assert [first.source_weight_version, second.source_weight_version] == [
+                7,
+                8,
+            ]
+            assert first.batch.prefill_positions.tolist() == [0, 1, 2, 3]
+            assert first.batch.prefill_aux_hidden_states[:, 0].tolist() == [
+                100.0,
+                101.0,
+                102.0,
+                103.0,
+            ]
+            assert second.batch.prefill_positions.tolist() == [4]
+            assert second.batch.prefill_input_embeds.tolist() == [[4.0, 4.0]]
+            assert second.batch.confirmed_input_embeds.tolist() == [[5.0, 5.0]]
+            torch.testing.assert_close(
+                second.batch.teacher_probabilities,
+                torch.tensor([[1.0, 3.0], [5.0, 7.0]]).softmax(-1),
+            )
             adapter.finish_request(request_id)
             assert adapter.completed_rounds == 0
         assert len(rounds) == 4
     finally:
         adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("tensor", "message"),
+    [
+        (torch.zeros(2, 3, dtype=torch.bfloat16), "uses torch.bfloat16"),
+        (torch.zeros(3, 3), "has 9 elements"),
+    ],
+)
+def test_staging_rejects_lossy_or_oversized_copies(tensor, message) -> None:
+    """Staging must not silently cast or truncate captured training data."""
+    staging = PinnedStaging({"rows": ((2, 3), torch.float32)})
+
+    with pytest.raises(ValueError, match=message):
+        staging.copy("rows", tensor, non_blocking=False)
+
+
+def test_dflash_rejects_discontinuous_target_history() -> None:
+    """A position gap (e.g. a prefix-cache hit) must fail, not train on it."""
+    adapter = DFlashCaptureAdapter(
+        source_weight_version=lambda: 0,
+        buffers=DFlashCaptureBuffers(
+            8, 4, 16, 23, dtype=torch.float32, teacher_dtype=torch.float32
+        ),
+        on_round=lambda _: None,
+        on_epoch_close=lambda _: None,
+        on_finish=lambda _: None,
+    )
+    try:
+        adapter.capture_target(
+            request_id="r",
+            final_prefill=True,
+            fc_output=torch.zeros(2, 16),
+            positions=torch.arange(3, 5),
+            num_rejected=torch.tensor(0),
+            num_sampled=torch.tensor(1),
+        )
+        with pytest.raises(ValueError, match="contiguous target positions"):
+            adapter.finish_request("r")
+    finally:
+        with pytest.raises(ValueError):
+            adapter.close()

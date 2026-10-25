@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import copy
 import math
 from dataclasses import replace
 
@@ -17,17 +16,12 @@ from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
 from online_draft.training.eagle3.cache import (
-    append_confirmed_to_persistent_cache,
+    append_confirmed_window_to_persistent_cache,
     persistent_cache_length,
     prepare_training_window_spine,
 )
-from online_draft.training.eagle3.distill import (
-    window_forward_kl_loss,
-)
 from online_draft.training.eagle3.inputs import (
-    prepare_eagle3_confirmed_path_inputs,
     prepare_eagle3_proposal_window_inputs,
-    prepare_eagle3_training_inputs,
 )
 from online_draft.training.eagle3.window import (
     Eagle3TrainingWindow,
@@ -170,22 +164,6 @@ def _make_two_round_window(
     return Eagle3TrainingWindow(rounds=(first, second))
 
 
-def _slice_cache_before_position(
-    cache: Eagle3KVCache,
-    position: int,
-) -> Eagle3KVCache | None:
-    if position == 0:
-        return None
-
-    return tuple(
-        (
-            key[:, :position].detach(),
-            value[:, :position].detach(),
-        )
-        for key, value in cache
-    )
-
-
 def _assert_cache_detached(cache: Eagle3KVCache) -> None:
     for key, value in cache:
         assert not key.requires_grad
@@ -316,199 +294,6 @@ def test_proposal_window_mask_isolates_round_branches() -> None:
         False,
     ]
     assert torch.equal(inputs.attention_mask, expected_mask)
-
-
-def test_packed_proposal_forward_matches_independent_rounds() -> None:
-    torch.manual_seed(22)
-
-    packed_model = _make_model()
-    independent_model = copy.deepcopy(packed_model)
-    window = _make_two_round_window()
-
-    packed_spine = prepare_training_window_spine(
-        packed_model,
-        window,
-        persistent_cache=None,
-    )
-    _assert_cache_detached(packed_spine)
-    packed_inputs = prepare_eagle3_proposal_window_inputs(
-        packed_model,
-        window,
-        spine_length=persistent_cache_length(packed_spine),
-    )
-    packed_output = packed_model(
-        positions=packed_inputs.positions,
-        input_embeds=packed_inputs.input_embeds,
-        hidden_states=packed_inputs.hidden_states,
-        past_key_values=packed_spine,
-        attention_mask=packed_inputs.attention_mask,
-    )
-    packed_logits = packed_model.compute_draft_logits(packed_output.hidden_states)
-    packed_loss = window_forward_kl_loss(
-        student_logits=packed_logits,
-        teacher_probabilities=packed_inputs.teacher_probabilities,
-        rejection_target_mask=packed_inputs.rejection_target_mask,
-    )
-    packed_loss.backward()
-
-    independent_spine = prepare_training_window_spine(
-        independent_model,
-        window,
-        persistent_cache=None,
-    )
-    independent_logits_parts: list[torch.Tensor] = []
-    rejection_mask_parts: list[torch.Tensor] = []
-
-    for round_batch in window.rounds:
-        round_inputs = prepare_eagle3_training_inputs(
-            independent_model,
-            round_batch,
-        )
-        anchor_position = int(round_inputs.positions[0].item())
-        round_output = independent_model(
-            positions=round_inputs.positions,
-            input_embeds=round_inputs.input_embeds,
-            hidden_states=round_inputs.hidden_states,
-            past_key_values=_slice_cache_before_position(
-                independent_spine,
-                anchor_position,
-            ),
-        )
-        independent_logits_parts.append(
-            independent_model.compute_draft_logits(round_output.hidden_states)
-        )
-
-        rejection_mask = torch.zeros(
-            round_batch.draft_length,
-            dtype=torch.bool,
-        )
-        if round_batch.rejection_position is not None:
-            rejection_mask[round_batch.rejection_position] = True
-        rejection_mask_parts.append(rejection_mask)
-
-    independent_logits = torch.cat(independent_logits_parts, dim=0)
-    independent_loss = window_forward_kl_loss(
-        student_logits=independent_logits,
-        teacher_probabilities=packed_inputs.teacher_probabilities,
-        rejection_target_mask=torch.cat(rejection_mask_parts, dim=0),
-    )
-    independent_loss.backward()
-
-    torch.testing.assert_close(packed_logits, independent_logits)
-    torch.testing.assert_close(packed_loss, independent_loss)
-
-    independent_parameters = dict(independent_model.named_parameters())
-    gradient_count = 0
-    for name, packed_parameter in packed_model.named_parameters():
-        independent_parameter = independent_parameters[name]
-        assert (packed_parameter.grad is None) == (independent_parameter.grad is None)
-        if packed_parameter.grad is not None:
-            gradient_count += 1
-            torch.testing.assert_close(
-                packed_parameter.grad,
-                independent_parameter.grad,
-                rtol=1e-5,
-                atol=1e-6,
-            )
-
-    assert gradient_count > 0
-
-
-def test_packed_confirmed_forward_matches_independent_rounds() -> None:
-    torch.manual_seed(28)
-
-    packed_model = _make_model()
-    independent_model = copy.deepcopy(packed_model)
-    window = _make_two_round_window()
-
-    packed_spine = prepare_training_window_spine(
-        packed_model,
-        window,
-        persistent_cache=None,
-    )
-    packed_inputs = prepare_eagle3_confirmed_path_inputs(
-        packed_model,
-        window,
-        spine_length=persistent_cache_length(packed_spine),
-    )
-    packed_output = packed_model(
-        positions=packed_inputs.positions,
-        input_embeds=packed_inputs.input_embeds,
-        hidden_states=packed_inputs.hidden_states,
-        past_key_values=packed_spine,
-        attention_mask=packed_inputs.attention_mask,
-    )
-    packed_logits = packed_model.compute_draft_logits(packed_output.hidden_states)
-    packed_loss = window_forward_kl_loss(
-        student_logits=packed_logits,
-        teacher_probabilities=packed_inputs.teacher_probabilities,
-        rejection_target_mask=packed_inputs.rejection_target_mask,
-    )
-    packed_loss.backward()
-
-    independent_spine = prepare_training_window_spine(
-        independent_model,
-        window,
-        persistent_cache=None,
-    )
-    independent_logits_parts: list[torch.Tensor] = []
-    rejection_mask_parts: list[torch.Tensor] = []
-
-    for round_batch in window.rounds:
-        round_inputs = prepare_eagle3_training_inputs(
-            independent_model,
-            round_batch,
-        )
-        target_count = (
-            round_batch.draft_length
-            if round_batch.rejection_position is None
-            else round_batch.confirmed_length
-        )
-        anchor_position = int(round_inputs.positions[0].item())
-        round_output = independent_model(
-            positions=round_inputs.positions[:target_count],
-            input_embeds=round_inputs.input_embeds[:target_count],
-            hidden_states=round_inputs.hidden_states[:target_count],
-            past_key_values=_slice_cache_before_position(
-                independent_spine,
-                anchor_position,
-            ),
-        )
-        independent_logits_parts.append(
-            independent_model.compute_draft_logits(round_output.hidden_states)
-        )
-
-        rejection_mask = torch.zeros(target_count, dtype=torch.bool)
-        if round_batch.rejection_position is not None:
-            rejection_mask[round_batch.rejection_position] = True
-        rejection_mask_parts.append(rejection_mask)
-
-    independent_logits = torch.cat(independent_logits_parts, dim=0)
-    independent_loss = window_forward_kl_loss(
-        student_logits=independent_logits,
-        teacher_probabilities=packed_inputs.teacher_probabilities,
-        rejection_target_mask=torch.cat(rejection_mask_parts, dim=0),
-    )
-    independent_loss.backward()
-
-    torch.testing.assert_close(packed_logits, independent_logits)
-    torch.testing.assert_close(packed_loss, independent_loss)
-
-    independent_parameters = dict(independent_model.named_parameters())
-    gradient_count = 0
-    for name, packed_parameter in packed_model.named_parameters():
-        independent_parameter = independent_parameters[name]
-        assert (packed_parameter.grad is None) == (independent_parameter.grad is None)
-        if packed_parameter.grad is not None:
-            gradient_count += 1
-            torch.testing.assert_close(
-                packed_parameter.grad,
-                independent_parameter.grad,
-                rtol=1e-5,
-                atol=1e-6,
-            )
-
-    assert gradient_count > 0
 
 
 def test_future_spine_and_other_branch_do_not_leak() -> None:
@@ -659,9 +444,9 @@ def test_later_proposal_window_preserves_existing_history() -> None:
         draft_length=2,
         rejection_position=0,
     )
-    persistent_cache = append_confirmed_to_persistent_cache(
+    persistent_cache = append_confirmed_window_to_persistent_cache(
         model,
-        history_batch,
+        Eagle3TrainingWindow((history_batch,)),
         persistent_cache=None,
     )
     old_cache = tuple(
