@@ -181,7 +181,8 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
         self,
         *,
         buffers: Eagle3CaptureBuffers,
-        target_token_ids: torch.Tensor,
+        # Draft-vocabulary columns of the teacher; None keeps the full vocabulary.
+        target_token_ids: torch.Tensor | None = None,
         source_weight_version: Callable[[], int],
         on_round: Callable[[Eagle3PreparedRound], object],
         on_epoch_close: Callable[[str], object],

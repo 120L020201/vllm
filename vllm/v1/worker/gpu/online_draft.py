@@ -17,6 +17,7 @@ from online_draft.runtime.capture.eagle3 import (
 )
 from online_draft.runtime.contracts import TrainRounds
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
+from online_draft.training.eagle3.draft_model import AutoregressiveDraftConfig
 from online_draft.training.eagle3.window import train_eagle3_rounds
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
 from torch import nn
@@ -65,11 +66,36 @@ class OnlineDraftRuntime:
         self.pipeline.close()
 
 
+def _autoregressive_capture_adapter(
+    vllm_config: VllmConfig,
+    draft_config: AutoregressiveDraftConfig,
+    target_token_ids: torch.Tensor | None,
+    **capture: Any,
+) -> Eagle3CaptureAdapter:
+    """Capture for drafts trained by the EAGLE3-style window (EAGLE3, MTP)."""
+    assert vllm_config.speculative_config is not None
+    model_config = vllm_config.model_config
+    return Eagle3CaptureAdapter(
+        buffers=Eagle3CaptureBuffers(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.speculative_config.num_speculative_tokens,
+            draft_config.hidden_size,
+            draft_config.num_aux_hidden_states,
+            draft_config.draft_vocab_size,
+            dtype=model_config.dtype,
+            teacher_dtype=model_config.head_dtype or model_config.dtype,
+        ),
+        target_token_ids=target_token_ids,
+        **capture,
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Eagle3Recipe:
     """EAGLE3 captures before its trainable FC; fields are its settings."""
 
     name: ClassVar[str] = "EAGLE3"
+    target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3", "qwen3_5"})
 
     attention_backend: str | None = None
 
@@ -97,21 +123,62 @@ class _Eagle3Recipe:
         **capture: Any,
     ) -> Eagle3CaptureAdapter:
         assert isinstance(cpu_model, Qwen3Eagle3ForCausalLM)
-        assert vllm_config.speculative_config is not None
-        model_config = vllm_config.model_config
-        draft_config = cpu_model.config
-        return Eagle3CaptureAdapter(
-            buffers=Eagle3CaptureBuffers(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                vllm_config.speculative_config.num_speculative_tokens,
-                draft_config.hidden_size,
-                draft_config.num_aux_hidden_states,
-                draft_config.draft_vocab_size,
-                dtype=model_config.dtype,
-                teacher_dtype=model_config.head_dtype or model_config.dtype,
-            ),
-            target_token_ids=cpu_model.get_target_token_ids().to(device),
+        return _autoregressive_capture_adapter(
+            vllm_config,
+            cpu_model.config,
+            cpu_model.get_target_token_ids().to(device),
             **capture,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class _MTPRecipe:
+    """Qwen3.5 MTP reuses the EAGLE3 capture and training path.
+
+    The draft fuses the target's final hidden state inside its layer, so it
+    captures one feature row and distills over the full shared vocabulary.
+    """
+
+    name: ClassVar[str] = "MTP"
+    target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3_5"})
+
+    attention_backend: str | None = None
+
+    @staticmethod
+    def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
+        assert vllm_config.speculative_config is not None
+        return vllm_config.speculative_config.method == "mtp"
+
+    def load_model(self, gpu_draft_model: nn.Module) -> nn.Module:
+        from online_draft.models.qwen3_5_mtp import load_qwen3_5_mtp_from_vllm
+
+        return load_qwen3_5_mtp_from_vllm(
+            gpu_draft_model, attention_backend=self.attention_backend
+        )
+
+    def check(self, trainer: DraftTrainer, speculator: Any) -> None:
+        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+        assert isinstance(speculator, MTPSpeculator)
+        assert "lm_head.weight" not in trainer.trainable_parameter_names, (
+            "online MTP shares its head with the target"
+        )
+
+    def train_rounds(self) -> TrainRounds:
+        return train_eagle3_rounds
+
+    def create_adapter(
+        self,
+        vllm_config: VllmConfig,
+        cpu_model: nn.Module,
+        device: torch.device,
+        **capture: Any,
+    ) -> Eagle3CaptureAdapter:
+        from online_draft.models.qwen3_5_mtp import Qwen3_5MTPForCausalLM
+
+        assert isinstance(cpu_model, Qwen3_5MTPForCausalLM)
+        return _autoregressive_capture_adapter(
+            vllm_config, cpu_model.config, None, **capture
         )
 
 
@@ -120,6 +187,7 @@ class _DFlashRecipe:
     """DFlash captures its frozen FC output; fields are its settings."""
 
     name: ClassVar[str] = "DFlash"
+    target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3", "qwen3_5"})
 
     grouped_query_attention: bool = False
     selective_last_layer: bool = False
@@ -193,7 +261,7 @@ class _DFlashRecipe:
         )
 
 
-_Recipe = _Eagle3Recipe | _DFlashRecipe
+_Recipe = _Eagle3Recipe | _DFlashRecipe | _MTPRecipe
 
 # Setting name -> TrainerConfig field.
 _TRAINER_SETTINGS = {
@@ -220,8 +288,11 @@ class _OnlineDraftSettings:
 
 def _recipe_type(vllm_config: VllmConfig) -> type[_Recipe]:
     assert vllm_config.speculative_config is not None
-    if vllm_config.speculative_config.method == "dflash":
+    method = vllm_config.speculative_config.method
+    if method == "dflash":
         return _DFlashRecipe
+    if method == "mtp":
+        return _MTPRecipe
     return _Eagle3Recipe
 
 
@@ -286,7 +357,10 @@ def _validate_online_draft_config(vllm_config: VllmConfig, speculator: Any) -> N
         "enable_prefix_caching=False": (
             not vllm_config.cache_config.enable_prefix_caching
         ),
-        "qwen3 target": vllm_config.model_config.hf_config.model_type == "qwen3",
+        f"target model_type in {sorted(recipe_type.target_model_types)}": (
+            vllm_config.model_config.hf_config.model_type
+            in recipe_type.target_model_types
+        ),
     }
 
     unmet = [requirement for requirement, ok in requirements.items() if not ok]

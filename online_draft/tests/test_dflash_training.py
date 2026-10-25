@@ -12,6 +12,7 @@ from online_draft.models.cpu_attention import (
 )
 from online_draft.models.qwen3_dflash import (
     DFlashAttention,
+    DFlashLayerAttention,
     Qwen3DFlashConfig,
     Qwen3DFlashForCausalLM,
 )
@@ -355,3 +356,41 @@ def test_window_rejects_rounds_that_skip_context():
     rounds = (make_batch(5, 1, prompt=True), make_batch(8, 0))
     with pytest.raises(ValueError, match="start where its context ends"):
         train_dflash_window(trainer, rounds, None)
+
+
+def test_causal_sliding_layer_chunks_match_explicit_window_mask():
+    """Qwen3.5 DFlash: chunked, window-cropped context equals the full mask."""
+    torch.manual_seed(3)
+    window, block = 5, 4
+    config = Qwen3DFlashConfig(
+        8,
+        16,
+        2,
+        1,
+        4,
+        1,
+        23,
+        2,
+        attention_blocks_per_chunk=1,
+        layer_attention=(DFlashLayerAttention(sliding_window=window, causal=True),),
+    )
+    attention = DFlashAttention(config, config.attention(0))
+    anchors = torch.tensor([6, 9])
+    positions = torch.cat([torch.arange(a, a + block) for a in anchors.tolist()])
+    blocks = torch.arange(len(anchors)).repeat_interleave(block)
+    hidden = torch.randn(positions.numel(), 8)
+    context = tuple(torch.randn(1, 12, 4) for _ in range(2))
+    base = torch.cat(
+        (
+            torch.arange(12)[None, :] < anchors[blocks][:, None],
+            blocks[:, None] == blocks[None, :],
+        ),
+        dim=1,
+    )
+    offset = positions[:, None] - torch.cat((torch.arange(12), positions))[None, :]
+    explicit = base & (offset >= 0) & (offset < window)
+
+    chunked = attention(hidden, positions, context, base, block_size=block)
+    expected = attention(hidden, positions, context, explicit)
+
+    torch.testing.assert_close(chunked, expected)

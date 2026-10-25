@@ -129,6 +129,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         aux_hidden_states: list[torch.Tensor] | None,
         num_sampled: torch.Tensor,
         capture_enabled: bool,
+        target_hidden_states: torch.Tensor | None = None,
     ) -> None: ...
 
     def on_prefill_end(self, num_reqs: int) -> None: ...
@@ -406,6 +407,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     aux_hidden_states=aux_hidden_states,
                     num_sampled=num_sampled,
                     capture_enabled=capture_enabled,
+                    target_hidden_states=last_hidden_states,
                 )
 
                 if aux_hidden_states:
@@ -491,13 +493,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         input_ids = self.input_buffers.input_ids[:num_tokens]
         self.last_input_embeds = None
 
-        if self.explicit_input_embeds:
+        if not self.supports_mm_inputs:
+            if not self.explicit_input_embeds:
+                return None
             inputs_embeds = self.model.embed_input_ids(input_ids)
             self.last_input_embeds = inputs_embeds
             return inputs_embeds
-
-        if not self.supports_mm_inputs:
-            return None
 
         assert self.inputs_embeds is not None
 
@@ -510,7 +511,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             multimodal_embeddings=mm_embeds,
             is_multimodal=is_mm_embed,
         )
-        return self.inputs_embeds[:num_tokens]
+        inputs_embeds = self.inputs_embeds[:num_tokens]
+        if self.explicit_input_embeds:
+            # Online capture records the merged embeddings the draft consumes.
+            self.last_input_embeds = inputs_embeds
+        return inputs_embeds
 
     @torch.inference_mode()
     def _run_model(

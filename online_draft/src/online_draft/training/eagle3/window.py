@@ -6,10 +6,7 @@ from enum import Enum
 from itertools import pairwise
 
 import torch
-from online_draft.models.qwen3_eagle3 import (
-    Eagle3KVCache,
-    Qwen3Eagle3ForCausalLM,
-)
+from online_draft.models.qwen3_eagle3 import Eagle3KVCache
 from online_draft.runtime import profile_range
 from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
@@ -23,6 +20,7 @@ from online_draft.training.eagle3.cache import (
 from online_draft.training.eagle3.distill import (
     window_forward_kl_loss,
 )
+from online_draft.training.eagle3.draft_model import AutoregressiveDraftModel
 from online_draft.training.eagle3.inputs import (
     prepare_eagle3_confirmed_path_inputs,
     prepare_eagle3_proposal_window_inputs,
@@ -185,8 +183,8 @@ def train_eagle3_window(
         ValueError: If inputs, history, loss, or gradients are invalid.
     """
     model = trainer.model
-    if not isinstance(model, Qwen3Eagle3ForCausalLM):
-        raise TypeError("EAGLE3 training requires Qwen3Eagle3ForCausalLM")
+    if not isinstance(model, AutoregressiveDraftModel):
+        raise TypeError("EAGLE3-style training requires an autoregressive draft model")
     if not isinstance(mode, Eagle3WindowMode):
         raise TypeError("mode must be an Eagle3WindowMode")
     validate_eagle3_rounds(model, window.rounds)

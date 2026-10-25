@@ -4,11 +4,9 @@
 from typing import TYPE_CHECKING
 
 import torch
-from online_draft.models.qwen3_eagle3 import (
-    Eagle3KVCache,
-    Qwen3Eagle3ForCausalLM,
-)
+from online_draft.models.qwen3_eagle3 import Eagle3KVCache
 from online_draft.training.eagle3.batch import validate_eagle3_rounds
+from online_draft.training.eagle3.draft_model import AutoregressiveDraftModel
 
 if TYPE_CHECKING:
     from online_draft.training.eagle3.window import (
@@ -73,7 +71,7 @@ def persistent_cache_length(
 
 
 def append_confirmed_window_to_persistent_cache(
-    model: Qwen3Eagle3ForCausalLM,
+    model: AutoregressiveDraftModel,
     window: "Eagle3TrainingWindow",
     persistent_cache: PersistentEagle3KVCache,
 ) -> Eagle3KVCache:
@@ -101,7 +99,7 @@ def append_confirmed_window_to_persistent_cache(
 
 
 def _append_confirmed_window(
-    model: Qwen3Eagle3ForCausalLM,
+    model: AutoregressiveDraftModel,
     window: "Eagle3TrainingWindow",
     persistent_cache: PersistentEagle3KVCache,
 ) -> Eagle3KVCache:
@@ -159,7 +157,7 @@ def _append_confirmed_window(
 
 def _append_fixed_inputs(
     *,
-    model: Qwen3Eagle3ForCausalLM,
+    model: AutoregressiveDraftModel,
     cache: PersistentEagle3KVCache,
     positions: torch.Tensor,
     input_embeds: torch.Tensor,

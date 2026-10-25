@@ -5,9 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from online_draft.models.qwen3_eagle3 import (
-    Qwen3Eagle3ForCausalLM,
-)
+from online_draft.training.eagle3.draft_model import AutoregressiveDraftModel
 
 if TYPE_CHECKING:
     from online_draft.training.eagle3.window import (
@@ -44,7 +42,7 @@ class Eagle3WindowInputs:
 
 
 def prepare_eagle3_confirmed_path_inputs(
-    model: Qwen3Eagle3ForCausalLM,
+    model: AutoregressiveDraftModel,
     window: "Eagle3TrainingWindow",
     *,
     spine_length: int,
@@ -81,7 +79,7 @@ def prepare_eagle3_confirmed_path_inputs(
 
 
 def prepare_eagle3_proposal_window_inputs(
-    model: Qwen3Eagle3ForCausalLM,
+    model: AutoregressiveDraftModel,
     window: "Eagle3TrainingWindow",
     *,
     spine_length: int,
@@ -111,7 +109,7 @@ def prepare_eagle3_proposal_window_inputs(
 
 
 def _pack_window_inputs(
-    model: Qwen3Eagle3ForCausalLM,
+    model: AutoregressiveDraftModel,
     window: "Eagle3TrainingWindow",
     *,
     spine_length: int,

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from .layers import AttentionBackend, DraftForwardOutput
 from .qwen3_eagle3 import (
-    Eagle3AttentionBackend,
-    Eagle3ForwardOutput,
     Eagle3KVCache,
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
@@ -13,8 +12,8 @@ from .qwen3_eagle3 import (
 )
 
 __all__ = [
-    "Eagle3AttentionBackend",
-    "Eagle3ForwardOutput",
+    "AttentionBackend",
+    "DraftForwardOutput",
     "Eagle3KVCache",
     "Qwen3Eagle3Config",
     "Qwen3Eagle3ForCausalLM",

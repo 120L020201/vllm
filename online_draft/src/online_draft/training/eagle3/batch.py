@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from online_draft.models.qwen3_eagle3 import Qwen3Eagle3ForCausalLM
+    from online_draft.training.eagle3.draft_model import AutoregressiveDraftModel
 
 _POSITION_FIELD_NAMES = (
     "prefix_positions",
@@ -248,7 +248,7 @@ class Eagle3DistillationBatch:
 
 
 def validate_eagle3_rounds(
-    model: "Qwen3Eagle3ForCausalLM",
+    model: "AutoregressiveDraftModel",
     rounds: Iterable[Eagle3DistillationBatch],
 ) -> None:
     """Validate rounds against the CPU model that will consume them.

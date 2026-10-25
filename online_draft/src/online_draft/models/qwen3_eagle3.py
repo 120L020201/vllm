@@ -3,24 +3,24 @@
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from safetensors.torch import load_file
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
-
-class Eagle3AttentionBackend(str, Enum):
-    """Attention implementations supported by the CPU training model."""
-
-    EAGER = "eager"
-    FLASH_ATTENTION = "flash_attention"
-
-    __str__ = str.__str__
+from online_draft.models.layers import (
+    VLLM_ATTENTION_STATE_SUFFIXES,
+    AttentionBackend,
+    DraftForwardOutput,
+    GatedMLP,
+    LayerKV,
+    RMSNorm,
+    apply_rotary_embedding,
+    cached_attention,
+    validate_vllm_rotary,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +41,11 @@ class Qwen3Eagle3Config:
     norm_output: bool = False
     num_aux_hidden_states: int = 3
     fc_norm: bool = False
-    attention_backend: Eagle3AttentionBackend = Eagle3AttentionBackend.EAGER
+    attention_backend: AttentionBackend = AttentionBackend.EAGER
+    # Leading head channels that RoPE rotates; None rotates all of them.
+    rotary_dim: int | None = None
+    # vLLM pads the draft head to a multiple of 64 rows; logits drop the padding.
+    padded_draft_vocab_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -74,8 +78,17 @@ class Qwen3Eagle3Config:
             raise ValueError("rms_norm_eps must be greater than zero")
         if self.rope_theta <= 0:
             raise ValueError("rope_theta must be greater than zero")
-        if not isinstance(self.attention_backend, Eagle3AttentionBackend):
-            raise TypeError("attention_backend must be an Eagle3AttentionBackend")
+        if not isinstance(self.attention_backend, AttentionBackend):
+            raise TypeError("attention_backend must be an AttentionBackend")
+        if self.rotary_dim is not None and (
+            self.rotary_dim % 2 != 0 or not 0 < self.rotary_dim <= self.head_dim
+        ):
+            raise ValueError("rotary_dim must be even and within head_dim")
+        if (
+            self.padded_draft_vocab_size is not None
+            and self.padded_draft_vocab_size < self.draft_vocab_size
+        ):
+            raise ValueError("padded_draft_vocab_size must cover draft_vocab_size")
 
     @classmethod
     def from_dict(
@@ -112,6 +125,14 @@ class Qwen3Eagle3Config:
             values,
             eagle_config,
         )
+        rope_parameters = values.get("rope_parameters") or {}
+        rope_theta = values.get("rope_theta") or rope_parameters.get(
+            "rope_theta", 10000.0
+        )
+        partial_rotary_factor = values.get(
+            "partial_rotary_factor"
+        ) or rope_parameters.get("partial_rotary_factor", 1.0)
+        rotary_dim = int(head_dim * partial_rotary_factor)
 
         return cls(
             hidden_size=hidden_size,
@@ -123,7 +144,7 @@ class Qwen3Eagle3Config:
             target_vocab_size=target_vocab_size,
             draft_vocab_size=draft_vocab_size,
             rms_norm_eps=float(values.get("rms_norm_eps", 1e-6)),
-            rope_theta=float(values.get("rope_theta", 10000.0)),
+            rope_theta=float(rope_theta),
             attention_bias=bool(values.get("attention_bias", False)),
             norm_before_residual=bool(values.get("norm_before_residual", False)),
             norm_before_fc=bool(
@@ -143,9 +164,10 @@ class Qwen3Eagle3Config:
             attention_backend=_parse_attention_backend(
                 values.get(
                     "attention_backend",
-                    Eagle3AttentionBackend.EAGER,
+                    AttentionBackend.EAGER,
                 )
             ),
+            rotary_dim=None if rotary_dim == head_dim else rotary_dim,
         )
 
 
@@ -171,132 +193,17 @@ def _get_num_aux_hidden_states(
 
 def _parse_attention_backend(
     value: object,
-) -> Eagle3AttentionBackend:
-    if isinstance(value, Eagle3AttentionBackend):
+) -> AttentionBackend:
+    if isinstance(value, AttentionBackend):
         return value
     if not isinstance(value, str):
         raise TypeError("attention_backend must be a string")
 
     try:
-        return Eagle3AttentionBackend(value)
+        return AttentionBackend(value)
     except ValueError as error:
-        supported = ", ".join(backend.value for backend in Eagle3AttentionBackend)
+        supported = ", ".join(backend.value for backend in AttentionBackend)
         raise ValueError(f"attention_backend must be one of: {supported}") from error
-
-
-class Qwen3Eagle3RMSNorm(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            hidden_states = hidden_states + residual
-            return self._normalize(hidden_states), hidden_states
-
-        return self._normalize(hidden_states)
-
-    def _normalize(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-
-        variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
-        normalized = hidden_states.float() * torch.rsqrt(
-            variance + self.variance_epsilon
-        )
-        normalized = normalized * self.weight.float()
-
-        return normalized.to(dtype=input_dtype)
-
-
-def _apply_rotary_embedding(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    positions: torch.Tensor,
-    rope_theta: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if query.ndim != 3 or key.ndim != 3:
-        raise ValueError("query and key must have shape [heads, tokens, dim]")
-    if positions.ndim != 1:
-        raise ValueError("positions must have shape [tokens]")
-    if query.shape[1] != positions.numel():
-        raise ValueError("query token count must match positions")
-    if key.shape[1] != positions.numel():
-        raise ValueError("key token count must match positions")
-    if query.shape[-1] != key.shape[-1]:
-        raise ValueError("query and key head dimensions must match")
-    if query.device != key.device:
-        raise ValueError("query and key must be on the same device")
-
-    head_dim = query.shape[-1]
-    if head_dim % 2 != 0:
-        raise ValueError("head dimension must be even")
-
-    cosine, sine = _rotary_cosine_and_sine(
-        positions.to(query.device), head_dim, rope_theta
-    )
-    cosine = cosine.to(dtype=query.dtype).unsqueeze(0)
-    sine = sine.to(dtype=query.dtype).unsqueeze(0)
-
-    rotated_query = _rotate_with_cosine_and_sine(
-        query,
-        cosine,
-        sine,
-    )
-    rotated_key = _rotate_with_cosine_and_sine(
-        key,
-        cosine,
-        sine,
-    )
-    return rotated_query, rotated_key
-
-
-def _rotary_cosine_and_sine(
-    positions: torch.Tensor,
-    head_dim: int,
-    rope_theta: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return FP32 NeoX RoPE cosine and sine shaped [tokens, head_dim // 2]."""
-    frequency_indices = torch.arange(
-        0,
-        head_dim,
-        2,
-        dtype=torch.float32,
-        device=positions.device,
-    )
-    inverse_frequencies = 1.0 / (rope_theta ** (frequency_indices / head_dim))
-    frequencies = torch.outer(positions.to(dtype=torch.float32), inverse_frequencies)
-    return frequencies.cos(), frequencies.sin()
-
-
-def _rotate_with_cosine_and_sine(
-    tensor: torch.Tensor,
-    cosine: torch.Tensor,
-    sine: torch.Tensor,
-) -> torch.Tensor:
-    first_half, second_half = tensor.chunk(2, dim=-1)
-
-    rotated_first = first_half * cosine - second_half * sine
-    rotated_second = second_half * cosine + first_half * sine
-
-    return torch.cat(
-        (rotated_first, rotated_second),
-        dim=-1,
-    )
-
-
-Eagle3LayerKVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 class Qwen3Eagle3SelfAttention(nn.Module):
@@ -312,6 +219,7 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.rope_theta = config.rope_theta
+        self.rotary_dim = config.rotary_dim
         self.attention_backend = config.attention_backend
 
         query_size = self.num_attention_heads * self.head_dim
@@ -333,9 +241,9 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        past_key_value: Eagle3LayerKVCache | None = None,
+        past_key_value: LayerKV | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, Eagle3LayerKVCache]:
+    ) -> tuple[torch.Tensor, LayerKV]:
         if hidden_states.ndim != 2:
             raise ValueError("hidden_states must have shape [tokens, input_size]")
         if positions.ndim != 1:
@@ -349,227 +257,36 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         query_size = self.num_attention_heads * self.head_dim
         key_value_size = self.num_key_value_heads * self.head_dim
 
-        qkv = self.qkv_proj(hidden_states)
-        query, key, value = qkv.split(
+        query, key, value = self.qkv_proj(hidden_states).split(
             (query_size, key_value_size, key_value_size),
             dim=-1,
         )
-
         query = query.view(
-            sequence_length,
-            self.num_attention_heads,
-            self.head_dim,
+            sequence_length, self.num_attention_heads, self.head_dim
         ).transpose(0, 1)
         key = key.view(
-            sequence_length,
-            self.num_key_value_heads,
-            self.head_dim,
+            sequence_length, self.num_key_value_heads, self.head_dim
         ).transpose(0, 1)
         value = value.view(
-            sequence_length,
-            self.num_key_value_heads,
-            self.head_dim,
+            sequence_length, self.num_key_value_heads, self.head_dim
         ).transpose(0, 1)
 
-        query, key = _apply_rotary_embedding(
+        query, key = apply_rotary_embedding(
+            query, key, positions, self.rope_theta, self.rotary_dim
+        )
+        attention_output, present_key_value = cached_attention(
             query,
             key,
-            positions,
-            self.rope_theta,
+            value,
+            past_key_value,
+            attention_mask,
+            self.attention_backend,
         )
-
-        past_length = 0
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            self._validate_past_key_value(
-                past_key,
-                past_value,
-                hidden_states,
-            )
-            past_length = past_key.shape[1]
-            key = torch.cat((past_key, key), dim=1)
-            value = torch.cat((past_value, value), dim=1)
-
-        present_key_value = (key, value)
-
-        if self.num_attention_heads != self.num_key_value_heads:
-            repeat_count = self.num_attention_heads // self.num_key_value_heads
-            attention_key = key.repeat_interleave(
-                repeat_count,
-                dim=0,
-            )
-            attention_value = value.repeat_interleave(
-                repeat_count,
-                dim=0,
-            )
-        else:
-            attention_key = key
-            attention_value = value
-
-        total_key_length = past_length + sequence_length
-        if attention_mask is None:
-            blocked_attention_mask = torch.triu(
-                torch.ones(
-                    sequence_length,
-                    total_key_length,
-                    dtype=torch.bool,
-                    device=query.device,
-                ),
-                diagonal=past_length + 1,
-            )
-        else:
-            self._validate_attention_mask(
-                attention_mask,
-                sequence_length=sequence_length,
-                total_key_length=total_key_length,
-                device=query.device,
-            )
-            blocked_attention_mask = attention_mask
-
-        attention_output = self._compute_attention(
-            query=query,
-            key=attention_key,
-            value=attention_value,
-            blocked_attention_mask=blocked_attention_mask,
+        attention_output = attention_output.transpose(0, 1).reshape(
+            sequence_length, query_size
         )
-        attention_output = attention_output.transpose(
-            0,
-            1,
-        ).reshape(sequence_length, query_size)
 
         return self.o_proj(attention_output), present_key_value
-
-    def _compute_attention(
-        self,
-        *,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        blocked_attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION:
-            # SDPA uses the opposite boolean convention: True entries are
-            # visible. A batch dimension is required by the fused kernel.
-            allowed_attention_mask = ~blocked_attention_mask
-
-            try:
-                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                    output = F.scaled_dot_product_attention(
-                        query.unsqueeze(0),
-                        key.unsqueeze(0),
-                        value.unsqueeze(0),
-                        attn_mask=allowed_attention_mask,
-                        dropout_p=0.0,
-                    )
-            except RuntimeError as error:
-                raise RuntimeError(
-                    "flash attention is unavailable for the current "
-                    "device, dtype, or mask"
-                ) from error
-
-            return output.squeeze(0)
-
-        attention_scores = torch.matmul(
-            query,
-            key.transpose(-1, -2),
-        )
-        attention_scores = attention_scores * (self.head_dim**-0.5)
-        attention_scores = attention_scores.masked_fill(
-            blocked_attention_mask,
-            torch.finfo(attention_scores.dtype).min,
-        )
-        attention_weights = torch.softmax(
-            attention_scores.float(),
-            dim=-1,
-        ).to(dtype=value.dtype)
-
-        return torch.matmul(
-            attention_weights,
-            value,
-        )
-
-    def _validate_attention_mask(
-        self,
-        attention_mask: torch.Tensor,
-        *,
-        sequence_length: int,
-        total_key_length: int,
-        device: torch.device,
-    ) -> None:
-        if attention_mask.shape != (
-            sequence_length,
-            total_key_length,
-        ):
-            raise ValueError(
-                "attention_mask must have shape [query_tokens, key_tokens]"
-            )
-        if attention_mask.dtype != torch.bool:
-            raise ValueError("attention_mask must use torch.bool")
-        if attention_mask.device != device:
-            raise ValueError("attention_mask must use the attention device")
-        if not torch.all((~attention_mask).any(dim=-1)):
-            raise ValueError("every attention query must have at least one visible key")
-
-    def _validate_past_key_value(
-        self,
-        past_key: torch.Tensor,
-        past_value: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> None:
-        if past_key.ndim != 3 or past_value.ndim != 3:
-            raise ValueError(
-                "cached key and value must have shape [kv_heads, tokens, head_dim]"
-            )
-        if past_key.shape != past_value.shape:
-            raise ValueError("cached key and value shapes must match")
-        if past_key.shape[0] != self.num_key_value_heads:
-            raise ValueError("cached key/value head count is invalid")
-        if past_key.shape[2] != self.head_dim:
-            raise ValueError("cached key/value head dimension is invalid")
-        if past_key.device != hidden_states.device:
-            raise ValueError("cached key/value and hidden_states devices must match")
-        if past_key.dtype != hidden_states.dtype:
-            raise ValueError("cached key/value and hidden_states dtypes must match")
-
-
-class Qwen3Eagle3MLP(nn.Module):
-    def __init__(
-        self,
-        config: Qwen3Eagle3Config,
-    ) -> None:
-        super().__init__()
-
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-
-        self.gate_up_proj = nn.Linear(
-            self.hidden_size,
-            2 * self.intermediate_size,
-            bias=False,
-        )
-        self.down_proj = nn.Linear(
-            self.intermediate_size,
-            self.hidden_size,
-            bias=False,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        if hidden_states.ndim != 2:
-            raise ValueError("hidden_states must have shape [tokens, hidden_size]")
-        if hidden_states.shape[1] != self.hidden_size:
-            raise ValueError("hidden_states width does not match hidden_size")
-
-        gate_and_up = self.gate_up_proj(hidden_states)
-        gate, up = gate_and_up.split(
-            self.intermediate_size,
-            dim=-1,
-        )
-        activated = F.silu(gate) * up
-
-        return self.down_proj(activated)
 
 
 class Qwen3Eagle3DecoderLayer(nn.Module):
@@ -595,17 +312,17 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
             config,
             input_size=attention_input_size,
         )
-        self.mlp = Qwen3Eagle3MLP(config)
+        self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
 
-        self.hidden_norm = Qwen3Eagle3RMSNorm(
+        self.hidden_norm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
         )
-        self.input_layernorm = Qwen3Eagle3RMSNorm(
+        self.input_layernorm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
         )
-        self.post_attention_layernorm = Qwen3Eagle3RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
         )
@@ -616,12 +333,12 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        past_key_value: Eagle3LayerKVCache | None = None,
+        past_key_value: LayerKV | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
-        Eagle3LayerKVCache,
+        LayerKV,
     ]:
         self._validate_inputs(
             positions,
@@ -706,14 +423,7 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
             raise ValueError("input width does not match hidden_size")
 
 
-Eagle3KVCache = tuple[Eagle3LayerKVCache, ...]
-
-
-@dataclass(slots=True)
-class Eagle3ForwardOutput:
-    hidden_states: torch.Tensor
-    recurrent_hidden_states: torch.Tensor
-    past_key_values: Eagle3KVCache
+Eagle3KVCache = tuple[LayerKV, ...]
 
 
 class Qwen3Eagle3Model(nn.Module):
@@ -732,7 +442,7 @@ class Qwen3Eagle3Model(nn.Module):
         self.fc_input_size = config.hidden_size * config.num_aux_hidden_states
 
         if self.norm_before_fc:
-            self.input_norm: Qwen3Eagle3RMSNorm | None = Qwen3Eagle3RMSNorm(
+            self.input_norm: RMSNorm | None = RMSNorm(
                 self.fc_input_size,
                 config.rms_norm_eps,
             )
@@ -742,7 +452,7 @@ class Qwen3Eagle3Model(nn.Module):
         if config.fc_norm:
             self.fc_norm: nn.ModuleList | None = nn.ModuleList(
                 [
-                    Qwen3Eagle3RMSNorm(
+                    RMSNorm(
                         config.hidden_size,
                         config.rms_norm_eps,
                     )
@@ -768,7 +478,7 @@ class Qwen3Eagle3Model(nn.Module):
             ]
         )
 
-        self.norm = Qwen3Eagle3RMSNorm(
+        self.norm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
         )
@@ -828,7 +538,7 @@ class Qwen3Eagle3Model(nn.Module):
         hidden_states: torch.Tensor,
         past_key_values: Eagle3KVCache | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> Eagle3ForwardOutput:
+    ) -> DraftForwardOutput:
         self._validate_inputs(
             positions,
             input_embeds,
@@ -837,7 +547,7 @@ class Qwen3Eagle3Model(nn.Module):
         )
 
         residual: torch.Tensor | None = None
-        present_key_values: list[Eagle3LayerKVCache] = []
+        present_key_values: list[LayerKV] = []
 
         for layer_index, layer in enumerate(self.layers):
             if past_key_values is None:
@@ -872,7 +582,7 @@ class Qwen3Eagle3Model(nn.Module):
         else:
             recurrent_hidden_states = hidden_states_before_norm
 
-        return Eagle3ForwardOutput(
+        return DraftForwardOutput(
             hidden_states=normalized_hidden_states,
             recurrent_hidden_states=recurrent_hidden_states,
             past_key_values=tuple(present_key_values),
@@ -913,7 +623,7 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
 
         self.lm_head = nn.Linear(
             config.hidden_size,
-            config.draft_vocab_size,
+            config.padded_draft_vocab_size or config.draft_vocab_size,
             bias=False,
         )
 
@@ -932,7 +642,7 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
         past_key_values: Eagle3KVCache | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> Eagle3ForwardOutput:
+    ) -> DraftForwardOutput:
         return self.model(
             positions=positions,
             input_embeds=input_embeds,
@@ -956,7 +666,7 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         if hidden_states.shape[1] != self.config.hidden_size:
             raise ValueError("hidden_states width does not match hidden_size")
 
-        return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states)[..., : self.config.draft_vocab_size]
 
     def compute_target_logits(
         self,
@@ -1007,18 +717,10 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         return target_token_ids
 
 
-_VLLM_ATTENTION_SCALES = (
-    ".attn._q_scale",
-    ".attn._k_scale",
-    ".attn._v_scale",
-    ".attn._prob_scale",
-)
-
-
 def load_qwen3_eagle3_from_vllm(
     gpu_model: nn.Module,
     *,
-    attention_backend: Eagle3AttentionBackend | str | None = None,
+    attention_backend: AttentionBackend | str | None = None,
 ) -> Qwen3Eagle3ForCausalLM:
     """Copy the loaded vLLM EAGLE3 draft into a trainable CPU model.
 
@@ -1047,7 +749,6 @@ def load_qwen3_eagle3_from_vllm(
         "aux hidden states disabled": not draft.use_aux_hidden_state,
         "parallel drafting": getattr(gpu_model, "use_parallel_drafting", False),
         "logit scale": gpu_model.logits_processor.scale != 1.0,
-        "partial rotary": rotary.rotary_dim != rotary.head_size,
         "non-NeoX rotary": not rotary.is_neox_style,
         "attention scaling": attention.scaling != attention.head_dim**-0.5,
         "missing draft-to-target map": gpu_model.draft_id_to_target_id is None,
@@ -1074,12 +775,20 @@ def load_qwen3_eagle3_from_vllm(
         num_aux_hidden_states=draft.num_aux_hidden_states,
         fc_norm=draft.fc_norm is not None,
         attention_backend=(
-            Eagle3AttentionBackend.EAGER
+            AttentionBackend.EAGER
             if attention_backend is None
             else _parse_attention_backend(attention_backend)
         ),
+        rotary_dim=(
+            None if rotary.rotary_dim == attention.head_dim else rotary.rotary_dim
+        ),
+        padded_draft_vocab_size=(
+            None
+            if gpu_model.lm_head.weight.shape[0] == config.draft_vocab_size
+            else gpu_model.lm_head.weight.shape[0]
+        ),
     )
-    _validate_vllm_rotary(rotary, cpu_config.head_dim, cpu_config.rope_theta)
+    validate_vllm_rotary(rotary, rotary.rotary_dim, cpu_config.rope_theta, "EAGLE3")
 
     with torch.inference_mode(False), torch.device("meta"):
         model = Qwen3Eagle3ForCausalLM(cpu_config)
@@ -1091,7 +800,7 @@ def load_qwen3_eagle3_from_vllm(
         name
         for name in source
         if name != "model.embed_tokens.weight"
-        and not name.endswith(_VLLM_ATTENTION_SCALES)
+        and not name.endswith(VLLM_ATTENTION_STATE_SUFFIXES)
     }
     if draft_owned != set(model.state_dict()):
         missing = sorted(set(model.state_dict()) - draft_owned)
@@ -1108,23 +817,6 @@ def load_qwen3_eagle3_from_vllm(
         }
         model.load_state_dict(weights, assign=True)
     return model
-
-
-def _validate_vllm_rotary(rotary: nn.Module, head_dim: int, rope_theta: float) -> None:
-    """Check that vLLM's precomputed RoPE table equals the CPU formula.
-
-    This also rejects RoPE scaling variants, whose tables differ.
-    """
-    cache = rotary.cos_sin_cache
-    positions = torch.arange(min(cache.shape[0], 4096))
-    cosine, sine = _rotary_cosine_and_sine(positions, head_dim, rope_theta)
-    expected = torch.cat((cosine, sine), dim=-1)
-    actual = cache[: positions.numel()].detach().float().cpu()
-    tolerance = 1e-4 if cache.dtype == torch.float32 else 1e-2
-    if actual.shape != expected.shape or not torch.allclose(
-        actual, expected, rtol=0, atol=tolerance
-    ):
-        raise ValueError("vLLM EAGLE3 RoPE does not match the CPU RoPE")
 
 
 def convert_angelslim_eagle3_state_dict(
@@ -1178,7 +870,7 @@ def load_qwen3_eagle3_checkpoint(
     model_directory: str | Path,
     *,
     dtype: torch.dtype = torch.float32,
-    attention_backend: Eagle3AttentionBackend | str | None = None,
+    attention_backend: AttentionBackend | str | None = None,
 ) -> Qwen3Eagle3ForCausalLM:
     """Load an AngelSlim Qwen3 EAGLE3 checkpoint from disk.
 

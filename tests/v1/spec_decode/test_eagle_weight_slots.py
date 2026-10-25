@@ -17,6 +17,7 @@ from online_draft.runtime.capture.eagle3 import (
 from online_draft.runtime.weights import DraftWeightInstaller, DraftWeightSnapshot
 
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.online_state import DraftOnlineState, logger
 from vllm.v1.worker.gpu.spec_decode.weight_slots import (
     DraftWeightSlots,
@@ -676,3 +677,36 @@ def test_capture_delivers_every_training_field(prompt_chunks, device) -> None:
                 assert torch.equal(actual, value), name
             else:
                 assert actual == value, name
+
+
+def test_mtp_captures_the_target_final_hidden_state() -> None:
+    """MTP fuses the target's final hidden state, its only feature row."""
+    captured = []
+    speculator = object.__new__(MTPSpeculator)
+    speculator.capture_adapter = SimpleNamespace(
+        capture_target=lambda **target: captured.append(target)
+    )
+    speculator.online_state = SimpleNamespace(advance=lambda: None)
+    speculator.last_prefill_input_embeds = torch.zeros(3, 2)
+    speculator.last_prefill_positions = torch.arange(3)
+    speculator.last_prefill_length = torch.tensor(2)
+    target_hidden_states = torch.randn(3, 2)
+
+    speculator.on_prefill_input_embeds_ready(
+        num_reqs=1,
+        input_batch=SimpleNamespace(
+            req_ids=["request-0"],
+            num_reqs=1,
+            num_tokens=2,
+            num_scheduled_tokens=[2],
+            num_computed_prefill_tokens_np=[0],
+            prefill_len_np=[2],
+        ),
+        aux_hidden_states=None,
+        num_sampled=torch.tensor([1]),
+        capture_enabled=True,
+        target_hidden_states=target_hidden_states,
+    )
+
+    (features,) = captured[0]["aux_hidden_states"]
+    assert torch.equal(features, target_hidden_states[:2])

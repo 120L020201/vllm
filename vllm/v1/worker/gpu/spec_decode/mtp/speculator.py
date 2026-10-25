@@ -1,22 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
 import torch.nn as nn
 
+from vllm.config import VllmConfig
+from vllm.v1.worker.gpu.spec_decode.autoregressive.online import (
+    AutoRegressiveOnlineDraft,
+)
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 
-class MTPSpeculator(AutoRegressiveSpeculator):
+class MTPSpeculator(AutoRegressiveOnlineDraft, AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        self._init_autoregressive_online_draft()
 
     def load_draft_model(
         self,
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
+        self._keep_online_target(target_model)
         draft_model = load_eagle_model(target_model, self.vllm_config)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
@@ -56,3 +66,12 @@ class MTPSpeculator(AutoRegressiveSpeculator):
     def on_multi_step_decode_end(self, num_reqs: int) -> None:
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)
+
+    def _online_target_features(
+        self,
+        aux_hidden_states: list[torch.Tensor] | None,
+        target_hidden_states: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        # MTP fuses the target's final hidden state inside the draft layer.
+        assert target_hidden_states is not None
+        return [target_hidden_states]

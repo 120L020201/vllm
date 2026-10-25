@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 from online_draft.models.qwen3_eagle3 import (
-    Eagle3AttentionBackend,
+    AttentionBackend,
     Eagle3KVCache,
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
@@ -41,7 +41,7 @@ TARGET_VOCAB_SIZE = 8
 
 def _make_model(
     dtype: torch.dtype = torch.float32,
-    attention_backend: Eagle3AttentionBackend = Eagle3AttentionBackend.EAGER,
+    attention_backend: AttentionBackend = AttentionBackend.EAGER,
 ) -> Qwen3Eagle3ForCausalLM:
     config = Qwen3Eagle3Config(
         hidden_size=HIDDEN_SIZE,
@@ -503,7 +503,7 @@ def test_bfloat16_proposal_window_training() -> None:
 
     model = _make_model(
         dtype=torch.bfloat16,
-        attention_backend=Eagle3AttentionBackend.FLASH_ATTENTION,
+        attention_backend=AttentionBackend.FLASH_ATTENTION,
     )
     trainer = DraftTrainer(
         model,
@@ -539,7 +539,7 @@ def test_window_modes_support_fused_optimizer_and_flash_attention(
     torch.manual_seed(27)
 
     model = _make_model(
-        attention_backend=Eagle3AttentionBackend.FLASH_ATTENTION,
+        attention_backend=AttentionBackend.FLASH_ATTENTION,
     )
     trainer = DraftTrainer(
         model,
@@ -556,7 +556,7 @@ def test_window_modes_support_fused_optimizer_and_flash_attention(
         mode=mode,
     )
 
-    assert model.config.attention_backend is Eagle3AttentionBackend.FLASH_ATTENTION
+    assert model.config.attention_backend is AttentionBackend.FLASH_ATTENTION
     assert trainer.optimizer.defaults["fused"] is True
     assert trainer.version == 1
     assert result.mode is mode

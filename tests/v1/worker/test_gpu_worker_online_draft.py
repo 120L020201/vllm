@@ -193,3 +193,16 @@ def test_online_draft_settings_reject_keys_the_method_ignores(
     """A misspelled or other-method key would otherwise be silently ignored."""
     with pytest.raises(ValueError, match=message):
         _parse_online_draft_settings(values, recipe)
+
+
+def test_online_mtp_requires_a_qwen3_5_target() -> None:
+    """The CPU MTP layer mirrors Qwen3.5's gated attention only."""
+    speculator = SimpleNamespace(_speculator_name="MTP")
+    _validate_online_draft_config(
+        _online_config("mtp", model_type="qwen3_5"), speculator
+    )
+
+    with pytest.raises(
+        ValueError, match=r"online MTP requires target model_type in \['qwen3_5'\]"
+    ):
+        _validate_online_draft_config(_online_config("mtp"), speculator)
