@@ -111,10 +111,6 @@ class _Eagle3Recipe:
                 teacher_dtype=model_config.head_dtype or model_config.dtype,
             ),
             target_token_ids=cpu_model.get_target_token_ids().to(device),
-            hidden_size=draft_config.hidden_size,
-            num_aux_hidden_states=draft_config.num_aux_hidden_states,
-            draft_vocab_size=draft_config.draft_vocab_size,
-            feature_dtype=model_config.dtype,
             **capture,
         )
 

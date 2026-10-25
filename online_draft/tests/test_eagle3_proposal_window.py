@@ -18,7 +18,6 @@ from online_draft.training.eagle3.batch import (
 from online_draft.training.eagle3.cache import (
     append_confirmed_window_to_persistent_cache,
     persistent_cache_length,
-    prepare_training_window_spine,
 )
 from online_draft.training.eagle3.inputs import (
     prepare_eagle3_proposal_window_inputs,
@@ -319,7 +318,7 @@ def test_future_spine_and_other_branch_do_not_leak() -> None:
     perturbed_window = Eagle3TrainingWindow(rounds=(perturbed_first, perturbed_second))
 
     def first_branch_logits(window: Eagle3TrainingWindow) -> torch.Tensor:
-        spine = prepare_training_window_spine(
+        spine = append_confirmed_window_to_persistent_cache(
             model,
             window,
             persistent_cache=None,

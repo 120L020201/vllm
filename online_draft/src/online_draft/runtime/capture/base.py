@@ -41,7 +41,8 @@ class CaptureBuffers(PinnedStaging):
 class CaptureProposal(Protocol):
     """GPU proposal verified by the next target step."""
 
-    source_weight_version: int
+    @property
+    def source_weight_version(self) -> int: ...
 
     def to_cpu(
         self,

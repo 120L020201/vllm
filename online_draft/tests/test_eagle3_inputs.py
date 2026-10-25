@@ -9,8 +9,8 @@ from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
 )
 from online_draft.training.eagle3.cache import (
+    append_confirmed_window_to_persistent_cache,
     persistent_cache_length,
-    prepare_training_window_spine,
 )
 from online_draft.training.eagle3.distill import (
     window_forward_kl_loss,
@@ -281,7 +281,7 @@ def test_confirmed_path_forwards_only_loss_rows() -> None:
             second,
         )
     )
-    spine = prepare_training_window_spine(
+    spine = append_confirmed_window_to_persistent_cache(
         model,
         window,
         persistent_cache=None,

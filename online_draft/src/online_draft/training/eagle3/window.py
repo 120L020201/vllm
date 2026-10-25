@@ -13,12 +13,12 @@ from online_draft.models.qwen3_eagle3 import (
 from online_draft.runtime import profile_range
 from online_draft.training.eagle3.batch import (
     Eagle3DistillationBatch,
+    validate_eagle3_rounds,
 )
 from online_draft.training.eagle3.cache import (
     PersistentEagle3KVCache,
-    append_confirmed_window_to_persistent_cache,
+    _append_confirmed_window,
     persistent_cache_length,
-    prepare_training_window_spine,
 )
 from online_draft.training.eagle3.distill import (
     window_forward_kl_loss,
@@ -189,6 +189,7 @@ def train_eagle3_window(
         raise TypeError("EAGLE3 training requires Qwen3Eagle3ForCausalLM")
     if not isinstance(mode, Eagle3WindowMode):
         raise TypeError("mode must be an Eagle3WindowMode")
+    validate_eagle3_rounds(model, window.rounds)
 
     confirmed_length = sum(
         round_batch.confirmed_length for round_batch in window.rounds
@@ -196,7 +197,9 @@ def train_eagle3_window(
 
     with torch.inference_mode(False), torch.enable_grad():
         with profile_range("online_draft.prepare_spine", profile_timeline):
-            training_prefix = prepare_training_window_spine(
+            # Pre-update weights; discarded after the forward. Branch masks
+            # expose only positions before each anchor.
+            training_prefix = _append_confirmed_window(
                 model,
                 window,
                 persistent_cache,
@@ -250,7 +253,7 @@ def train_eagle3_window(
         del training_prefix
 
     with profile_range("online_draft.rebuild_cache", profile_timeline):
-        updated_cache = append_confirmed_window_to_persistent_cache(
+        updated_cache = _append_confirmed_window(
             model,
             window,
             persistent_cache,

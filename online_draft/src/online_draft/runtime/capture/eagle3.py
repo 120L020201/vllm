@@ -102,10 +102,6 @@ class _Eagle3BatchBuilder(
     def __init__(
         self,
         *,
-        hidden_size: int,
-        num_aux_hidden_states: int,
-        draft_vocab_size: int,
-        feature_dtype: torch.dtype,
         on_round: Callable[[Eagle3PreparedRound], object],
         on_epoch_close: Callable[[str], object],
         on_finish: Callable[[str], object],
@@ -115,10 +111,6 @@ class _Eagle3BatchBuilder(
             on_epoch_close=on_epoch_close,
             on_finish=on_finish,
         )
-        self._hidden_size = hidden_size
-        self._num_aux_hidden_states = num_aux_hidden_states
-        self._draft_vocab_size = draft_vocab_size
-        self._feature_dtype = feature_dtype
         self._last_confirmed: ConfirmedRows[Eagle3Rows] | None = None
 
     def _own_rows(self, packet: Eagle3CapturePacket, count: int) -> Eagle3Rows:
@@ -170,13 +162,6 @@ class _Eagle3BatchBuilder(
                 None if confirmed_length == draft_length + 1 else confirmed_length - 1
             ),
         )
-        batch.validate(
-            hidden_size=self._hidden_size,
-            num_aux_hidden_states=self._num_aux_hidden_states,
-            draft_vocab_size=self._draft_vocab_size,
-            feature_dtype=self._feature_dtype,
-        )
-
         self._last_confirmed = ConfirmedRows(
             confirmed.positions[-1:].clone(),
             (confirmed_input_embeds[-1:].clone(), confirmed_aux[-1:].clone()),
@@ -198,10 +183,6 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
         buffers: Eagle3CaptureBuffers,
         target_token_ids: torch.Tensor,
         source_weight_version: Callable[[], int],
-        hidden_size: int,
-        num_aux_hidden_states: int,
-        draft_vocab_size: int,
-        feature_dtype: torch.dtype,
         on_round: Callable[[Eagle3PreparedRound], object],
         on_epoch_close: Callable[[str], object],
         on_finish: Callable[[str], object],
@@ -212,10 +193,6 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
         super().__init__(
             buffers=buffers,
             builder=_Eagle3BatchBuilder(
-                hidden_size=hidden_size,
-                num_aux_hidden_states=num_aux_hidden_states,
-                draft_vocab_size=draft_vocab_size,
-                feature_dtype=feature_dtype,
                 on_round=on_round,
                 on_epoch_close=on_epoch_close,
                 on_finish=on_finish,

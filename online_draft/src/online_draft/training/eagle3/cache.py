@@ -8,9 +8,7 @@ from online_draft.models.qwen3_eagle3 import (
     Eagle3KVCache,
     Qwen3Eagle3ForCausalLM,
 )
-from online_draft.training.eagle3.batch import (
-    Eagle3DistillationBatch,
-)
+from online_draft.training.eagle3.batch import validate_eagle3_rounds
 
 if TYPE_CHECKING:
     from online_draft.training.eagle3.window import (
@@ -98,9 +96,16 @@ def append_confirmed_window_to_persistent_cache(
     Raises:
         ValueError: If history, batches, or positions are inconsistent.
     """
-    for round_batch in window.rounds:
-        _validate_batch(model, round_batch)
+    validate_eagle3_rounds(model, window.rounds)
+    return _append_confirmed_window(model, window, persistent_cache)
 
+
+def _append_confirmed_window(
+    model: Qwen3Eagle3ForCausalLM,
+    window: "Eagle3TrainingWindow",
+    persistent_cache: PersistentEagle3KVCache,
+) -> Eagle3KVCache:
+    """Append without validation; callers validate the window first."""
     first_round = window.rounds[0]
     history_length = persistent_cache_length(persistent_cache)
     first_anchor_position = window.start_anchor_position
@@ -150,37 +155,6 @@ def append_confirmed_window_to_persistent_cache(
         raise RuntimeError("confirmed window append did not create a cache")
 
     return updated_cache
-
-
-def prepare_training_window_spine(
-    model: Qwen3Eagle3ForCausalLM,
-    window: "Eagle3TrainingWindow",
-    persistent_cache: PersistentEagle3KVCache,
-) -> Eagle3KVCache:
-    """Build detached confirmed history for packed training branches.
-
-    The current pre-update weights build every confirmed position in the
-    window. The resulting cache is temporary: both window objectives use
-    branch masks that expose only positions before each branch anchor, and
-    the cache is discarded after the differentiable forward.
-
-    Args:
-        model: CPU EAGLE3 model before the window optimizer update.
-        window: Consecutive verification rounds in the pending update.
-        persistent_cache: Detached history through the first anchor, or
-            None for the first window.
-
-    Returns:
-        Detached confirmed history through the window's final token.
-
-    Raises:
-        ValueError: If history, batches, or positions are inconsistent.
-    """
-    return append_confirmed_window_to_persistent_cache(
-        model,
-        window,
-        persistent_cache,
-    )
 
 
 def _append_fixed_inputs(
@@ -244,16 +218,4 @@ def _detach_cache(
             value.detach(),
         )
         for key, value in cache
-    )
-
-
-def _validate_batch(
-    model: Qwen3Eagle3ForCausalLM,
-    batch: Eagle3DistillationBatch,
-) -> None:
-    batch.validate(
-        hidden_size=model.config.hidden_size,
-        num_aux_hidden_states=(model.config.num_aux_hidden_states),
-        draft_vocab_size=model.config.draft_vocab_size,
-        feature_dtype=batch.prefill_input_embeds.dtype,
     )

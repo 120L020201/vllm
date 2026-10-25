@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from online_draft.models.qwen3_eagle3 import Qwen3Eagle3ForCausalLM
 
 _POSITION_FIELD_NAMES = (
     "prefill_positions",
@@ -239,3 +244,34 @@ class Eagle3DistillationBatch:
 
         if self.confirmed_length != expected_confirmed_length:
             raise ValueError("confirmed length does not match rejection_position")
+
+
+def validate_eagle3_rounds(
+    model: "Qwen3Eagle3ForCausalLM",
+    rounds: Iterable[Eagle3DistillationBatch],
+) -> None:
+    """Validate rounds against the CPU model that will consume them.
+
+    Raises:
+        ValueError: If the model is not on one CPU dtype, or a round does
+            not match the model's sizes and dtype.
+    """
+    floating_parameters = [
+        parameter for parameter in model.parameters() if parameter.is_floating_point()
+    ]
+    if not floating_parameters:
+        raise ValueError("EAGLE3 model must contain floating-point parameters")
+    if {parameter.device.type for parameter in floating_parameters} != {"cpu"}:
+        raise ValueError("EAGLE3 training model must be on the CPU")
+    dtypes = {parameter.dtype for parameter in floating_parameters}
+    if len(dtypes) != 1:
+        raise ValueError("all floating-point model parameters must use one dtype")
+
+    (model_dtype,) = dtypes
+    for round_batch in rounds:
+        round_batch.validate(
+            hidden_size=model.config.hidden_size,
+            num_aux_hidden_states=model.config.num_aux_hidden_states,
+            draft_vocab_size=model.config.draft_vocab_size,
+            feature_dtype=model_dtype,
+        )
