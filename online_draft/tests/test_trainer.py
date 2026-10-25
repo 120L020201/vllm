@@ -104,7 +104,7 @@ def test_bfloat16_optimizer_state() -> None:
     ).to(dtype=torch.bfloat16)
     trainer = DraftTrainer(
         model,
-        TrainerConfig(learning_rate=1e-2),
+        TrainerConfig(learning_rate=1e-2, fused=False),
     )
 
     inputs = torch.randn(
@@ -191,7 +191,7 @@ def test_nonfinite_gradient_does_not_update_model() -> None:
     model = nn.Linear(3, 2)
     trainer = DraftTrainer(
         model,
-        TrainerConfig(learning_rate=0.1),
+        TrainerConfig(learning_rate=0.1, check_gradients=True),
     )
     old_weight = model.weight.detach().clone()
 

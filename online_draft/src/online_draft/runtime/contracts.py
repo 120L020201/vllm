@@ -5,10 +5,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 import torch
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from online_draft.training.trainer import DraftTrainer
 
 BatchT = TypeVar("BatchT")
 
@@ -21,6 +24,35 @@ class PreparedRound(Generic[BatchT]):
     step_id: int
     source_weight_version: int
     batch: BatchT
+
+
+class WindowResult(Protocol):
+    """Metrics the pipeline reads after one window update."""
+
+    @property
+    def model_version(self) -> int: ...
+
+    @property
+    def round_count(self) -> int: ...
+
+    @property
+    def target_count(self) -> int: ...
+
+
+class TrainRounds(Protocol):
+    """Train one window and return its updated persistent cache.
+
+    The cache is method-specific and None before the first window.
+    """
+
+    def __call__(
+        self,
+        trainer: DraftTrainer,
+        rounds: tuple[Any, ...],
+        cache: Any,
+        profile_timeline: bool,
+        /,
+    ) -> tuple[Any, WindowResult]: ...
 
 
 class CapturePacket(Protocol):
@@ -41,8 +73,11 @@ class CaptureAdapter(Protocol):
     capture_target and capture_proposal take model-specific tensors.
     """
 
-    capture_target: Callable[..., None]
-    capture_proposal: Callable[..., None]
+    @property
+    def capture_target(self) -> Callable[..., None]: ...
+
+    @property
+    def capture_proposal(self) -> Callable[..., None]: ...
 
     @property
     def completed_rounds(self) -> int: ...

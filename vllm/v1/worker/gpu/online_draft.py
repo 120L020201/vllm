@@ -3,32 +3,34 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, fields
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
-from online_draft.models import load_qwen3_eagle3_from_vllm
+from online_draft.models import Qwen3Eagle3ForCausalLM, load_qwen3_eagle3_from_vllm
 from online_draft.runtime.async_pipeline import AsyncDraftPipeline
 from online_draft.runtime.capture.eagle3 import (
     Eagle3CaptureAdapter,
     Eagle3CaptureBuffers,
 )
+from online_draft.runtime.contracts import TrainRounds
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.training.eagle3.window import train_eagle3_rounds
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
+from torch import nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm.v1.worker.gpu.spec_decode.online import OnlineDraftSpeculator
 
 if TYPE_CHECKING:
     from online_draft.runtime.capture.dflash import DFlashCaptureAdapter
 
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 logger = init_logger(__name__)
 
@@ -40,7 +42,7 @@ class OnlineDraftRuntime:
     trainer: DraftTrainer
     pipeline: AsyncDraftPipeline
     capture_adapter: Eagle3CaptureAdapter | DFlashCaptureAdapter
-    speculator: EagleSpeculator | DFlashSpeculator
+    speculator: OnlineDraftSpeculator
     inference_cpu: CPUWorkerConfig
 
     def enable_capture(self) -> None:
@@ -63,21 +65,225 @@ class OnlineDraftRuntime:
         self.pipeline.close()
 
 
+@dataclass(frozen=True, kw_only=True)
+class _Eagle3Recipe:
+    """EAGLE3 captures before its trainable FC; fields are its settings."""
+
+    name: ClassVar[str] = "EAGLE3"
+
+    attention_backend: str | None = None
+
+    @staticmethod
+    def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
+        assert vllm_config.speculative_config is not None
+        return vllm_config.speculative_config.method == "eagle3"
+
+    def load_model(self, gpu_draft_model: nn.Module) -> nn.Module:
+        return load_qwen3_eagle3_from_vllm(
+            gpu_draft_model, attention_backend=self.attention_backend
+        )
+
+    def check(self, trainer: DraftTrainer, speculator: Any) -> None:
+        assert isinstance(speculator, EagleSpeculator)
+
+    def train_rounds(self) -> TrainRounds:
+        return train_eagle3_rounds
+
+    def create_adapter(
+        self,
+        vllm_config: VllmConfig,
+        cpu_model: nn.Module,
+        device: torch.device,
+        **capture: Any,
+    ) -> Eagle3CaptureAdapter:
+        assert isinstance(cpu_model, Qwen3Eagle3ForCausalLM)
+        assert vllm_config.speculative_config is not None
+        model_config = vllm_config.model_config
+        draft_config = cpu_model.config
+        return Eagle3CaptureAdapter(
+            buffers=Eagle3CaptureBuffers(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.speculative_config.num_speculative_tokens,
+                draft_config.hidden_size,
+                draft_config.num_aux_hidden_states,
+                draft_config.draft_vocab_size,
+                dtype=model_config.dtype,
+                teacher_dtype=model_config.head_dtype or model_config.dtype,
+            ),
+            target_token_ids=cpu_model.get_target_token_ids().to(device),
+            hidden_size=draft_config.hidden_size,
+            num_aux_hidden_states=draft_config.num_aux_hidden_states,
+            draft_vocab_size=draft_config.draft_vocab_size,
+            feature_dtype=model_config.dtype,
+            **capture,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class _DFlashRecipe:
+    """DFlash captures its frozen FC output; fields are its settings."""
+
+    name: ClassVar[str] = "DFlash"
+
+    grouped_query_attention: bool = False
+    selective_last_layer: bool = False
+    max_train_rounds: int = 16
+    loss_decay_gamma: float = 7.0
+
+    def __post_init__(self) -> None:
+        if self.max_train_rounds < 0 or not 0 < self.loss_decay_gamma < float("inf"):
+            raise ValueError(
+                "DFlash requires max_train_rounds >= 0 and finite loss_decay_gamma > 0"
+            )
+
+    @staticmethod
+    def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
+        return speculator._speculator_name == "DFlash"
+
+    def load_model(self, gpu_draft_model: nn.Module) -> nn.Module:
+        from online_draft.models.qwen3_dflash import load_qwen3_dflash_from_vllm
+
+        return load_qwen3_dflash_from_vllm(
+            gpu_draft_model,
+            grouped_query_attention=self.grouped_query_attention,
+            selective_last_layer=self.selective_last_layer,
+        )
+
+    def check(self, trainer: DraftTrainer, speculator: Any) -> None:
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+            DFlashSpeculator,
+        )
+
+        assert isinstance(speculator, DFlashSpeculator)
+        assert not any(
+            name.startswith("model.fc.") for name in trainer.trainable_parameter_names
+        ), "online DFlash captures FC output and installs weights after FC"
+
+    def train_rounds(self) -> TrainRounds:
+        from online_draft.training.dflash.window import train_dflash_window
+
+        return partial(
+            train_dflash_window,
+            max_train_rounds=self.max_train_rounds,
+            loss_decay_gamma=self.loss_decay_gamma,
+        )
+
+    def create_adapter(
+        self,
+        vllm_config: VllmConfig,
+        cpu_model: nn.Module,
+        device: torch.device,
+        **capture: Any,
+    ) -> DFlashCaptureAdapter:
+        from online_draft.models.qwen3_dflash import Qwen3DFlashForCausalLM
+        from online_draft.runtime.capture.dflash import (
+            DFlashCaptureAdapter,
+            DFlashCaptureBuffers,
+        )
+
+        assert isinstance(cpu_model, Qwen3DFlashForCausalLM)
+        assert vllm_config.speculative_config is not None
+        model_config = vllm_config.model_config
+        return DFlashCaptureAdapter(
+            buffers=DFlashCaptureBuffers(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.speculative_config.num_speculative_tokens + 1,
+                cpu_model.config.hidden_size,
+                cpu_model.config.vocab_size,
+                dtype=model_config.dtype,
+                teacher_dtype=model_config.head_dtype or model_config.dtype,
+            ),
+            **capture,
+        )
+
+
+_Recipe = _Eagle3Recipe | _DFlashRecipe
+
+# Setting name -> TrainerConfig field.
+_TRAINER_SETTINGS = {
+    "learning_rate": "learning_rate",
+    "fused_optimizer": "fused",
+    "check_gradients": "check_gradients",
+    "master_weights": "master_weights",
+    "frozen_parameter_prefixes": "frozen_parameter_prefixes",
+}
+_RUNTIME_SETTINGS = {"cpu_threads", "cpu_affinity", "log_queue_sizes", "log_updates"}
+_CPU_ROLES = ("inference", "capture", "training")
+
+
+@dataclass(frozen=True)
+class _OnlineDraftSettings:
+    """Parsed ``additional_config["online_draft"]``."""
+
+    recipe: _Recipe
+    trainer: TrainerConfig
+    cpu: dict[str, CPUWorkerConfig]
+    log_queue_sizes: bool
+    log_updates: bool
+
+
+def _recipe_type(vllm_config: VllmConfig) -> type[_Recipe]:
+    assert vllm_config.speculative_config is not None
+    if vllm_config.speculative_config.method == "dflash":
+        return _DFlashRecipe
+    return _Eagle3Recipe
+
+
+def _parse_online_draft_settings(
+    values: Mapping[str, Any], recipe_type: type[_Recipe]
+) -> _OnlineDraftSettings:
+    """Reject settings the selected method does not read."""
+    recipe_settings = {field.name for field in fields(recipe_type)}
+    unknown = set(values) - _TRAINER_SETTINGS.keys() - _RUNTIME_SETTINGS
+    unknown -= recipe_settings
+    if unknown:
+        raise ValueError(
+            f"unknown online {recipe_type.name} settings: {', '.join(sorted(unknown))}"
+        )
+
+    cpu_threads = values.get("cpu_threads", {})
+    cpu_affinity = values.get("cpu_affinity", {})
+    unknown_roles = {*cpu_threads, *cpu_affinity} - set(_CPU_ROLES)
+    if unknown_roles:
+        raise ValueError(
+            f"unknown online draft CPU roles: {', '.join(sorted(unknown_roles))}"
+        )
+
+    trainer = {
+        field: values[name]
+        for name, field in _TRAINER_SETTINGS.items()
+        if name in values
+    }
+    if "frozen_parameter_prefixes" in trainer:
+        trainer["frozen_parameter_prefixes"] = tuple(
+            trainer["frozen_parameter_prefixes"]
+        )
+
+    return _OnlineDraftSettings(
+        recipe=recipe_type(
+            **{name: values[name] for name in recipe_settings & set(values)}
+        ),
+        trainer=TrainerConfig(**trainer),
+        cpu={
+            role: CPUWorkerConfig(
+                threads=cpu_threads.get(role), cpus=tuple(cpu_affinity.get(role, ()))
+            )
+            for role in _CPU_ROLES
+        },
+        log_queue_sizes=values.get("log_queue_sizes", False),
+        log_updates=values.get("log_updates", False),
+    )
+
+
 def _validate_online_draft_config(vllm_config: VllmConfig, speculator: Any) -> None:
     """Reject configs that break one request's contiguous capture history."""
-    speculative_config = vllm_config.speculative_config
-    assert speculative_config is not None
+    recipe_type = _recipe_type(vllm_config)
     parallel_config = vllm_config.parallel_config
 
-    if speculative_config.method == "dflash":
-        name = "DFlash"
-        supported_method = speculator._speculator_name == "DFlash"
-    else:
-        name = "EAGLE3"
-        supported_method = speculative_config.method == "eagle3"
-
     requirements = {
-        f"method={name.lower()}": supported_method,
+        f"method={recipe_type.name.lower()}": recipe_type.supports(
+            vllm_config, speculator
+        ),
         "tensor_parallel_size=1": parallel_config.tensor_parallel_size == 1,
         "pipeline_parallel_size=1": parallel_config.pipeline_parallel_size == 1,
         "max_num_seqs=1": vllm_config.scheduler_config.max_num_seqs == 1,
@@ -89,7 +295,7 @@ def _validate_online_draft_config(vllm_config: VllmConfig, speculator: Any) -> N
 
     unmet = [requirement for requirement, ok in requirements.items() if not ok]
     if unmet:
-        raise ValueError(f"online {name} requires {', '.join(unmet)}")
+        raise ValueError(f"online {recipe_type.name} requires {', '.join(unmet)}")
 
 
 def create_online_draft(
@@ -98,155 +304,55 @@ def create_online_draft(
     device: torch.device,
 ) -> OnlineDraftRuntime:
     """Build the CPU training pipeline and connect it to the loaded speculator."""
-    speculative_config = vllm_config.speculative_config
-    assert speculative_config is not None
-
     gpu_draft_model = model_runner.get_draft_model()
     assert gpu_draft_model is not None
-
-    additional_config = cast(dict[str, Any], vllm_config.additional_config)
-    online_config = additional_config.get("online_draft", {})
-    cpu_threads = online_config.get("cpu_threads", {})
-    cpu_affinity = online_config.get("cpu_affinity", {})
-    cpu_configs = {
-        role: CPUWorkerConfig(
-            threads=cpu_threads.get(role),
-            cpus=tuple(cpu_affinity.get(role, ())),
-        )
-        for role in ("inference", "capture", "training")
-    }
-    profile_online_draft = envs.VLLM_ONLINE_DRAFT_PROFILE
-    log_queue_sizes = online_config.get("log_queue_sizes", False)
     speculator = model_runner.speculator
-    assert speculator is not None
+    assert isinstance(speculator, OnlineDraftSpeculator)
 
-    is_dflash = speculative_config.method == "dflash"
     _validate_online_draft_config(vllm_config, speculator)
-    if is_dflash:
-        from online_draft.models.qwen3_dflash import load_qwen3_dflash_from_vllm
-        from online_draft.runtime.capture.dflash import (
-            DFlashCaptureAdapter,
-            DFlashCaptureBuffers,
-        )
-        from online_draft.training.dflash.window import train_dflash_window
-
-        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
-            DFlashSpeculator,
-        )
-
-        cpu_model = load_qwen3_dflash_from_vllm(
-            gpu_draft_model,
-            grouped_query_attention=online_config.get("grouped_query_attention", False),
-            selective_last_layer=online_config.get("selective_last_layer", False),
-        )
-    else:
-        cpu_model = load_qwen3_eagle3_from_vllm(
-            gpu_draft_model,
-            attention_backend=online_config.get("attention_backend"),
-        )
-
-    trainer = DraftTrainer(
-        cpu_model,
-        TrainerConfig(
-            learning_rate=online_config.get("learning_rate", 1e-5),
-            fused=online_config.get("fused_optimizer", True),
-            frozen_parameter_prefixes=tuple(
-                online_config.get("frozen_parameter_prefixes", ())
-            ),
-            check_gradients=online_config.get("check_gradients", False),
-            master_weights=online_config.get("master_weights", False),
-        ),
+    additional_config = cast(dict[str, Any], vllm_config.additional_config)
+    settings = _parse_online_draft_settings(
+        additional_config.get("online_draft", {}), _recipe_type(vllm_config)
     )
+    recipe = settings.recipe
+    profile_online_draft = envs.VLLM_ONLINE_DRAFT_PROFILE
 
-    if is_dflash:
-        assert not any(
-            name.startswith("model.fc.") for name in trainer.trainable_parameter_names
-        ), "online DFlash captures FC output and installs weights after FC"
-
-    assert isinstance(speculator, DFlashSpeculator if is_dflash else EagleSpeculator)
+    cpu_model = recipe.load_model(gpu_draft_model)
+    trainer = DraftTrainer(cpu_model, settings.trainer)
+    recipe.check(trainer, speculator)
 
     speculator.configure_online_training(
         trainer.trainable_parameter_names,
         profile_timeline=profile_online_draft,
-        log_updates=online_config.get("log_updates", False),
+        log_updates=settings.log_updates,
     )
-
     installer = speculator.draft_weight_installer
     assert installer is not None
 
-    queue_logger = lambda name: (
-        lambda size: logger.info("Online draft %s queue size: %d", name, size)
-    )
-    train_queue_log = queue_logger("train") if log_queue_sizes else None
-    capture_queue_log = queue_logger("capture") if log_queue_sizes else None
-    train_rounds: Callable
-    if is_dflash:
-        max_train_rounds = online_config.get("max_train_rounds", 16)
-        loss_decay_gamma = online_config.get("loss_decay_gamma", 7.0)
-        if max_train_rounds < 0 or not 0 < loss_decay_gamma < float("inf"):
-            raise ValueError(
-                "DFlash requires max_train_rounds >= 0 and finite loss_decay_gamma > 0"
-            )
-        train_rounds = partial(
-            train_dflash_window,
-            max_train_rounds=max_train_rounds,
-            loss_decay_gamma=loss_decay_gamma,
-        )
-    else:
-        train_rounds = train_eagle3_rounds
+    def queue_logger(name: str) -> Callable[[int], None] | None:
+        if not settings.log_queue_sizes:
+            return None
+        return lambda size: logger.info("Online draft %s queue size: %d", name, size)
 
     pipeline = AsyncDraftPipeline(
         trainer=trainer,
-        train_rounds=train_rounds,
-        on_queue_size=train_queue_log,
+        train_rounds=recipe.train_rounds(),
+        on_queue_size=queue_logger("train"),
         profile_timeline=profile_online_draft,
-        cpu_config=cpu_configs["training"],
+        cpu_config=settings.cpu["training"],
     )
-    if is_dflash:
-        adapter = DFlashCaptureAdapter(
-            buffers=DFlashCaptureBuffers(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                speculative_config.num_speculative_tokens + 1,
-                cpu_model.config.hidden_size,
-                cpu_model.config.vocab_size,
-                dtype=vllm_config.model_config.dtype,
-                teacher_dtype=vllm_config.model_config.head_dtype
-                or vllm_config.model_config.dtype,
-            ),
-            source_weight_version=lambda: installer.active_version,
-            on_round=pipeline.submit_round,
-            on_epoch_close=pipeline.close_epoch,
-            on_finish=pipeline.finish_request,
-            on_queue_size=capture_queue_log,
-            profile_timeline=profile_online_draft,
-            cpu_config=cpu_configs["capture"],
-        )
-    else:
-        draft_config = cpu_model.config
-        adapter = Eagle3CaptureAdapter(
-            buffers=Eagle3CaptureBuffers(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                speculative_config.num_speculative_tokens,
-                draft_config.hidden_size,
-                draft_config.num_aux_hidden_states,
-                draft_config.draft_vocab_size,
-                dtype=vllm_config.model_config.dtype,
-                teacher_dtype=vllm_config.model_config.head_dtype
-                or vllm_config.model_config.dtype,
-            ),
-            target_token_ids=cpu_model.get_target_token_ids().to(device),
-            source_weight_version=lambda: installer.active_version,
-            hidden_size=draft_config.hidden_size,
-            num_aux_hidden_states=draft_config.num_aux_hidden_states,
-            draft_vocab_size=draft_config.draft_vocab_size,
-            feature_dtype=vllm_config.model_config.dtype,
-            on_round=pipeline.submit_round,
-            on_epoch_close=pipeline.close_epoch,
-            on_finish=pipeline.finish_request,
-            on_queue_size=capture_queue_log,
-            profile_timeline=profile_online_draft,
-            cpu_config=cpu_configs["capture"],
-        )
+    adapter = recipe.create_adapter(
+        vllm_config,
+        cpu_model,
+        device,
+        source_weight_version=lambda: installer.active_version,
+        on_round=pipeline.submit_round,
+        on_epoch_close=pipeline.close_epoch,
+        on_finish=pipeline.finish_request,
+        on_queue_size=queue_logger("capture"),
+        profile_timeline=profile_online_draft,
+        cpu_config=settings.cpu["capture"],
+    )
     speculator.set_snapshot_source(pipeline.poll_snapshot)
 
     return OnlineDraftRuntime(
@@ -254,5 +360,5 @@ def create_online_draft(
         pipeline=pipeline,
         capture_adapter=adapter,
         speculator=speculator,
-        inference_cpu=cpu_configs["inference"],
+        inference_cpu=settings.cpu["inference"],
     )

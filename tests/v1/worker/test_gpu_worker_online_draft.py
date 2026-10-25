@@ -9,6 +9,9 @@ import pytest
 import vllm.v1.worker.gpu_worker as gpu_worker
 from vllm.v1.worker.gpu.online_draft import (
     OnlineDraftRuntime,
+    _DFlashRecipe,
+    _Eagle3Recipe,
+    _parse_online_draft_settings,
     _validate_online_draft_config,
 )
 from vllm.v1.worker.gpu_worker import Worker
@@ -155,3 +158,38 @@ def test_online_draft_config_lists_unmet_requirements(method, name) -> None:
 def test_online_eagle3_rejects_other_speculative_methods() -> None:
     with pytest.raises(ValueError, match="online EAGLE3 requires method=eagle3"):
         _validate_online_draft_config(_online_config("eagle"), Mock())
+
+
+def test_online_draft_settings_map_to_trainer_and_method() -> None:
+    settings = _parse_online_draft_settings(
+        {
+            "fused_optimizer": False,
+            "frozen_parameter_prefixes": ["model.fc"],
+            "max_train_rounds": 4,
+            "cpu_threads": {"training": 2},
+        },
+        _DFlashRecipe,
+    )
+
+    assert settings.trainer.fused is False
+    assert settings.trainer.check_gradients is False
+    assert settings.trainer.frozen_parameter_prefixes == ("model.fc",)
+    assert settings.recipe == _DFlashRecipe(max_train_rounds=4)
+    assert settings.cpu["training"].threads == 2
+    assert settings.cpu["capture"].threads is None
+
+
+@pytest.mark.parametrize(
+    ("recipe", "values", "message"),
+    [
+        (_Eagle3Recipe, {"max_train_rounds": 4}, "online EAGLE3 settings: max_train"),
+        (_DFlashRecipe, {"attention_backend": "eager"}, "online DFlash settings"),
+        (_Eagle3Recipe, {"cpu_threads": {"train": 2}}, "CPU roles: train"),
+    ],
+)
+def test_online_draft_settings_reject_keys_the_method_ignores(
+    recipe, values, message
+) -> None:
+    """A misspelled or other-method key would otherwise be silently ignored."""
+    with pytest.raises(ValueError, match=message):
+        _parse_online_draft_settings(values, recipe)

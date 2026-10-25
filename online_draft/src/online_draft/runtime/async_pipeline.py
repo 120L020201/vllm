@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 from online_draft.runtime import profile_range
-from online_draft.runtime.contracts import PreparedRound
+from online_draft.runtime.contracts import PreparedRound, TrainRounds
 from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from online_draft.runtime.weights import DraftWeightSnapshot
 from online_draft.training.trainer import DraftTrainer
@@ -43,7 +43,7 @@ class AsyncDraftPipeline:
         *,
         trainer: DraftTrainer,
         on_queue_size: Callable[[int], None] | None = None,
-        train_rounds: Callable,
+        train_rounds: TrainRounds,
         profile_timeline: bool = False,
         cpu_config: CPUWorkerConfig | None = None,
     ) -> None:

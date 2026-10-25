@@ -20,9 +20,9 @@ class TrainerConfig:
 
     learning_rate: float = 1e-5
     weight_decay: float = 0.0
-    fused: bool = False
+    fused: bool = True
     frozen_parameter_prefixes: tuple[str, ...] = ()
-    check_gradients: bool = True
+    check_gradients: bool = False
     master_weights: bool = False
 
     def __post_init__(self) -> None:
@@ -207,13 +207,6 @@ class DraftTrainer:
                 frozen_names.append(name)
 
         return tuple(frozen_names)
-
-    def _nonfinite_gradient_names(self) -> list[str]:
-        return [
-            name
-            for name, parameter in self._trainable_named_parameters
-            if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
-        ]
 
 
 def _matches_prefix(
