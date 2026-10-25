@@ -62,17 +62,17 @@ def _make_batch(
     )
 
     return Eagle3DistillationBatch(
-        prefill_positions=torch.arange(
+        prefix_positions=torch.arange(
             anchor_position - PREFILL_LENGTH + 1,
             anchor_position + 1,
             dtype=torch.long,
         ),
-        prefill_input_embeds=torch.randn(
+        prefix_input_embeds=torch.randn(
             PREFILL_LENGTH,
             HIDDEN_SIZE,
             dtype=feature_dtype,
         ),
-        prefill_aux_hidden_states=torch.randn(
+        prefix_aux_hidden_states=torch.randn(
             PREFILL_LENGTH,
             HIDDEN_SIZE * NUM_AUX_HIDDEN_STATES,
             dtype=feature_dtype,
@@ -87,7 +87,7 @@ def _make_batch(
             HIDDEN_SIZE,
             dtype=feature_dtype,
         ),
-        draft_recurrent_hidden_states=torch.randn(
+        draft_input_hidden_states=torch.randn(
             draft_length - 1,
             HIDDEN_SIZE,
             dtype=feature_dtype,
@@ -159,9 +159,9 @@ def test_confirmed_path_packs_only_confirmed_queries() -> None:
 
     expected_input_embeds = torch.cat(
         (
-            first.prefill_input_embeds[-1:],
+            first.prefix_input_embeds[-1:],
             first.draft_token_input_embeds,
-            second.prefill_input_embeds[-1:],
+            second.prefix_input_embeds[-1:],
             second.draft_token_input_embeds[:1],
         ),
         dim=0,
@@ -170,10 +170,10 @@ def test_confirmed_path_packs_only_confirmed_queries() -> None:
     with torch.no_grad():
         expected_hidden_states = torch.cat(
             (
-                model.combine_hidden_states(first.prefill_aux_hidden_states[-1:]),
-                first.draft_recurrent_hidden_states,
-                model.combine_hidden_states(second.prefill_aux_hidden_states[-1:]),
-                second.draft_recurrent_hidden_states[:1],
+                model.combine_hidden_states(first.prefix_aux_hidden_states[-1:]),
+                first.draft_input_hidden_states,
+                model.combine_hidden_states(second.prefix_aux_hidden_states[-1:]),
+                second.draft_input_hidden_states[:1],
             ),
             dim=0,
         )
@@ -249,7 +249,7 @@ def test_confirmed_path_trims_final_bonus_prediction_row() -> None:
         inputs.input_embeds,
         torch.cat(
             (
-                round_batch.prefill_input_embeds[-1:],
+                round_batch.prefix_input_embeds[-1:],
                 round_batch.draft_token_input_embeds,
             ),
             dim=0,

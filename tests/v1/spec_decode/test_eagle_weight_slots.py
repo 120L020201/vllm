@@ -455,7 +455,7 @@ def _make_request(seed: int = 0) -> SimpleNamespace:
         rows = NUM_SPECULATIVE_STEPS - 1
         return SimpleNamespace(
             token_input_embeds=_random(generator, rows, HIDDEN_SIZE),
-            recurrent_hidden_states=_random(generator, rows, HIDDEN_SIZE),
+            input_hidden_states=_random(generator, rows, HIDDEN_SIZE),
         )
 
     return SimpleNamespace(
@@ -530,8 +530,8 @@ def _engine_step(
     )
 
     speculator._draft_capture_input_embeds = proposal.token_input_embeds.to(device)
-    speculator._draft_capture_recurrent_hidden_states = (
-        proposal.recurrent_hidden_states.to(device)
+    speculator._draft_capture_input_hidden_states = proposal.input_hidden_states.to(
+        device
     )
     speculator._draft_capture_length = proposal.token_input_embeds.shape[0]
     speculator.on_proposal_ready(
@@ -613,26 +613,26 @@ def _capture_rounds(
 
 def _expected_batches(request: SimpleNamespace) -> list[dict]:
     expected = []
-    prefill_positions = torch.arange(PROMPT_LENGTH)
-    prefill_embeds = request.prompt_embeds
-    prefill_aux = torch.cat(request.prompt_aux, dim=-1)
+    prefix_positions = torch.arange(PROMPT_LENGTH)
+    prefix_embeds = request.prompt_embeds
+    prefix_aux = torch.cat(request.prompt_aux, dim=-1)
     for step, num_sampled in enumerate(NUM_SAMPLED):
-        anchor = int(prefill_positions[-1])
+        anchor = int(prefix_positions[-1])
         confirmed_positions = torch.arange(anchor + 1, anchor + 1 + num_sampled)
         confirmed_embeds = request.verify_embeds[step][:num_sampled]
         confirmed_aux = torch.cat(request.verify_aux[step], dim=-1)[:num_sampled]
         teacher_logits = request.verify_logits[step][:, list(TARGET_TOKEN_IDS)]
         expected.append(
             {
-                "prefill_positions": prefill_positions,
-                "prefill_input_embeds": prefill_embeds,
-                "prefill_aux_hidden_states": prefill_aux,
+                "prefix_positions": prefix_positions,
+                "prefix_input_embeds": prefix_embeds,
+                "prefix_aux_hidden_states": prefix_aux,
                 "proposal_positions": torch.arange(
                     anchor, anchor + NUM_SPECULATIVE_STEPS
                 ),
                 "draft_token_input_embeds": request.proposals[step].token_input_embeds,
-                "draft_recurrent_hidden_states": (
-                    request.proposals[step].recurrent_hidden_states
+                "draft_input_hidden_states": (
+                    request.proposals[step].input_hidden_states
                 ),
                 "teacher_probabilities": teacher_logits[:NUM_SPECULATIVE_STEPS].softmax(
                     -1
@@ -647,9 +647,9 @@ def _expected_batches(request: SimpleNamespace) -> list[dict]:
                 ),
             }
         )
-        prefill_positions = confirmed_positions[-1:]
-        prefill_embeds = confirmed_embeds[-1:]
-        prefill_aux = confirmed_aux[-1:]
+        prefix_positions = confirmed_positions[-1:]
+        prefix_embeds = confirmed_embeds[-1:]
+        prefix_aux = confirmed_aux[-1:]
     return expected
 
 

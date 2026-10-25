@@ -121,13 +121,13 @@ def _append_confirmed_window(
     auxiliary_hidden_state_parts: list[torch.Tensor] = []
 
     if history_length == 0:
-        first_position = int(first_round.prefill_positions[0].item())
+        first_position = int(first_round.prefix_positions[0].item())
         if first_position != 0:
             raise ValueError("first observation must contain the full prompt")
 
-        position_parts.append(first_round.prefill_positions)
-        input_embed_parts.append(first_round.prefill_input_embeds)
-        auxiliary_hidden_state_parts.append(first_round.prefill_aux_hidden_states)
+        position_parts.append(first_round.prefix_positions)
+        input_embed_parts.append(first_round.prefix_input_embeds)
+        auxiliary_hidden_state_parts.append(first_round.prefix_aux_hidden_states)
 
     for round_batch in window.rounds:
         position_parts.append(round_batch.confirmed_positions)

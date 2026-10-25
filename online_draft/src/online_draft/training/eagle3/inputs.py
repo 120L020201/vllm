@@ -130,7 +130,7 @@ def _pack_window_inputs(
 
     anchor_aux_hidden_states = torch.cat(
         tuple(
-            round_batch.prefill_aux_hidden_states[-1:] for round_batch in window.rounds
+            round_batch.prefix_aux_hidden_states[-1:] for round_batch in window.rounds
         ),
         dim=0,
     )
@@ -146,11 +146,11 @@ def _pack_window_inputs(
         if not 1 <= target_count <= round_batch.draft_length:
             raise ValueError("round target count must be within its draft length")
 
-        # The anchor is the final prefill row; later rows were generated on
+        # The anchor is the final prefix row; later rows were generated on
         # the GPU and are fixed inputs rather than CPU model outputs.
         input_embeds = torch.cat(
             (
-                round_batch.prefill_input_embeds[-1:],
+                round_batch.prefix_input_embeds[-1:],
                 round_batch.draft_token_input_embeds,
             ),
             dim=0,
@@ -158,7 +158,7 @@ def _pack_window_inputs(
         hidden_states = torch.cat(
             (
                 anchor_hidden_states[index : index + 1],
-                round_batch.draft_recurrent_hidden_states,
+                round_batch.draft_input_hidden_states,
             ),
             dim=0,
         )

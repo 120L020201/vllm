@@ -459,7 +459,7 @@ def test_draft_decode_captures_the_hidden_state_each_step_consumes(monkeypatch):
     speculator.dtype = torch.float32
     speculator.device = torch.device("cpu")
     speculator._draft_capture_input_embeds = None
-    speculator._draft_capture_recurrent_hidden_states = None
+    speculator._draft_capture_input_hidden_states = None
     speculator._ensure_draft_capture_buffers(1)
     speculator._draft_capture_length = 0
     # _prefill leaves the anchor's output hidden (h4) as the first decode input.
@@ -496,5 +496,5 @@ def test_draft_decode_captures_the_hidden_state_each_step_consumes(monkeypatch):
         speculator._generate_draft(1, 1, None, None, None)
 
     snapshot = speculator.get_proposal_snapshot()
-    assert snapshot.draft_recurrent_hidden_states[:, 0].tolist() == [4.0, 5.0]
+    assert snapshot.draft_input_hidden_states[:, 0].tolist() == [4.0, 5.0]
     assert snapshot.draft_token_input_embeds[:, 0].tolist() == [-5.0, -6.0]

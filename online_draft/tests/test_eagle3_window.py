@@ -61,20 +61,20 @@ def _make_batch(
     confirmed_length = (
         draft_length + 1 if rejection_position is None else rejection_position + 1
     )
-    prefill_length = 2
+    prefix_length = 2
 
     return Eagle3DistillationBatch(
-        prefill_positions=torch.arange(
-            anchor_position - prefill_length + 1,
+        prefix_positions=torch.arange(
+            anchor_position - prefix_length + 1,
             anchor_position + 1,
             dtype=torch.long,
         ),
-        prefill_input_embeds=torch.randn(
-            prefill_length,
+        prefix_input_embeds=torch.randn(
+            prefix_length,
             HIDDEN_SIZE,
         ),
-        prefill_aux_hidden_states=torch.randn(
-            prefill_length,
+        prefix_aux_hidden_states=torch.randn(
+            prefix_length,
             HIDDEN_SIZE * NUM_AUX_HIDDEN_STATES,
         ),
         proposal_positions=torch.arange(
@@ -86,7 +86,7 @@ def _make_batch(
             draft_length - 1,
             HIDDEN_SIZE,
         ),
-        draft_recurrent_hidden_states=torch.randn(
+        draft_input_hidden_states=torch.randn(
             draft_length - 1,
             HIDDEN_SIZE,
         ),
@@ -152,19 +152,19 @@ def _forward_full_window_history(
     first_round = window.rounds[0]
     positions = torch.cat(
         (
-            first_round.prefill_positions,
+            first_round.prefix_positions,
             *(batch.confirmed_positions for batch in window.rounds),
         )
     )
     input_embeds = torch.cat(
         (
-            first_round.prefill_input_embeds,
+            first_round.prefix_input_embeds,
             *(batch.confirmed_input_embeds for batch in window.rounds),
         )
     )
     auxiliary_hidden_states = torch.cat(
         (
-            first_round.prefill_aux_hidden_states,
+            first_round.prefix_aux_hidden_states,
             *(batch.confirmed_aux_hidden_states for batch in window.rounds),
         )
     )

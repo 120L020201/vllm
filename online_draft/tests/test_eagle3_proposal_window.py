@@ -71,21 +71,21 @@ def _make_batch(
     confirmed_length = (
         draft_length + 1 if rejection_position is None else rejection_position + 1
     )
-    prefill_length = 2
+    prefix_length = 2
 
     return Eagle3DistillationBatch(
-        prefill_positions=torch.arange(
-            anchor_position - prefill_length + 1,
+        prefix_positions=torch.arange(
+            anchor_position - prefix_length + 1,
             anchor_position + 1,
             dtype=torch.long,
         ),
-        prefill_input_embeds=torch.randn(
-            prefill_length,
+        prefix_input_embeds=torch.randn(
+            prefix_length,
             HIDDEN_SIZE,
             dtype=feature_dtype,
         ),
-        prefill_aux_hidden_states=torch.randn(
-            prefill_length,
+        prefix_aux_hidden_states=torch.randn(
+            prefix_length,
             HIDDEN_SIZE * NUM_AUX_HIDDEN_STATES,
             dtype=feature_dtype,
         ),
@@ -99,7 +99,7 @@ def _make_batch(
             HIDDEN_SIZE,
             dtype=feature_dtype,
         ),
-        draft_recurrent_hidden_states=torch.randn(
+        draft_input_hidden_states=torch.randn(
             draft_length - 1,
             HIDDEN_SIZE,
             dtype=feature_dtype,
@@ -131,15 +131,15 @@ def _align_next_anchor(
     previous: Eagle3DistillationBatch,
     current: Eagle3DistillationBatch,
 ) -> Eagle3DistillationBatch:
-    input_embeds = current.prefill_input_embeds.clone()
+    input_embeds = current.prefix_input_embeds.clone()
     input_embeds[-1] = previous.confirmed_input_embeds[-1]
-    auxiliary_hidden_states = current.prefill_aux_hidden_states.clone()
+    auxiliary_hidden_states = current.prefix_aux_hidden_states.clone()
     auxiliary_hidden_states[-1] = previous.confirmed_aux_hidden_states[-1]
 
     return replace(
         current,
-        prefill_input_embeds=input_embeds,
-        prefill_aux_hidden_states=auxiliary_hidden_states,
+        prefix_input_embeds=input_embeds,
+        prefix_aux_hidden_states=auxiliary_hidden_states,
     )
 
 
@@ -189,19 +189,19 @@ def _forward_full_history(
     first = window.rounds[0]
     positions = torch.cat(
         (
-            first.prefill_positions,
+            first.prefix_positions,
             *(batch.confirmed_positions for batch in window.rounds),
         )
     )
     input_embeds = torch.cat(
         (
-            first.prefill_input_embeds,
+            first.prefix_input_embeds,
             *(batch.confirmed_input_embeds for batch in window.rounds),
         )
     )
     auxiliary_hidden_states = torch.cat(
         (
-            first.prefill_aux_hidden_states,
+            first.prefix_aux_hidden_states,
             *(batch.confirmed_aux_hidden_states for batch in window.rounds),
         )
     )
@@ -308,10 +308,10 @@ def test_future_spine_and_other_branch_do_not_leak() -> None:
     )
     perturbed_second = replace(
         second,
-        prefill_input_embeds=second.prefill_input_embeds + 50.0,
-        prefill_aux_hidden_states=second.prefill_aux_hidden_states - 50.0,
+        prefix_input_embeds=second.prefix_input_embeds + 50.0,
+        prefix_aux_hidden_states=second.prefix_aux_hidden_states - 50.0,
         draft_token_input_embeds=(second.draft_token_input_embeds + 75.0),
-        draft_recurrent_hidden_states=(second.draft_recurrent_hidden_states - 75.0),
+        draft_input_hidden_states=(second.draft_input_hidden_states - 75.0),
         confirmed_input_embeds=second.confirmed_input_embeds + 25.0,
         confirmed_aux_hidden_states=(second.confirmed_aux_hidden_states - 25.0),
     )

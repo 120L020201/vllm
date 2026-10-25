@@ -47,7 +47,7 @@ class Eagle3CaptureBuffers(CaptureBuffers):
             teacher_dtype=teacher_dtype,
             layouts={
                 "proposal_token_input_embeds": (proposal_shape, dtype),
-                "proposal_recurrent_hidden_states": (proposal_shape, dtype),
+                "proposal_input_hidden_states": (proposal_shape, dtype),
                 "input_embeds": ((max_tokens, hidden_size), dtype),
                 "aux_hidden_states": (
                     (max_tokens, num_aux_hidden_states * hidden_size),
@@ -62,7 +62,7 @@ class Eagle3Proposal:
     """Draft rows after the anchor from one completed GPU proposal."""
 
     token_input_embeds: torch.Tensor
-    recurrent_hidden_states: torch.Tensor
+    input_hidden_states: torch.Tensor
     source_weight_version: int
 
     def to_cpu(
@@ -78,9 +78,9 @@ class Eagle3Proposal:
                 self.token_input_embeds,
                 non_blocking,
             ),
-            recurrent_hidden_states=buffers.copy(
-                "proposal_recurrent_hidden_states",
-                self.recurrent_hidden_states,
+            input_hidden_states=buffers.copy(
+                "proposal_input_hidden_states",
+                self.input_hidden_states,
                 non_blocking,
             ),
         )
@@ -126,34 +126,34 @@ class _Eagle3BatchBuilder(
         confirmed: ConfirmedRows[Eagle3Rows],
         prompt: list[ConfirmedRows[Eagle3Rows]],
     ) -> Eagle3DistillationBatch:
-        # The first round's prefill is the whole prompt; later rounds start
+        # The first round's prefix is the whole prompt; later rounds start
         # from the previous round's last confirmed token.
         if prompt:
-            prefill_positions = torch.cat([rows.positions for rows in prompt])
-            prefill_input_embeds = torch.cat([rows.features[0] for rows in prompt])
-            prefill_aux = torch.cat([rows.features[1] for rows in prompt])
+            prefix_positions = torch.cat([rows.positions for rows in prompt])
+            prefix_input_embeds = torch.cat([rows.features[0] for rows in prompt])
+            prefix_aux = torch.cat([rows.features[1] for rows in prompt])
         elif self._last_confirmed is not None:
-            prefill_positions = self._last_confirmed.positions
-            prefill_input_embeds, prefill_aux = self._last_confirmed.features
+            prefix_positions = self._last_confirmed.positions
+            prefix_input_embeds, prefix_aux = self._last_confirmed.features
         else:
             raise RuntimeError("continuation has no previous confirmed token")
 
         confirmed_input_embeds, confirmed_aux = confirmed.features
         confirmed_length = confirmed.positions.numel()
         draft_length = proposal.token_input_embeds.shape[0] + 1
-        anchor_position = int(prefill_positions[-1].item())
+        anchor_position = int(prefix_positions[-1].item())
 
         batch = Eagle3DistillationBatch(
-            prefill_positions=prefill_positions,
-            prefill_input_embeds=prefill_input_embeds,
-            prefill_aux_hidden_states=prefill_aux,
+            prefix_positions=prefix_positions,
+            prefix_input_embeds=prefix_input_embeds,
+            prefix_aux_hidden_states=prefix_aux,
             proposal_positions=torch.arange(
                 anchor_position,
                 anchor_position + draft_length,
                 dtype=torch.long,
             ),
             draft_token_input_embeds=proposal.token_input_embeds.clone(),
-            draft_recurrent_hidden_states=proposal.recurrent_hidden_states.clone(),
+            draft_input_hidden_states=proposal.input_hidden_states.clone(),
             teacher_probabilities=teacher_probabilities(teacher_logits[:draft_length]),
             confirmed_positions=confirmed.positions,
             confirmed_input_embeds=confirmed_input_embeds,
@@ -246,12 +246,12 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
         self,
         *,
         token_input_embeds: torch.Tensor,
-        recurrent_hidden_states: torch.Tensor,
+        input_hidden_states: torch.Tensor,
     ) -> None:
         self._save_proposal(
             lambda version: Eagle3Proposal(
                 token_input_embeds=token_input_embeds.detach().clone(),
-                recurrent_hidden_states=recurrent_hidden_states.detach().clone(),
+                input_hidden_states=input_hidden_states.detach().clone(),
                 source_weight_version=version,
             )
         )

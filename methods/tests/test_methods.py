@@ -69,16 +69,16 @@ def _make_batch(anchor_position=2):
     auxiliary_size = 8
     draft_length = 2
     return Eagle3DistillationBatch(
-        prefill_positions=torch.arange(anchor_position + 1, dtype=torch.long),
-        prefill_input_embeds=torch.randn(anchor_position + 1, hidden_size),
-        prefill_aux_hidden_states=torch.randn(anchor_position + 1, auxiliary_size),
+        prefix_positions=torch.arange(anchor_position + 1, dtype=torch.long),
+        prefix_input_embeds=torch.randn(anchor_position + 1, hidden_size),
+        prefix_aux_hidden_states=torch.randn(anchor_position + 1, auxiliary_size),
         proposal_positions=torch.arange(
             anchor_position,
             anchor_position + draft_length,
             dtype=torch.long,
         ),
         draft_token_input_embeds=torch.randn(draft_length - 1, hidden_size),
-        draft_recurrent_hidden_states=torch.randn(draft_length - 1, hidden_size),
+        draft_input_hidden_states=torch.randn(draft_length - 1, hidden_size),
         teacher_probabilities=torch.randn(draft_length, 5).softmax(dim=-1),
         confirmed_positions=torch.tensor([anchor_position + 1]),
         confirmed_input_embeds=torch.randn(1, hidden_size),
@@ -442,7 +442,7 @@ class PolicyTest(unittest.TestCase):
         )
 
         batch = bridge.observations[0][2]
-        torch.testing.assert_close(batch.prefill_positions, torch.tensor([0, 1, 2]))
+        torch.testing.assert_close(batch.prefix_positions, torch.tensor([0, 1, 2]))
         batch.validate(
             hidden_size=4,
             num_aux_hidden_states=2,

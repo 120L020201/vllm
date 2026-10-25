@@ -63,7 +63,7 @@ class OnlineEagle3Adapter:
             ],
             "proposal_positions": [],
             "draft_token_input_embeds": [],
-            "draft_recurrent_hidden_states": [],
+            "draft_input_hidden_states": [],
         }
 
     def record_prefill(
@@ -99,7 +99,7 @@ class OnlineEagle3Adapter:
         self._trace["draft_token_input_embeds"].append(
             self.model.embed_input_ids(input_ids[indices]).detach().clone()
         )
-        self._trace["draft_recurrent_hidden_states"].append(
+        self._trace["draft_input_hidden_states"].append(
             hidden_states[indices].detach().clone()
         )
 
@@ -119,7 +119,7 @@ class OnlineEagle3Adapter:
             torch.empty(0, hidden_size, dtype=pending["prefill_input_embeds"].dtype),
         )
         pending.setdefault(
-            "draft_recurrent_hidden_states",
+            "draft_input_hidden_states",
             torch.empty(0, hidden_size, dtype=pending["prefill_input_embeds"].dtype),
         )
         self._pending = pending
@@ -169,14 +169,12 @@ class OnlineEagle3Adapter:
             )
         )
         batch = Eagle3DistillationBatch(
-            prefill_positions=self._pending["prefill_positions"],
-            prefill_input_embeds=self._pending["prefill_input_embeds"],
-            prefill_aux_hidden_states=self._pending["prefill_aux_hidden_states"],
+            prefix_positions=self._pending["prefill_positions"],
+            prefix_input_embeds=self._pending["prefill_input_embeds"],
+            prefix_aux_hidden_states=self._pending["prefill_aux_hidden_states"],
             proposal_positions=self._pending["proposal_positions"],
             draft_token_input_embeds=self._pending["draft_token_input_embeds"],
-            draft_recurrent_hidden_states=(
-                self._pending["draft_recurrent_hidden_states"]
-            ),
+            draft_input_hidden_states=(self._pending["draft_input_hidden_states"]),
             teacher_probabilities=self._pending["teacher_probabilities"],
             confirmed_positions=_cpu_clone(input_batch.positions[:count]),
             confirmed_input_embeds=_cpu_clone(self.model.embed_input_ids(shifted_ids)),

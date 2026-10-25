@@ -69,5 +69,5 @@ class EagleSpeculator(OnlineDraftSpeculator, AutoRegressiveSpeculator):
         proposal = self.get_proposal_snapshot()
         self.capture_adapter.capture_proposal(
             token_input_embeds=proposal.draft_token_input_embeds,
-            recurrent_hidden_states=proposal.draft_recurrent_hidden_states,
+            input_hidden_states=proposal.draft_input_hidden_states,
         )

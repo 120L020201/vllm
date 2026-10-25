@@ -24,7 +24,7 @@ def _make_batch(
         draft_length + 1 if rejection_position is None else rejection_position + 1
     )
 
-    prefill_positions = torch.arange(
+    prefix_positions = torch.arange(
         ANCHOR_POSITION - PREFILL_LENGTH + 1,
         ANCHOR_POSITION + 1,
         dtype=torch.long,
@@ -41,13 +41,13 @@ def _make_batch(
     )
 
     return Eagle3DistillationBatch(
-        prefill_positions=prefill_positions,
-        prefill_input_embeds=torch.randn(
+        prefix_positions=prefix_positions,
+        prefix_input_embeds=torch.randn(
             PREFILL_LENGTH,
             HIDDEN_SIZE,
             dtype=torch.float32,
         ),
-        prefill_aux_hidden_states=torch.randn(
+        prefix_aux_hidden_states=torch.randn(
             PREFILL_LENGTH,
             HIDDEN_SIZE * NUM_AUX_HIDDEN_STATES,
             dtype=torch.float32,
@@ -58,7 +58,7 @@ def _make_batch(
             HIDDEN_SIZE,
             dtype=torch.float32,
         ),
-        draft_recurrent_hidden_states=torch.randn(
+        draft_input_hidden_states=torch.randn(
             draft_length - 1,
             HIDDEN_SIZE,
             dtype=torch.float32,
@@ -95,16 +95,16 @@ def _validate(batch: Eagle3DistillationBatch) -> None:
     )
 
 
-def test_valid_batch_uses_prefill_anchor() -> None:
+def test_valid_batch_uses_prefix_anchor() -> None:
     batch = _make_batch()
 
     _validate(batch)
 
-    assert batch.proposal_positions[0].item() == (batch.prefill_positions[-1].item())
+    assert batch.proposal_positions[0].item() == (batch.prefix_positions[-1].item())
 
     proposal_input_embeds = torch.cat(
         (
-            batch.prefill_input_embeds[-1:],
+            batch.prefix_input_embeds[-1:],
             batch.draft_token_input_embeds,
         ),
         dim=0,
@@ -116,7 +116,7 @@ def test_valid_batch_uses_prefill_anchor() -> None:
     )
     torch.testing.assert_close(
         proposal_input_embeds[0],
-        batch.prefill_input_embeds[-1],
+        batch.prefix_input_embeds[-1],
     )
     torch.testing.assert_close(
         proposal_input_embeds[1:],
@@ -136,7 +136,7 @@ def test_draft_length_one_has_no_later_draft_inputs() -> None:
         0,
         HIDDEN_SIZE,
     )
-    assert batch.draft_recurrent_hidden_states.shape == (
+    assert batch.draft_input_hidden_states.shape == (
         0,
         HIDDEN_SIZE,
     )
@@ -198,7 +198,7 @@ def test_proposal_positions_must_start_at_anchor() -> None:
 
     with pytest.raises(
         ValueError,
-        match="proposal positions must start at the prefill anchor",
+        match="proposal positions must start at the prefix anchor",
     ):
         _validate(invalid_batch)
 
@@ -207,11 +207,11 @@ def test_inference_tensor_is_rejected() -> None:
     batch = _make_batch()
 
     with torch.inference_mode():
-        inference_embeds = batch.prefill_input_embeds.clone()
+        inference_embeds = batch.prefix_input_embeds.clone()
 
     invalid_batch = replace(
         batch,
-        prefill_input_embeds=inference_embeds,
+        prefix_input_embeds=inference_embeds,
     )
 
     with pytest.raises(
@@ -225,11 +225,11 @@ def test_batch_feature_must_be_detached() -> None:
     batch = _make_batch()
     invalid_batch = replace(
         batch,
-        prefill_input_embeds=batch.prefill_input_embeds.requires_grad_(),
+        prefix_input_embeds=batch.prefix_input_embeds.requires_grad_(),
     )
 
     with pytest.raises(
         ValueError,
-        match="prefill_input_embeds must be detached",
+        match="prefix_input_embeds must be detached",
     ):
         _validate(invalid_batch)

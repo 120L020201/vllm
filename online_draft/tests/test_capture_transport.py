@@ -302,7 +302,7 @@ def test_eagle3_rounds_restart_history_for_each_request(device) -> None:
         )
         adapter.capture_proposal(
             token_input_embeds=torch.tensor([[12.0, 13.0]], device=device),
-            recurrent_hidden_states=torch.tensor([[14.0, 15.0]], device=device),
+            input_hidden_states=torch.tensor([[14.0, 15.0]], device=device),
         )
 
     try:
@@ -326,15 +326,15 @@ def test_eagle3_rounds_restart_history_for_each_request(device) -> None:
                 7,
                 8,
             ]
-            assert first.batch.prefill_positions.tolist() == [0, 1, 2, 3]
-            assert first.batch.prefill_aux_hidden_states[:, 0].tolist() == [
+            assert first.batch.prefix_positions.tolist() == [0, 1, 2, 3]
+            assert first.batch.prefix_aux_hidden_states[:, 0].tolist() == [
                 100.0,
                 101.0,
                 102.0,
                 103.0,
             ]
-            assert second.batch.prefill_positions.tolist() == [4]
-            assert second.batch.prefill_input_embeds.tolist() == [[4.0, 4.0]]
+            assert second.batch.prefix_positions.tolist() == [4]
+            assert second.batch.prefix_input_embeds.tolist() == [[4.0, 4.0]]
             assert second.batch.confirmed_input_embeds.tolist() == [[5.0, 5.0]]
             torch.testing.assert_close(
                 second.batch.teacher_probabilities,

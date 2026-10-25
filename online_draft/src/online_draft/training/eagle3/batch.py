@@ -11,16 +11,16 @@ if TYPE_CHECKING:
     from online_draft.models.qwen3_eagle3 import Qwen3Eagle3ForCausalLM
 
 _POSITION_FIELD_NAMES = (
-    "prefill_positions",
+    "prefix_positions",
     "proposal_positions",
     "confirmed_positions",
 )
 
 _FEATURE_FIELD_NAMES = (
-    "prefill_input_embeds",
-    "prefill_aux_hidden_states",
+    "prefix_input_embeds",
+    "prefix_aux_hidden_states",
     "draft_token_input_embeds",
-    "draft_recurrent_hidden_states",
+    "draft_input_hidden_states",
     "confirmed_input_embeds",
     "confirmed_aux_hidden_states",
 )
@@ -30,19 +30,20 @@ _FEATURE_FIELD_NAMES = (
 class Eagle3DistillationBatch:
     """Prepared CPU tensors for one EAGLE3 verification round.
 
-    The first proposal hidden input is reconstructed from the final
-    prefill auxiliary hidden state through the trainable FC layer.
-    Later proposal hidden inputs are fixed recurrent hidden states
-    captured from GPU draft generation.
+    The prefix ends at the proposal anchor: the whole prompt in the first
+    round, then only the previous round's last confirmed row. The first
+    proposal hidden input is rebuilt from the anchor's auxiliary hidden
+    state through the trainable FC. Later proposal rows use the hidden
+    states the GPU draft consumed at each step, captured as fixed inputs.
     """
 
-    prefill_positions: torch.Tensor
-    prefill_input_embeds: torch.Tensor
-    prefill_aux_hidden_states: torch.Tensor
+    prefix_positions: torch.Tensor
+    prefix_input_embeds: torch.Tensor
+    prefix_aux_hidden_states: torch.Tensor
 
     proposal_positions: torch.Tensor
     draft_token_input_embeds: torch.Tensor
-    draft_recurrent_hidden_states: torch.Tensor
+    draft_input_hidden_states: torch.Tensor
     teacher_probabilities: torch.Tensor
 
     confirmed_positions: torch.Tensor
@@ -139,32 +140,32 @@ class Eagle3DistillationBatch:
             if positions.ndim != 1:
                 raise ValueError(f"{name} must be one-dimensional")
 
-        prefill_length = self.prefill_positions.numel()
+        prefix_length = self.prefix_positions.numel()
         draft_length = self.draft_length
         confirmed_length = self.confirmed_length
         auxiliary_size = hidden_size * num_aux_hidden_states
 
-        if prefill_length == 0:
-            raise ValueError("prefill must not be empty")
+        if prefix_length == 0:
+            raise ValueError("prefix must not be empty")
         if draft_length == 0:
             raise ValueError("proposal must not be empty")
         if not 1 <= confirmed_length <= draft_length + 1:
             raise ValueError("confirmed length must be between 1 and draft_length + 1")
 
         expected_shapes = {
-            "prefill_input_embeds": (
-                prefill_length,
+            "prefix_input_embeds": (
+                prefix_length,
                 hidden_size,
             ),
-            "prefill_aux_hidden_states": (
-                prefill_length,
+            "prefix_aux_hidden_states": (
+                prefix_length,
                 auxiliary_size,
             ),
             "draft_token_input_embeds": (
                 draft_length - 1,
                 hidden_size,
             ),
-            "draft_recurrent_hidden_states": (
+            "draft_input_hidden_states": (
                 draft_length - 1,
                 hidden_size,
             ),
@@ -189,22 +190,22 @@ class Eagle3DistillationBatch:
                 raise ValueError(f"{name} must have shape {expected_shape}")
 
     def _validate_positions(self) -> None:
-        prefill_start = int(self.prefill_positions[0].item())
-        if prefill_start < 0:
-            raise ValueError("prefill positions must not be negative")
+        prefix_start = int(self.prefix_positions[0].item())
+        if prefix_start < 0:
+            raise ValueError("prefix positions must not be negative")
 
-        expected_prefill = torch.arange(
-            prefill_start,
-            prefill_start + self.prefill_positions.numel(),
+        expected_prefix = torch.arange(
+            prefix_start,
+            prefix_start + self.prefix_positions.numel(),
             dtype=torch.long,
         )
         if not torch.equal(
-            self.prefill_positions,
-            expected_prefill,
+            self.prefix_positions,
+            expected_prefix,
         ):
-            raise ValueError("prefill positions must be contiguous")
+            raise ValueError("prefix positions must be contiguous")
 
-        anchor_position = int(self.prefill_positions[-1].item())
+        anchor_position = int(self.prefix_positions[-1].item())
         expected_proposal = torch.arange(
             anchor_position,
             anchor_position + self.draft_length,
@@ -214,7 +215,7 @@ class Eagle3DistillationBatch:
             self.proposal_positions,
             expected_proposal,
         ):
-            raise ValueError("proposal positions must start at the prefill anchor")
+            raise ValueError("proposal positions must start at the prefix anchor")
 
         expected_confirmed = torch.arange(
             anchor_position + 1,
@@ -225,7 +226,7 @@ class Eagle3DistillationBatch:
             self.confirmed_positions,
             expected_confirmed,
         ):
-            raise ValueError("confirmed positions must follow the prefill anchor")
+            raise ValueError("confirmed positions must follow the prefix anchor")
 
     def _validate_rejection_position(self) -> None:
         rejection_position = self.rejection_position
