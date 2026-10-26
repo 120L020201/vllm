@@ -142,7 +142,7 @@ class DFlashSpeculator(OnlineDraftSpeculator, DraftModelSpeculator):
                 cudagraph_mode,
                 decode_query_len=self.num_query_per_req,
             )
-            for _ in range(2 if self.online_draft_training_enabled else 1)
+            for _ in range(self.num_weight_slots)
         )
         self.query_cudagraph_manager = self.query_cudagraph_managers[0]
 
@@ -153,10 +153,8 @@ class DFlashSpeculator(OnlineDraftSpeculator, DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
-        online_state = self.online_state
         for slot, manager in enumerate(self.query_cudagraph_managers):
-            if online_state is not None:
-                online_state.slots.bind(online_state.slots.slots[slot])
+            self._bind_weight_slot(slot)
             manager.capture(
                 self._generate_draft,
                 self.input_buffers,
@@ -169,8 +167,7 @@ class DFlashSpeculator(OnlineDraftSpeculator, DraftModelSpeculator):
                     f"Capturing {self._speculator_name.lower()} CUDA graphs"
                 ),
             )
-        if online_state is not None:
-            online_state.slots.bind(online_state.installer.active_weights)
+        self._bind_weight_slot(self._active_weight_slot())
 
     def load_draft_model(
         self,
@@ -469,10 +466,9 @@ class DFlashSpeculator(OnlineDraftSpeculator, DraftModelSpeculator):
             context_slots,
         )
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        if self.online_state is not None:
-            self.query_cudagraph_manager = self.query_cudagraph_managers[
-                self.online_state.installer.active_slot
-            ]
+        self.query_cudagraph_manager = self.query_cudagraph_managers[
+            self._active_weight_slot()
+        ]
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,

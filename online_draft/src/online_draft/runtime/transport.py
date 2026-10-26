@@ -162,7 +162,9 @@ class CaptureQueue:
                     with torch.cuda.stream(d2h_stream):
                         d2h_stream.wait_event(packet.ready)
                         cpu_packet = packet.to_cpu(non_blocking=True)
-                        copy_done = torch.cuda.Event()
+                        # Sleep rather than spin: a spinning core lowers the
+                        # turbo clock of the inference thread.
+                        copy_done = torch.cuda.Event(blocking=True)
                         copy_done.record(d2h_stream)
 
                     copy_done.synchronize()

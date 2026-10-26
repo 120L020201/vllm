@@ -308,6 +308,7 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
     expected_graph_replays,
 ):
     speculator = object.__new__(_TestSpeculator)
+    speculator.explicit_input_embeds = False
     speculator.num_speculative_steps = 4
     speculator.current_draft_step = torch.tensor(0)
     speculator.input_buffers = SimpleNamespace(
@@ -447,41 +448,35 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
     assert metadata.scheduler_metadata is None
 
 
-def test_draft_decode_captures_the_hidden_state_each_step_consumes(monkeypatch):
-    """Online training replays decode step j from its inputs, so the captured
-    hidden must be the one the step read, not its output or a buffer the
-    forward has since updated in place."""
+def _decode_capture_speculator(monkeypatch, device: str = "cpu"):
+    """Draft decode stub whose forward updates its input hidden in place."""
     hidden_size = 4
     speculator = object.__new__(_TestSpeculator)
     speculator.explicit_input_embeds = True
     speculator.hidden_size = hidden_size
-    speculator.num_speculative_steps = 3
+    speculator.num_speculative_steps = 4
     speculator.dtype = torch.float32
-    speculator.device = torch.device("cpu")
+    speculator.device = torch.device(device)
     speculator._draft_capture_input_embeds = None
     speculator._draft_capture_input_hidden_states = None
     speculator._ensure_draft_capture_buffers(1)
-    speculator._draft_capture_length = 0
-    # _prefill leaves the anchor's output hidden (h4) as the first decode input.
-    speculator.hidden_states = torch.zeros(2, hidden_size)
-    speculator.hidden_states[0] = 4.0
-    speculator.idx_mapping = torch.zeros(1, dtype=torch.long)
-    speculator.input_buffers = SimpleNamespace(positions=torch.tensor([5]))
+    speculator.hidden_states = torch.zeros(2, hidden_size, device=device)
+    speculator.idx_mapping = torch.zeros(1, dtype=torch.long, device=device)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.tensor([5], device=device)
+    )
     speculator._prepare_eplb_forward = lambda num_tokens: None
-    speculator.current_draft_step = torch.tensor(1)
+    speculator.current_draft_step = torch.tensor(0, device=device)
     speculator.temperature = speculator.seeds = speculator.draft_logits = None
-    speculator.draft_tokens = torch.zeros(1, 3, dtype=torch.long)
+    speculator.draft_tokens = torch.zeros(1, 4, dtype=torch.long, device=device)
     speculator.max_model_len = 64
-    speculator.sample_draft = lambda *args: torch.zeros(1, dtype=torch.long)
-
-    outputs = iter([5.0, 6.0])
+    speculator.sample_draft = lambda hidden, *args: hidden[:, 0].long()
 
     def run_model(*args, **kwargs):
-        value = next(outputs)
-        speculator.last_input_embeds = torch.full((1, hidden_size), -value)
+        output = speculator.hidden_states[:1] + 1.0
+        speculator.last_input_embeds = -output
         # Fused add-RMSNorm updates the first layer's residual in place.
         speculator.hidden_states[:1].add_(100.0)
-        output = torch.full((1, hidden_size), value)
         return output, output
 
     def update_draft_inputs(
@@ -491,10 +486,119 @@ def test_draft_decode_captures_the_hidden_state_each_step_consumes(monkeypatch):
 
     speculator._run_model = run_model
     monkeypatch.setattr(spec_module, "update_draft_inputs", update_draft_inputs)
+    return speculator
 
-    for _ in range(2):
+
+def test_draft_decode_captures_the_hidden_state_each_step_consumes(monkeypatch):
+    """Online training replays decode step j from its inputs, so the captured
+    hidden must be the one the step read, not its output or a buffer the
+    forward has since updated in place."""
+    speculator = _decode_capture_speculator(monkeypatch)
+    # _prefill leaves the anchor's output hidden (h4) as the first decode input.
+    speculator.hidden_states[0] = 4.0
+
+    for step in range(1, speculator.num_speculative_steps):
+        speculator.current_draft_step.fill_(step)
         speculator._generate_draft(1, 1, None, None, None)
+    speculator._draft_capture_length = speculator.num_speculative_steps - 1
 
     snapshot = speculator.get_proposal_snapshot()
-    assert snapshot.draft_input_hidden_states[:, 0].tolist() == [4.0, 5.0]
-    assert snapshot.draft_token_input_embeds[:, 0].tolist() == [-5.0, -6.0]
+    assert snapshot.draft_input_hidden_states[:, 0].tolist() == [4.0, 5.0, 6.0]
+    assert snapshot.draft_token_input_embeds[:, 0].tolist() == [-5.0, -6.0, -7.0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+def test_one_step_graph_replayed_per_step_captures_every_step(monkeypatch):
+    """Backends without fused decode replay one step graph per draft step;
+    each replay must record that step's rows, not the rows of the capture."""
+    speculator = _decode_capture_speculator(monkeypatch, "cuda")
+
+    def generate():
+        speculator._generate_draft(1, 1, None, None, None)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        generate()
+    graph = torch.cuda.CUDAGraph()
+    # Capture runs with the step counter at 0, as in speculator capture.
+    speculator.current_draft_step.fill_(0)
+    with torch.cuda.graph(graph, stream=stream):
+        generate()
+    torch.cuda.current_stream().wait_stream(stream)
+
+    speculator._draft_capture_input_hidden_states.zero_()
+    speculator._draft_capture_input_embeds.zero_()
+    speculator.hidden_states[0] = 4.0
+    for step in range(1, speculator.num_speculative_steps):
+        speculator.current_draft_step.fill_(step)
+        graph.replay()
+    speculator._draft_capture_length = speculator.num_speculative_steps - 1
+
+    snapshot = speculator.get_proposal_snapshot()
+    assert snapshot.draft_input_hidden_states[:, 0].tolist() == [4.0, 5.0, 6.0]
+    assert snapshot.draft_token_input_embeds[:, 0].tolist() == [-5.0, -6.0, -7.0]
+
+
+class _FakeGraphManager:
+    def __init__(self, vllm_config, device, cudagraph_mode, *args, **kwargs):
+        self.mode = cudagraph_mode
+
+
+@pytest.mark.parametrize(
+    ("online", "expected_slots", "expected_prefill_mode"),
+    [
+        (False, 1, CUDAGraphMode.FULL_AND_PIECEWISE),
+        (True, 2, CUDAGraphMode.FULL_DECODE_ONLY),
+    ],
+)
+def test_online_draft_gets_full_graphs_for_each_weight_slot(
+    monkeypatch, online, expected_slots, expected_prefill_mode
+):
+    """PIECEWISE graphs live in the compiled model and keep one slot's weights."""
+    monkeypatch.setattr(spec_module, "SpeculatorCudaGraphManager", _FakeGraphManager)
+    speculator = object.__new__(_TestSpeculator)
+    speculator.vllm_config = speculator.device = None
+    speculator.num_speculative_steps = 3
+    speculator.explicit_input_embeds = online
+    speculator.num_weight_slots = 2 if online else 1
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
+
+    assert len(speculator.cudagraph_managers) == expected_slots
+    managers = {id(m) for pair in speculator.cudagraph_managers for m in pair}
+    assert len(managers) == 2 * expected_slots
+    for prefill, decode in speculator.cudagraph_managers:
+        assert prefill.mode == expected_prefill_mode
+        assert decode.mode == CUDAGraphMode.FULL_DECODE_ONLY
+    assert (
+        speculator.prefill_cudagraph_manager,
+        speculator.decode_cudagraph_manager,
+    ) == speculator.cudagraph_managers[0]
+
+
+def test_online_draft_captures_each_slot_with_its_weights_bound():
+    """A graph replays the parameter pointers bound while it was captured."""
+    from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+
+    bound: list[str] = []
+    captured: list[tuple[str, object]] = []
+    speculator = object.__new__(EagleSpeculator)
+    speculator.online_state = SimpleNamespace(
+        slots=SimpleNamespace(slots=("slot-0", "slot-1"), bind=bound.append),
+        installer=SimpleNamespace(active_slot=1),
+    )
+    speculator.cudagraph_managers = (
+        ("prefill-0", "decode-0"),
+        ("prefill-1", "decode-1"),
+    )
+    speculator._capture_slot = lambda: captured.append(
+        (bound[-1], speculator.prefill_cudagraph_manager)
+    )
+
+    speculator.capture()
+
+    assert captured == [("slot-0", "prefill-0"), ("slot-1", "prefill-1")]
+    assert bound[-1] == "slot-1"
+    assert speculator.prefill_cudagraph_manager == "prefill-1"
+    assert speculator.decode_cudagraph_manager == "decode-1"

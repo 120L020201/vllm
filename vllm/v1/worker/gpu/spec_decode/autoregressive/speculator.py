@@ -55,8 +55,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.last_prefill_length: torch.Tensor | None = None
         self._draft_capture_input_embeds: torch.Tensor | None = None
         self._draft_capture_input_hidden_states: torch.Tensor | None = None
+        self._draft_capture_request_rows: torch.Tensor | None = None
         self._draft_capture_length = 0
 
+        # One graph-manager pair per draft weight slot (two for online drafts).
+        self.num_weight_slots = 1
+        self.cudagraph_managers: tuple[
+            tuple[SpeculatorCudaGraphManager, SpeculatorCudaGraphManager], ...
+        ] = ()
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
@@ -96,6 +102,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             shape,
             dtype=self.dtype,
             device=self.device,
+        )
+        self._draft_capture_request_rows = torch.arange(
+            num_reqs, dtype=torch.int64, device=self.device
         )
 
     def get_proposal_snapshot(self) -> DraftProposalSnapshot:
@@ -199,8 +208,28 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.explicit_input_embeds:
+            # Online drafts rebind their weights to the installed slot and
+            # capture FULL graphs per slot. PIECEWISE graphs are kept by the
+            # compiled model per shape and would keep one slot's pointers.
+            cudagraph_mode = (
+                CUDAGraphMode.FULL_DECODE_ONLY
+                if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                else CUDAGraphMode.NONE
+            )
+        self.cudagraph_managers = tuple(
+            self._create_cudagraph_managers(cudagraph_mode)
+            for _ in range(self.num_weight_slots)
+        )
+        self.prefill_cudagraph_manager, self.decode_cudagraph_manager = (
+            self.cudagraph_managers[0]
+        )
+
+    def _create_cudagraph_managers(
+        self, cudagraph_mode: CUDAGraphMode
+    ) -> tuple[SpeculatorCudaGraphManager, SpeculatorCudaGraphManager]:
         # Initialize cudagraph manager for draft prefill (draft position 0).
-        self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
+        prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -214,14 +243,36 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             cudagraph_mode = CUDAGraphMode.NONE
 
         # Initialize cudagraph manager for draft decodes (draft positions > 0).
-        self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
+        decode_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
             decode_query_len=1,
         )
+        return prefill_cudagraph_manager, decode_cudagraph_manager
+
+    def _bind_weight_slot(self, slot: int) -> None:
+        """Point the draft parameters at one weight slot."""
+
+    def _active_weight_slot(self) -> int:
+        return 0
+
+    def _use_active_slot_graphs(self) -> None:
+        # Memory profiling runs before the managers exist.
+        if self.cudagraph_managers:
+            self.prefill_cudagraph_manager, self.decode_cudagraph_manager = (
+                self.cudagraph_managers[self._active_weight_slot()]
+            )
 
     def capture(self) -> None:
+        for slot, managers in enumerate(self.cudagraph_managers):
+            self._bind_weight_slot(slot)
+            self.prefill_cudagraph_manager, self.decode_cudagraph_manager = managers
+            self._capture_slot()
+        self._bind_weight_slot(self._active_weight_slot())
+        self._use_active_slot_graphs()
+
+    def _capture_slot(self) -> None:
         logger.info("Capturing model for speculator...")
         # Reset indices to zeros to prevent stale values from prior
         # dummy runs to cause out-of-bounds indexing during capture.
@@ -310,7 +361,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.explicit_input_embeds and not dummy_run and not is_profile
         )
         if self.explicit_input_embeds:
-            self._ensure_draft_capture_buffers(num_reqs)
             self._draft_capture_length = 0
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
@@ -324,16 +374,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions. By doing so,
         # we can also reuse the attention metadata (e.g., query_start_loc,
         # seq_lens) of the target model.
-        hidden_states = last_hidden_states
-        if aux_hidden_states:
-            assert self.method == "eagle3"
-
         if not self.explicit_input_embeds:
-            if aux_hidden_states:
-                hidden_states = self.model.combine_hidden_states(
-                    torch.cat(aux_hidden_states, dim=-1)
-                )
-            self.hidden_states[:num_tokens_padded].copy_(hidden_states)
+            # Online drafts stage these after installing new FC weights.
+            self._stage_prefill_hidden_states(
+                last_hidden_states, aux_hidden_states, num_tokens_padded
+            )
 
         self._copy_request_inputs(
             num_reqs,
@@ -372,50 +417,50 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             uniform_token_count,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile or self.explicit_input_embeds,
+            need_eager=is_profile,
         )
 
         self._prepare_eplb_forward(num_tokens)
 
         self.on_prefill_begin(num_reqs)
+        # Prepare embeddings before the draft model forward so the capture
+        # boundary can install new weights before FC and attention.
+        prefill_input_embeds = None
+        if self.explicit_input_embeds:
+            prefill_input_embeds = self._prepare_input_embeds(
+                prefill_batch_desc.num_tokens,
+                mm_inputs,
+            )
+            assert prefill_input_embeds is not None
+
+            self.last_prefill_input_embeds = prefill_input_embeds
+            self.last_prefill_positions = (
+                self.input_buffers.positions[: prefill_batch_desc.num_tokens]
+                .detach()
+                .clone()
+            )
+            self.last_prefill_length = self.last_token_indices[num_reqs - 1] + 1
+
+            self.on_prefill_input_embeds_ready(
+                num_reqs=num_reqs,
+                input_batch=input_batch,
+                aux_hidden_states=aux_hidden_states,
+                num_sampled=num_sampled,
+                capture_enabled=capture_enabled,
+                target_hidden_states=last_hidden_states,
+            )
+            # The install may have switched slots; replay that slot's graphs.
+            self._use_active_slot_graphs()
+            self._stage_prefill_hidden_states(
+                last_hidden_states, aux_hidden_states, num_tokens_padded
+            )
+
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Replay the full graph for draft prefill.
+            # Replay the full graph for draft prefill. It embeds the input
+            # ids itself, so the explicit embeddings above are only captured.
             assert self.prefill_cudagraph_manager is not None
             self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
         else:
-            # Prepare embeddings before the draft model forward so the capture
-            # boundary can install new weights before FC and attention.
-            prefill_input_embeds = None
-            if self.explicit_input_embeds:
-                prefill_input_embeds = self._prepare_input_embeds(
-                    prefill_batch_desc.num_tokens,
-                    mm_inputs,
-                )
-                assert prefill_input_embeds is not None
-
-                self.last_prefill_input_embeds = prefill_input_embeds
-                self.last_prefill_positions = (
-                    self.input_buffers.positions[: prefill_batch_desc.num_tokens]
-                    .detach()
-                    .clone()
-                )
-                self.last_prefill_length = self.last_token_indices[num_reqs - 1] + 1
-
-                self.on_prefill_input_embeds_ready(
-                    num_reqs=num_reqs,
-                    input_batch=input_batch,
-                    aux_hidden_states=aux_hidden_states,
-                    num_sampled=num_sampled,
-                    capture_enabled=capture_enabled,
-                    target_hidden_states=last_hidden_states,
-                )
-
-                if aux_hidden_states:
-                    hidden_states = self.model.combine_hidden_states(
-                        torch.cat(aux_hidden_states, dim=-1)
-                    )
-                self.hidden_states[:num_tokens_padded].copy_(hidden_states)
-
             # The target model's attention metadata and slot mappings can directly
             # be used for draft prefill.
             self._prefill(
@@ -458,7 +503,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             uniform_token_count=1,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile or self.explicit_input_embeds,
+            need_eager=is_profile,
         )
 
         self.on_multi_step_decode_begin(num_reqs)
@@ -476,6 +521,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.seq_lens_cpu_upper_bound,
         )
         self.on_multi_step_decode_end(num_reqs)
+        if self.explicit_input_embeds:
+            # Capture rows are laid out with the replayed batch's request count.
+            assert decode_batch_desc.num_reqs in (None, num_reqs)
+            self._draft_capture_length = (self.num_speculative_steps - 1) * num_reqs
 
         self.on_proposal_ready(
             input_batch=input_batch,
@@ -484,6 +533,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         return self.draft_tokens[:num_reqs]
+
+    def _stage_prefill_hidden_states(
+        self,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_tokens_padded: int,
+    ) -> None:
+        """Write the draft prefill's hidden input; EAGLE3 projects aux states."""
+        if aux_hidden_states:
+            assert self.method == "eagle3"
+            hidden_states = self.model.combine_hidden_states(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
+        else:
+            hidden_states = last_hidden_states
+        self.hidden_states[:num_tokens_padded].copy_(hidden_states)
 
     def _prepare_input_embeds(
         self,
@@ -763,13 +828,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         if self.explicit_input_embeds:
             assert self._draft_capture_input_hidden_states is not None
-            capture_start = self._draft_capture_length
-            capture_end = capture_start + num_reqs
+            assert self._draft_capture_request_rows is not None
+            # Rows come from the device step counter, so one captured step
+            # graph replayed per step still writes each step's own rows.
+            # Graph capture may run with the counter at 0; clamp to row 0.
+            capture_rows = (self.current_draft_step - 1).clamp(
+                min=0
+            ) * num_reqs + self._draft_capture_request_rows[:num_reqs]
             # Record the hidden state this step consumes: training replays the
             # step from its inputs, and the forward may update the buffer in place.
-            hidden_capture = self._draft_capture_input_hidden_states
-            hidden_capture[capture_start:capture_end].copy_(
-                self.hidden_states[:num_reqs]
+            self._draft_capture_input_hidden_states.index_copy_(
+                0, capture_rows, self.hidden_states[:num_reqs]
             )
 
         # Run the draft model forward pass.
@@ -784,10 +853,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if self.explicit_input_embeds:
             assert self.last_input_embeds is not None
             assert self._draft_capture_input_embeds is not None
-            self._draft_capture_input_embeds[capture_start:capture_end].copy_(
-                self.last_input_embeds[:num_reqs]
+            self._draft_capture_input_embeds.index_copy_(
+                0, capture_rows, self.last_input_embeds[:num_reqs]
             )
-            self._draft_capture_length = capture_end
 
         last_hidden_states = last_hidden_states[:num_reqs]
 

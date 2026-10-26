@@ -35,15 +35,29 @@ class OnlineDraftSpeculator:
 
     model: nn.Module
     online_draft_training_enabled: bool
+    # Online drafts switch between two weight slots, each with its graphs.
+    num_weight_slots: int
     online_state: "DraftOnlineState | None"
     capture_adapter: "CaptureAdapter | None"
     _online_target_model: nn.Module | None
 
     def _init_online_draft(self) -> None:
         self.online_draft_training_enabled = envs.VLLM_ONLINE_DRAFT_TRAIN
+        self.num_weight_slots = 2 if self.online_draft_training_enabled else 1
         self.online_state = None
         self.capture_adapter = None
         self._online_target_model = None
+
+    def _bind_weight_slot(self, slot: int) -> None:
+        """Point the draft parameters at one weight slot, e.g. for capture."""
+        if self.online_state is not None:
+            slots = self.online_state.slots
+            slots.bind(slots.slots[slot])
+
+    def _active_weight_slot(self) -> int:
+        if self.online_state is None:
+            return 0
+        return self.online_state.installer.active_slot
 
     def _keep_online_target(self, target_model: nn.Module) -> None:
         if self.online_draft_training_enabled:
