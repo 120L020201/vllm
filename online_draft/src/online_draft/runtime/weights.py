@@ -49,37 +49,12 @@ class DraftWeightInstaller:
         self,
         slots: tuple[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor]],
         *,
-        mutable_names: Iterable[str],
         initial_version: int = 0,
         profile_timeline: bool = False,
         prepare_slot: Callable[[int, Mapping[str, torch.Tensor]], None] | None = None,
     ) -> None:
-        if len(slots) != 2:
-            raise ValueError("slots must contain two mappings")
-
         self._slots = slots
-        self._names = tuple(slots[0])
-        self._mutable_names = tuple(mutable_names)
-        if not self._names:
-            raise ValueError("slots must not be empty")
-        if not self._mutable_names:
-            raise ValueError("mutable_names must not be empty")
-        if tuple(slots[1]) != self._names:
-            raise ValueError("slot names do not match")
-        if len(set(self._mutable_names)) != len(self._mutable_names):
-            raise ValueError("mutable_names must not contain duplicates")
-        if not set(self._mutable_names).issubset(self._names):
-            raise ValueError("mutable_names must be present in both slots")
-
-        self._device = slots[0][self._names[0]].device
-        for name in self._names:
-            first = slots[0][name]
-            second = slots[1][name]
-            if first.device != self._device or second.device != self._device:
-                raise ValueError("all slot tensors must use one device")
-            if first.shape != second.shape or first.dtype != second.dtype:
-                raise ValueError(f"slot tensor metadata does not match: {name}")
-
+        self._device = next(iter(slots[0].values())).device
         self._active_slot = 0
         self._initial_version = initial_version
         self._active_version = initial_version
@@ -120,7 +95,6 @@ class DraftWeightInstaller:
     def stage(self, snapshot: DraftWeightSnapshot) -> None:
         """Copy a CPU snapshot into the inactive device slot."""
         with self._lock:
-            self._validate_snapshot(snapshot)
             if self._staged is not None:
                 raise RuntimeError("a draft weight update is already staged")
 
@@ -169,27 +143,6 @@ class DraftWeightInstaller:
                 self._staged = None
             return self._active_version
 
-    def _validate_snapshot(self, snapshot: DraftWeightSnapshot) -> None:
-        if snapshot.version <= self._active_version:
-            raise ValueError("snapshot version must be newer than active version")
-
-        self._validate_weights(snapshot.tensors)
-
-    def _validate_weights(
-        self,
-        weights: tuple[tuple[str, torch.Tensor], ...],
-    ) -> None:
-        if tuple(name for name, _ in weights) != self._mutable_names:
-            raise ValueError("weight tensor names do not match the installer")
-
-        for name, tensor in weights:
-            if tensor.device.type != "cpu":
-                raise ValueError(f"weight tensor must be on CPU: {name}")
-            if tensor.shape != self._slots[0][name].shape:
-                raise ValueError(f"weight shape does not match: {name}")
-            if tensor.dtype != self._slots[0][name].dtype:
-                raise ValueError(f"weight dtype does not match: {name}")
-
     def reset(
         self,
         initial_weights: Iterable[tuple[str, torch.Tensor]],
@@ -198,8 +151,6 @@ class DraftWeightInstaller:
         weights = tuple(initial_weights)
 
         with self._lock:
-            self._validate_weights(weights)
-
             if self._h2d_stream is not None:
                 self._h2d_stream.synchronize()
 

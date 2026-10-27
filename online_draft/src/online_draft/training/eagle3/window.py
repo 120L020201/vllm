@@ -3,15 +3,12 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from itertools import pairwise
+from typing import cast
 
 import torch
 from online_draft.models.qwen3_eagle3 import Eagle3KVCache
 from online_draft.runtime import profile_range
-from online_draft.training.eagle3.batch import (
-    Eagle3DistillationBatch,
-    validate_eagle3_rounds,
-)
+from online_draft.training.eagle3.batch import Eagle3DistillationBatch
 from online_draft.training.eagle3.cache import (
     PersistentEagle3KVCache,
     _append_confirmed_window,
@@ -41,30 +38,11 @@ class Eagle3WindowMode(str, Enum):
 class Eagle3TrainingWindow:
     """Consecutive verification rounds updated by one optimizer step.
 
-    The runtime decides when enough rounds have been collected. This
-    object only validates the EAGLE3-specific ordering of those rounds.
+    The runtime decides when enough rounds have been collected; each round
+    anchors at the previous round's final confirmed position.
     """
 
     rounds: tuple[Eagle3DistillationBatch, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.rounds, tuple):
-            raise TypeError("rounds must be a tuple")
-
-        if not self.rounds:
-            raise ValueError("training window must contain at least one round")
-
-        for round_batch in self.rounds:
-            if not isinstance(round_batch, Eagle3DistillationBatch):
-                raise TypeError("every window entry must be an Eagle3DistillationBatch")
-
-            if round_batch.proposal_positions.numel() == 0:
-                raise ValueError("every round must contain proposal positions")
-
-            if round_batch.confirmed_positions.numel() == 0:
-                raise ValueError("every round must contain confirmed positions")
-
-        self._validate_position_continuity()
 
     @property
     def round_count(self) -> int:
@@ -110,17 +88,6 @@ class Eagle3TrainingWindow:
             for round_batch in self.rounds
         )
         return 1 + accepted_tokens / self.round_count
-
-    def _validate_position_continuity(self) -> None:
-        for previous, current in pairwise(self.rounds):
-            previous_end = int(previous.confirmed_positions[-1].item())
-            current_anchor = int(current.proposal_positions[0].item())
-
-            if current_anchor != previous_end:
-                raise ValueError(
-                    "each round anchor must equal the previous "
-                    "round final confirmed position"
-                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,15 +146,9 @@ def train_eagle3_window(
         Updated persistent KV and metrics for the completed update.
 
     Raises:
-        TypeError: If trainer or mode is incompatible.
-        ValueError: If inputs, history, loss, or gradients are invalid.
+        ValueError: If the loss or gradients are invalid (see DraftTrainer).
     """
-    model = trainer.model
-    if not isinstance(model, AutoregressiveDraftModel):
-        raise TypeError("EAGLE3-style training requires an autoregressive draft model")
-    if not isinstance(mode, Eagle3WindowMode):
-        raise TypeError("mode must be an Eagle3WindowMode")
-    validate_eagle3_rounds(model, window.rounds)
+    model = cast(AutoregressiveDraftModel, trainer.model)
 
     confirmed_length = sum(
         round_batch.confirmed_length for round_batch in window.rounds

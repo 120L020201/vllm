@@ -23,7 +23,6 @@ def test_slot_derived_weights_are_prepared_before_commit_and_reset():
 
     installer = DraftWeightInstaller(
         _slots(),
-        mutable_names=("weight",),
         prepare_slot=prepare,
     )
     installer.stage(
@@ -51,7 +50,7 @@ def test_pending_transfer_commits_only_when_ready(use_advance):
         def synchronize(self):
             pytest.fail("commit must not wait for a transfer")
 
-    installer = DraftWeightInstaller(_slots(), mutable_names=("weight",))
+    installer = DraftWeightInstaller(_slots())
     snapshot = DraftWeightSnapshot.from_named_tensors(
         [("weight", torch.tensor([3.0, 4.0]))],
         version=1,
@@ -98,7 +97,6 @@ def test_snapshot_owns_cpu_copy() -> None:
 def test_installer_switches_only_after_staging() -> None:
     installer = DraftWeightInstaller(
         _slots(),
-        mutable_names=("weight",),
     )
     snapshot = DraftWeightSnapshot.from_named_tensors(
         [("weight", torch.tensor([3.0, 4.0]))],
@@ -125,7 +123,6 @@ def test_installer_switches_only_after_staging() -> None:
 def test_installer_rejects_two_pending_updates() -> None:
     installer = DraftWeightInstaller(
         _slots(),
-        mutable_names=("weight",),
     )
     first = DraftWeightSnapshot.from_named_tensors(
         [("weight", torch.tensor([3.0, 4.0]))],
@@ -148,7 +145,6 @@ def test_installer_reset_restores_initial_weights() -> None:
     initial_weights = (("weight", slots[0]["weight"].clone()),)
     installer = DraftWeightInstaller(
         slots,
-        mutable_names=("weight",),
     )
 
     for version, values in (
@@ -187,7 +183,6 @@ def test_installer_reset_discards_staged_update() -> None:
     initial_weights = (("weight", slots[0]["weight"].clone()),)
     installer = DraftWeightInstaller(
         slots,
-        mutable_names=("weight",),
     )
 
     first = DraftWeightSnapshot.from_named_tensors(

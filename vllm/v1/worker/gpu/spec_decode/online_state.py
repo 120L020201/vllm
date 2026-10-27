@@ -41,7 +41,6 @@ class DraftOnlineState:
         self.slots = slots
         self.installer = DraftWeightInstaller(
             slots=slots.slots,
-            mutable_names=slots.owned_names,
             prepare_slot=prepare_slot,
             profile_timeline=profile_timeline,
         )

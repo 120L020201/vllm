@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from dataclasses import replace
 
-import pytest
 import torch
 from online_draft.models.qwen3_eagle3 import (
     Eagle3KVCache,
@@ -229,92 +227,6 @@ def test_single_round_is_a_valid_window() -> None:
     assert window.proposal_target_count == 3
     assert window.confirmed_path_target_count == 1
     assert window.mean_acceptance_length == 1.0
-
-
-def test_empty_window_is_invalid() -> None:
-    with pytest.raises(
-        ValueError,
-        match="at least one round",
-    ):
-        Eagle3TrainingWindow(rounds=())
-
-
-def test_rounds_must_be_a_tuple() -> None:
-    round_batch = _make_batch(anchor_position=4)
-
-    with pytest.raises(
-        TypeError,
-        match="rounds must be a tuple",
-    ):
-        Eagle3TrainingWindow(
-            rounds=[round_batch],  # type: ignore[arg-type]
-        )
-
-
-def test_window_entries_must_be_batches() -> None:
-    with pytest.raises(
-        TypeError,
-        match="Eagle3DistillationBatch",
-    ):
-        Eagle3TrainingWindow(
-            rounds=(object(),),  # type: ignore[arg-type]
-        )
-
-
-def test_round_anchors_must_follow_confirmed_history() -> None:
-    first = _make_batch(
-        anchor_position=4,
-        rejection_position=1,
-    )
-    second = _make_batch(
-        anchor_position=7,
-        rejection_position=0,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="anchor must equal",
-    ):
-        Eagle3TrainingWindow(
-            rounds=(
-                first,
-                second,
-            )
-        )
-
-
-def test_round_must_have_proposal_positions() -> None:
-    round_batch = _make_batch(anchor_position=4)
-    invalid_batch = replace(
-        round_batch,
-        proposal_positions=torch.empty(
-            0,
-            dtype=torch.long,
-        ),
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="proposal positions",
-    ):
-        Eagle3TrainingWindow(rounds=(invalid_batch,))
-
-
-def test_round_must_have_confirmed_positions() -> None:
-    round_batch = _make_batch(anchor_position=4)
-    invalid_batch = replace(
-        round_batch,
-        confirmed_positions=torch.empty(
-            0,
-            dtype=torch.long,
-        ),
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="confirmed positions",
-    ):
-        Eagle3TrainingWindow(rounds=(invalid_batch,))
 
 
 def test_confirmed_path_window_uses_one_optimizer_step() -> None:

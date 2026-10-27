@@ -95,8 +95,6 @@ class _DFlashBatchBuilder(
         k = input_ids.numel() - 1
         confirmed_length = confirmed.positions.numel()
         targets = min(confirmed_length, k)
-        if targets <= 0:
-            raise ValueError("DFlash round must have a supervised target")
 
         return DFlashBatch(
             input_ids=input_ids.clone(),

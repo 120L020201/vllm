@@ -4,7 +4,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -46,49 +46,6 @@ class Qwen3Eagle3Config:
     rotary_dim: int | None = None
     # vLLM pads the draft head to a multiple of 64 rows; logits drop the padding.
     padded_draft_vocab_size: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.hidden_size <= 0:
-            raise ValueError("hidden_size must be greater than zero")
-        if self.intermediate_size <= 0:
-            raise ValueError("intermediate_size must be greater than zero")
-        if self.num_attention_heads <= 0:
-            raise ValueError("num_attention_heads must be greater than zero")
-        if self.num_key_value_heads <= 0:
-            raise ValueError("num_key_value_heads must be greater than zero")
-        if self.head_dim <= 0:
-            raise ValueError("head_dim must be greater than zero")
-        if self.num_hidden_layers <= 0:
-            raise ValueError("num_hidden_layers must be greater than zero")
-        if self.target_vocab_size <= 0:
-            raise ValueError("target_vocab_size must be greater than zero")
-        if self.draft_vocab_size <= 0:
-            raise ValueError("draft_vocab_size must be greater than zero")
-        if self.draft_vocab_size > self.target_vocab_size:
-            raise ValueError("draft_vocab_size must not exceed target_vocab_size")
-        if self.num_aux_hidden_states <= 0:
-            raise ValueError("num_aux_hidden_states must be greater than zero")
-        if self.num_attention_heads % self.num_key_value_heads != 0:
-            raise ValueError(
-                "num_attention_heads must be divisible by num_key_value_heads"
-            )
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even")
-        if self.rms_norm_eps <= 0:
-            raise ValueError("rms_norm_eps must be greater than zero")
-        if self.rope_theta <= 0:
-            raise ValueError("rope_theta must be greater than zero")
-        if not isinstance(self.attention_backend, AttentionBackend):
-            raise TypeError("attention_backend must be an AttentionBackend")
-        if self.rotary_dim is not None and (
-            self.rotary_dim % 2 != 0 or not 0 < self.rotary_dim <= self.head_dim
-        ):
-            raise ValueError("rotary_dim must be even and within head_dim")
-        if (
-            self.padded_draft_vocab_size is not None
-            and self.padded_draft_vocab_size < self.draft_vocab_size
-        ):
-            raise ValueError("padded_draft_vocab_size must cover draft_vocab_size")
 
     @classmethod
     def from_dict(
@@ -244,15 +201,6 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         past_key_value: LayerKV | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LayerKV]:
-        if hidden_states.ndim != 2:
-            raise ValueError("hidden_states must have shape [tokens, input_size]")
-        if positions.ndim != 1:
-            raise ValueError("positions must have shape [tokens]")
-        if hidden_states.shape[0] != positions.numel():
-            raise ValueError("hidden_states token count must match positions")
-        if hidden_states.shape[1] != self.qkv_proj.in_features:
-            raise ValueError("hidden_states width does not match attention input size")
-
         sequence_length = hidden_states.shape[0]
         query_size = self.num_attention_heads * self.head_dim
         key_value_size = self.num_key_value_heads * self.head_dim
@@ -297,9 +245,6 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        if layer_index < 0:
-            raise ValueError("layer_index must not be negative")
-
         self.layer_index = layer_index
         self.hidden_size = config.hidden_size
         self.norm_before_residual = config.norm_before_residual
@@ -340,19 +285,8 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
         torch.Tensor,
         LayerKV,
     ]:
-        self._validate_inputs(
-            positions,
-            input_embeds,
-            hidden_states,
-        )
-
         if self.layer_index == 0:
-            normalized_embeds = self.input_layernorm(input_embeds)
-            if not isinstance(normalized_embeds, torch.Tensor):
-                raise RuntimeError(
-                    "input embedding normalization returned invalid output"
-                )
-
+            normalized_embeds = cast(torch.Tensor, self.input_layernorm(input_embeds))
             hidden_states, residual = self._normalize_first_layer_hidden_states(
                 hidden_states
             )
@@ -361,16 +295,10 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
                 dim=-1,
             )
         else:
-            if residual is None:
-                raise ValueError("residual is required after the first decoder layer")
-
-            normalized = self.input_layernorm(
-                hidden_states,
-                residual,
+            hidden_states, residual = cast(
+                tuple[torch.Tensor, torch.Tensor],
+                self.input_layernorm(hidden_states, residual),
             )
-            if not isinstance(normalized, tuple):
-                raise RuntimeError("residual normalization returned invalid output")
-            hidden_states, residual = normalized
 
         attention_output, present_key_value = self.self_attn(
             hidden_states,
@@ -379,13 +307,10 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
             attention_mask,
         )
 
-        normalized = self.post_attention_layernorm(
-            attention_output,
-            residual,
+        hidden_states, residual = cast(
+            tuple[torch.Tensor, torch.Tensor],
+            self.post_attention_layernorm(attention_output, residual),
         )
-        if not isinstance(normalized, tuple):
-            raise RuntimeError("post-attention normalization returned invalid output")
-        hidden_states, residual = normalized
 
         hidden_states = self.mlp(hidden_states)
 
@@ -395,32 +320,10 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        normalized = self.hidden_norm(hidden_states)
-        if not isinstance(normalized, torch.Tensor):
-            raise RuntimeError("hidden state normalization returned invalid output")
-
+        normalized = cast(torch.Tensor, self.hidden_norm(hidden_states))
         residual = normalized if self.norm_before_residual else hidden_states
 
         return normalized, residual
-
-    def _validate_inputs(
-        self,
-        positions: torch.Tensor,
-        input_embeds: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> None:
-        if positions.ndim != 1:
-            raise ValueError("positions must have shape [tokens]")
-        if input_embeds.ndim != 2:
-            raise ValueError("input_embeds must have shape [tokens, hidden_size]")
-        if hidden_states.ndim != 2:
-            raise ValueError("hidden_states must have shape [tokens, hidden_size]")
-        if input_embeds.shape != hidden_states.shape:
-            raise ValueError("input_embeds and hidden_states shapes must match")
-        if input_embeds.shape[0] != positions.numel():
-            raise ValueError("input token count must match positions")
-        if input_embeds.shape[1] != self.hidden_size:
-            raise ValueError("input width does not match hidden_size")
 
 
 Eagle3KVCache = tuple[LayerKV, ...]
@@ -487,23 +390,10 @@ class Qwen3Eagle3Model(nn.Module):
         self,
         auxiliary_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        if auxiliary_hidden_states.ndim != 2:
-            raise ValueError(
-                "auxiliary_hidden_states must have shape [tokens, auxiliary_width]"
-            )
-        if auxiliary_hidden_states.shape[1] != self.fc_input_size:
-            raise ValueError(
-                "auxiliary hidden state width does not match "
-                "the configured FC input size"
-            )
-
         hidden_states = auxiliary_hidden_states
 
         if self.input_norm is not None:
-            normalized = self.input_norm(hidden_states)
-            if not isinstance(normalized, torch.Tensor):
-                raise RuntimeError("input normalization returned invalid output")
-            hidden_states = normalized
+            hidden_states = cast(torch.Tensor, self.input_norm(hidden_states))
 
         if self.fc_norm is not None:
             chunks = hidden_states.chunk(
@@ -517,12 +407,7 @@ class Qwen3Eagle3Model(nn.Module):
                 chunks,
                 strict=True,
             ):
-                normalized = norm(chunk)
-                if not isinstance(normalized, torch.Tensor):
-                    raise RuntimeError(
-                        "auxiliary normalization returned invalid output"
-                    )
-                normalized_chunks.append(normalized)
+                normalized_chunks.append(norm(chunk))
 
             hidden_states = torch.cat(
                 normalized_chunks,
@@ -539,13 +424,6 @@ class Qwen3Eagle3Model(nn.Module):
         past_key_values: Eagle3KVCache | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> DraftForwardOutput:
-        self._validate_inputs(
-            positions,
-            input_embeds,
-            hidden_states,
-            past_key_values,
-        )
-
         residual: torch.Tensor | None = None
         present_key_values: list[LayerKV] = []
 
@@ -565,17 +443,9 @@ class Qwen3Eagle3Model(nn.Module):
             )
             present_key_values.append(present_key_value)
 
-        if residual is None:
-            raise RuntimeError("model did not produce a residual")
-
-        final_output = self.norm(
-            hidden_states,
-            residual,
+        normalized_hidden_states, hidden_states_before_norm = cast(
+            tuple[torch.Tensor, torch.Tensor], self.norm(hidden_states, residual)
         )
-        if not isinstance(final_output, tuple):
-            raise RuntimeError("final normalization returned invalid output")
-
-        normalized_hidden_states, hidden_states_before_norm = final_output
 
         if self.norm_output:
             recurrent_hidden_states = normalized_hidden_states
@@ -587,28 +457,6 @@ class Qwen3Eagle3Model(nn.Module):
             recurrent_hidden_states=recurrent_hidden_states,
             past_key_values=tuple(present_key_values),
         )
-
-    def _validate_inputs(
-        self,
-        positions: torch.Tensor,
-        input_embeds: torch.Tensor,
-        hidden_states: torch.Tensor,
-        past_key_values: Eagle3KVCache | None,
-    ) -> None:
-        if positions.ndim != 1:
-            raise ValueError("positions must have shape [tokens]")
-        if input_embeds.ndim != 2:
-            raise ValueError("input_embeds must have shape [tokens, hidden_size]")
-        if hidden_states.ndim != 2:
-            raise ValueError("hidden_states must have shape [tokens, hidden_size]")
-        if input_embeds.shape != hidden_states.shape:
-            raise ValueError("input_embeds and hidden_states shapes must match")
-        if input_embeds.shape[0] != positions.numel():
-            raise ValueError("input token count must match positions")
-        if input_embeds.shape[1] != self.hidden_size:
-            raise ValueError("input width does not match hidden_size")
-        if past_key_values is not None and len(past_key_values) != len(self.layers):
-            raise ValueError("past_key_values must contain one entry per layer")
 
 
 class Qwen3Eagle3ForCausalLM(nn.Module):
@@ -661,11 +509,6 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        if hidden_states.ndim != 2:
-            raise ValueError("hidden_states must have shape [tokens, hidden_size]")
-        if hidden_states.shape[1] != self.config.hidden_size:
-            raise ValueError("hidden_states width does not match hidden_size")
-
         return self.lm_head(hidden_states)[..., : self.config.draft_vocab_size]
 
     def compute_target_logits(

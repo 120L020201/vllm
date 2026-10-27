@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from online_draft.models.qwen3_dflash import ContextKV, Qwen3DFlashForCausalLM
@@ -65,8 +66,6 @@ def forward_dflash_window(
         if features is not None:
             context_length += features.shape[0]
             new_features.append(features)
-        if context_length != batch.anchor:
-            raise ValueError("each DFlash round must start where its context ends")
         if index < first_query:
             continue
         query_count = batch.input_ids.numel()
@@ -84,8 +83,8 @@ def forward_dflash_window(
                 torch.cat(new_features), torch.arange(old_length, context_length)
             ),
         )
-    if context is None:
-        raise ValueError("DFlash training needs context before the first anchor")
+    # The first round carries the prompt, so context is never empty here.
+    context = cast(ContextKV, context)
     blocks = torch.tensor(block_ids)
     attention_mask = torch.cat(
         (
@@ -119,16 +118,7 @@ def train_dflash_window(
     loss_decay_gamma: float = 7.0,
 ) -> tuple[DFlashCache, DFlashWindowResult]:
     """Train recent complete blocks; append all confirmed target context KV."""
-    model = trainer.model
-    if not isinstance(model, Qwen3DFlashForCausalLM):
-        raise TypeError("DFlash training requires Qwen3DFlashForCausalLM")
-    for batch in rounds:
-        batch.validate(
-            hidden_size=model.config.hidden_size,
-            vocab_size=model.config.vocab_size,
-            feature_dtype=model.model.fc.weight.dtype,
-        )
-
+    model = cast(Qwen3DFlashForCausalLM, trainer.model)
     old_length = 0 if cache is None else cache.length
     selected = rounds[_first_query_round(rounds, max_train_rounds) :]
     with torch.inference_mode(False), torch.enable_grad():

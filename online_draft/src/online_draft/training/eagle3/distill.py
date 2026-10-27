@@ -69,101 +69,14 @@ def window_forward_kl_loss(
 
     Returns:
         A scalar FP32 rejection-weighted forward-KL loss.
-
-    Raises:
-        ValueError: If tensor shapes, dtypes, or devices are invalid.
     """
-    _validate_distillation_inputs(
-        student_logits,
-        teacher_probabilities,
-    )
-
-    if rejection_target_mask.shape != student_logits.shape[:1]:
-        raise ValueError("rejection_target_mask must match the student token count")
-    if rejection_target_mask.dtype != torch.bool:
-        raise ValueError("rejection_target_mask must use torch.bool")
-    if rejection_target_mask.device != student_logits.device:
-        raise ValueError("rejection mask and student logits must use the same device")
-
     position_weights = _make_masked_position_weights(rejection_target_mask)
-
-    return _compute_weighted_forward_kl(
-        student_logits=student_logits,
-        teacher_probabilities=teacher_probabilities,
-        position_weights=position_weights,
-    )
-
-
-def _validate_distillation_inputs(
-    student_logits: torch.Tensor,
-    teacher_probabilities: torch.Tensor,
-) -> None:
-    if (
-        student_logits.ndim != 2
-        or student_logits.shape != teacher_probabilities.shape
-        or student_logits.shape[0] == 0
-    ):
-        raise ValueError(
-            "student and teacher must have matching nonempty "
-            "[tokens, vocabulary] shapes"
-        )
-    if not student_logits.is_floating_point():
-        raise ValueError("student_logits must be floating point")
-    if not teacher_probabilities.is_floating_point():
-        raise ValueError("teacher_probabilities must be floating point")
-    if student_logits.device != teacher_probabilities.device:
-        raise ValueError(
-            "student logits and teacher probabilities must use the same device"
-        )
-
-
-def _compute_weighted_forward_kl(
-    *,
-    student_logits: torch.Tensor,
-    teacher_probabilities: torch.Tensor,
-    position_weights: torch.Tensor,
-) -> torch.Tensor:
-    teacher = teacher_probabilities.detach().float()
-
-    if not torch.isfinite(teacher).all():
-        raise ValueError("teacher probabilities must be finite")
-    if (teacher < 0).any():
-        raise ValueError("teacher probabilities must be nonnegative")
-
-    probability_sums = teacher.sum(dim=-1)
-    if not torch.allclose(
-        probability_sums,
-        torch.ones_like(probability_sums),
-        atol=1e-5,
-        rtol=1e-5,
-    ):
-        bad = ~torch.isclose(
-            probability_sums,
-            torch.ones_like(probability_sums),
-            atol=1e-5,
-            rtol=1e-5,
-        )
-        raise ValueError(
-            "teacher probabilities must sum to one: "
-            f"bad_rows={bad.nonzero().flatten().tolist()}, "
-            f"bad_sums={probability_sums[bad].tolist()}, "
-            f"bad_sums64={teacher.sum(dim=-1, dtype=torch.float64)[bad].tolist()}, "
-            f"shape={tuple(teacher.shape)}, dtype={teacher.dtype}"
-        )
-
-    elementwise_kl = F.kl_div(
+    per_position_kl = F.kl_div(
         F.log_softmax(student_logits.float(), dim=-1),
-        teacher,
+        teacher_probabilities.detach().float(),
         reduction="none",
-    )
-    per_position_kl = elementwise_kl.sum(dim=-1)
-
-    loss = (per_position_kl * position_weights).sum() / position_weights.sum()
-
-    if not torch.isfinite(loss):
-        raise ValueError("distillation loss must be finite")
-
-    return loss
+    ).sum(dim=-1)
+    return (per_position_kl * position_weights).sum() / position_weights.sum()
 
 
 def _make_masked_position_weights(

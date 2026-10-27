@@ -132,13 +132,11 @@ class DraftTrainer:
             The detached FP32 loss value.
 
         Raises:
-            ValueError: If the loss is invalid or disconnected, or if a
+            ValueError: If the loss is nonfinite or disconnected, or if a
                 checked gradient is nonfinite.
         """
         self.zero_grad()
 
-        if loss.ndim != 0:
-            raise ValueError("loss must be a scalar")
         if not loss.requires_grad:
             raise ValueError("loss must require gradients")
         if not torch.isfinite(loss.detach()):

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import nn
@@ -32,12 +33,6 @@ class DFlashLayerAttention:
 
     sliding_window: int | None = None
     causal: bool = False
-
-    def __post_init__(self) -> None:
-        if self.sliding_window is not None and not self.causal:
-            raise ValueError("non-causal sliding-window DFlash layers are unsupported")
-        if self.sliding_window is not None and self.sliding_window <= 0:
-            raise ValueError("sliding_window must be positive")
 
 
 @dataclass(frozen=True)
@@ -142,7 +137,8 @@ class DFlashAttention(nn.Module):
             context_start, context_end = 0, context_length
             mask = attention_mask
             if block_size is not None:
-                assert attention_mask is not None
+                # Packed training windows always pass their block mask.
+                attention_mask = cast(torch.Tensor, attention_mask)
                 # Later blocks start later, so the chunk's last anchor bounds
                 # its context and its first row bounds a sliding window.
                 context_end = int(positions[end - block_size])

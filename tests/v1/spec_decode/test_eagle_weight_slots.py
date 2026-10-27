@@ -64,9 +64,7 @@ def test_dflash_graphs_read_each_updated_slot_and_reset_weights(monkeypatch):
     )
     mutable = tuple(n for n, p in draft.named_parameters() if p.requires_grad)
     slots = DFlashWeightSlots(target, draft, mutable)
-    installer = DraftWeightInstaller(
-        slots.slots, mutable_names=mutable, prepare_slot=slots.prepare
-    )
+    installer = DraftWeightInstaller(slots.slots, prepare_slot=slots.prepare)
     initial = tuple((n, p.cpu().clone()) for n, p in installer.active_weights.items())
     features = torch.randn(5, 32, device="cuda", dtype=torch.bfloat16)
     context_positions = torch.arange(5, device="cuda")

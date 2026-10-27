@@ -74,7 +74,6 @@ def prepare_eagle3_confirmed_path_inputs(
         window,
         spine_length=spine_length,
         target_counts=target_counts,
-        expected_target_count=window.confirmed_path_target_count,
     )
 
 
@@ -104,7 +103,6 @@ def prepare_eagle3_proposal_window_inputs(
         window,
         spine_length=spine_length,
         target_counts=target_counts,
-        expected_target_count=window.proposal_target_count,
     )
 
 
@@ -114,18 +112,7 @@ def _pack_window_inputs(
     *,
     spine_length: int,
     target_counts: tuple[int, ...],
-    expected_target_count: int,
 ) -> Eagle3WindowInputs:
-    if isinstance(spine_length, bool) or not isinstance(spine_length, int):
-        raise TypeError("spine_length must be an integer")
-
-    expected_spine_length = window.end_confirmed_position + 1
-    if spine_length != expected_spine_length:
-        raise ValueError("window spine must end at the final confirmed position")
-
-    if len(target_counts) != window.round_count:
-        raise RuntimeError("every window round must have a target count")
-
     anchor_aux_hidden_states = torch.cat(
         tuple(
             round_batch.prefix_aux_hidden_states[-1:] for round_batch in window.rounds
@@ -141,9 +128,6 @@ def _pack_window_inputs(
     for index, (round_batch, target_count) in enumerate(
         zip(window.rounds, target_counts, strict=True)
     ):
-        if not 1 <= target_count <= round_batch.draft_length:
-            raise ValueError("round target count must be within its draft length")
-
         # The anchor is the final prefix row; later rows were generated on
         # the GPU and are fixed inputs rather than CPU model outputs.
         input_embeds = torch.cat(
@@ -187,9 +171,6 @@ def _pack_window_inputs(
         query_end = query_start + target_count
         anchor_position = int(round_batch.proposal_positions[0].item())
 
-        if not 0 <= anchor_position < spine_length:
-            raise ValueError("window anchor must be inside the confirmed spine")
-
         # The detached spine already contains the anchor. Block that copy
         # and later spine entries so this branch uses its trainable anchor.
         attention_mask[query_start:query_end, :anchor_position] = False
@@ -215,9 +196,6 @@ def _pack_window_inputs(
             rejection_target_mask[query_start + rejection_position] = True
 
         query_start = query_end
-
-    if total_query_length != expected_target_count:
-        raise RuntimeError("packed target count does not match the window")
 
     return Eagle3WindowInputs(
         positions=positions,

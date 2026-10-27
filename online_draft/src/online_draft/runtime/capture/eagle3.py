@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import cast
 
 import torch
 
@@ -132,11 +133,10 @@ class _Eagle3BatchBuilder(
             prefix_positions = torch.cat([rows.positions for rows in prompt])
             prefix_input_embeds = torch.cat([rows.features[0] for rows in prompt])
             prefix_aux = torch.cat([rows.features[1] for rows in prompt])
-        elif self._last_confirmed is not None:
-            prefix_positions = self._last_confirmed.positions
-            prefix_input_embeds, prefix_aux = self._last_confirmed.features
         else:
-            raise RuntimeError("continuation has no previous confirmed token")
+            last = cast("ConfirmedRows[Eagle3Rows]", self._last_confirmed)
+            prefix_positions = last.positions
+            prefix_input_embeds, prefix_aux = last.features
 
         confirmed_input_embeds, confirmed_aux = confirmed.features
         confirmed_length = confirmed.positions.numel()
