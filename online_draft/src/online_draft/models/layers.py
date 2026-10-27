@@ -115,62 +115,60 @@ def rotary_cosine_and_sine(
     return frequencies.cos(), frequencies.sin()
 
 
-def apply_rotary_embedding(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    positions: torch.Tensor,
-    rope_theta: float,
-    rotary_dim: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate the first ``rotary_dim`` channels of [heads, tokens, head_dim].
+class RotaryEmbedding(nn.Module):
+    """NeoX RoPE on the first ``rotary_dim`` channels of [heads, tokens, head_dim].
 
     The remaining channels pass through unchanged, as in vLLM partial rotary.
+    Drafts copied from vLLM look up the GPU layer's ``cos_sin_cache``, so any
+    RoPE scaling matches; drafts built from a config use default RoPE.
     """
-    head_dim = query.shape[-1]
-    rotary_dim = head_dim if rotary_dim is None else rotary_dim
-    cosine, sine = rotary_cosine_and_sine(
-        positions.to(query.device), rotary_dim, rope_theta
-    )
-    cosine = cosine.to(dtype=query.dtype).unsqueeze(0)
-    sine = sine.to(dtype=query.dtype).unsqueeze(0)
 
-    def rotate(tensor: torch.Tensor) -> torch.Tensor:
-        rotary, passthrough = tensor.split((rotary_dim, head_dim - rotary_dim), -1)
-        first_half, second_half = rotary.chunk(2, dim=-1)
-        rotated = torch.cat(
-            (
-                first_half * cosine - second_half * sine,
-                second_half * cosine + first_half * sine,
-            ),
-            dim=-1,
-        )
-        if rotary_dim == head_dim:
-            return rotated
-        return torch.cat((rotated, passthrough), dim=-1)
+    def __init__(self, rotary_dim: int, rope_theta: float) -> None:
+        super().__init__()
+        self.rotary_dim = rotary_dim
+        self.rope_theta = rope_theta
+        self.cos_sin_cache: torch.Tensor | None
+        self.register_buffer("cos_sin_cache", None, persistent=False)
 
-    return rotate(query), rotate(key)
+    def forward(
+        self, query: torch.Tensor, key: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = positions.to(query.device)
+        if self.cos_sin_cache is None:
+            cosine, sine = rotary_cosine_and_sine(
+                positions, self.rotary_dim, self.rope_theta
+            )
+        else:
+            cosine, sine = self.cos_sin_cache[positions].chunk(2, dim=-1)
+        cosine = cosine.to(dtype=query.dtype).unsqueeze(0)
+        sine = sine.to(dtype=query.dtype).unsqueeze(0)
+        head_dim = query.shape[-1]
+
+        def rotate(tensor: torch.Tensor) -> torch.Tensor:
+            rotary, passthrough = tensor.split(
+                (self.rotary_dim, head_dim - self.rotary_dim), -1
+            )
+            first_half, second_half = rotary.chunk(2, dim=-1)
+            rotated = torch.cat(
+                (
+                    first_half * cosine - second_half * sine,
+                    second_half * cosine + first_half * sine,
+                ),
+                dim=-1,
+            )
+            if self.rotary_dim == head_dim:
+                return rotated
+            return torch.cat((rotated, passthrough), dim=-1)
+
+        return rotate(query), rotate(key)
 
 
-def validate_vllm_rotary(
-    rotary: nn.Module,
-    rotary_dim: int,
-    rope_theta: float,
-    name: str,
-) -> None:
-    """Check that a vLLM precomputed RoPE table equals the CPU formula.
-
-    This also rejects RoPE scaling variants, whose tables differ.
-    """
-    cache = rotary.cos_sin_cache
-    positions = torch.arange(min(cache.shape[0], 4096))
-    cosine, sine = rotary_cosine_and_sine(positions, rotary_dim, rope_theta)
-    expected = torch.cat((cosine, sine), dim=-1)
-    actual = cache[: positions.numel()].detach().float().cpu()
-    tolerance = 1e-4 if cache.dtype == torch.float32 else 1e-2
-    if actual.shape != expected.shape or not torch.allclose(
-        actual, expected, rtol=0, atol=tolerance
-    ):
-        raise ValueError(f"vLLM {name} RoPE does not match the CPU RoPE")
+def copy_vllm_rotary(model: nn.Module, rotary: nn.Module) -> None:
+    """Point every RoPE in ``model`` at one CPU copy of vLLM's cos/sin table."""
+    cache = rotary.cos_sin_cache.detach().to(device="cpu", copy=True)
+    for module in model.modules():
+        if isinstance(module, RotaryEmbedding):
+            module.cos_sin_cache = cache
 
 
 def cached_attention(

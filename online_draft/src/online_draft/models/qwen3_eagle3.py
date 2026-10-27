@@ -17,9 +17,9 @@ from online_draft.models.layers import (
     GatedMLP,
     LayerKV,
     RMSNorm,
-    apply_rotary_embedding,
+    RotaryEmbedding,
     cached_attention,
-    validate_vllm_rotary,
+    copy_vllm_rotary,
 )
 
 
@@ -175,8 +175,6 @@ class Qwen3Eagle3SelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
-        self.rope_theta = config.rope_theta
-        self.rotary_dim = config.rotary_dim
         self.attention_backend = config.attention_backend
 
         query_size = self.num_attention_heads * self.head_dim
@@ -192,6 +190,9 @@ class Qwen3Eagle3SelfAttention(nn.Module):
             query_size,
             self.hidden_size,
             bias=False,
+        )
+        self.rotary_emb = RotaryEmbedding(
+            config.rotary_dim or config.head_dim, config.rope_theta
         )
 
     def forward(
@@ -219,9 +220,7 @@ class Qwen3Eagle3SelfAttention(nn.Module):
             sequence_length, self.num_key_value_heads, self.head_dim
         ).transpose(0, 1)
 
-        query, key = apply_rotary_embedding(
-            query, key, positions, self.rope_theta, self.rotary_dim
-        )
+        query, key = self.rotary_emb(query, key, positions)
         attention_output, present_key_value = cached_attention(
             query,
             key,
@@ -631,8 +630,6 @@ def load_qwen3_eagle3_from_vllm(
             else gpu_model.lm_head.weight.shape[0]
         ),
     )
-    validate_vllm_rotary(rotary, rotary.rotary_dim, cpu_config.rope_theta, "EAGLE3")
-
     with torch.inference_mode(False), torch.device("meta"):
         model = Qwen3Eagle3ForCausalLM(cpu_config)
 
@@ -659,6 +656,7 @@ def load_qwen3_eagle3_from_vllm(
             for name in model.state_dict()
         }
         model.load_state_dict(weights, assign=True)
+        copy_vllm_rotary(model, rotary)
     return model
 
 

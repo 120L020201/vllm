@@ -14,7 +14,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from online_draft.models.layers import GatedMLP, RMSNorm, apply_rotary_embedding
+from online_draft.models.layers import (
+    GatedMLP,
+    RMSNorm,
+    RotaryEmbedding,
+    copy_vllm_rotary,
+)
 from online_draft.models.qwen3_5_mtp import (
     Qwen3_5MTPConfig,
     Qwen3_5MTPForCausalLM,
@@ -33,6 +38,19 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 
 DTYPES = [torch.float32, torch.bfloat16]
 ROPE_THETA = 1_000_000.0
+# Qwen3.6-27B PRISM EAGLE3 draft.
+YARN = {
+    "rope_type": "yarn",
+    "factor": 32.0,
+    "original_max_position_embeddings": 4096,
+}
+LLAMA3 = {
+    "rope_type": "llama3",
+    "factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 64,
+}
 
 
 def _rope(head_dim: int, dtype: torch.dtype = torch.float32, **parameters):
@@ -90,9 +108,26 @@ def test_rms_norm_matches_vllm(
     ],
 )
 def test_rotary_matches_vllm(default_vllm_config, dtype, rope_parameters) -> None:
+    """Drafts built from a config compute default RoPE themselves."""
+    _assert_rotary_matches(
+        _rope(64, dtype, **rope_parameters), copy_table=False, dtype=dtype
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rope_parameters", [YARN, LLAMA3])
+def test_copied_rotary_table_matches_scaled_vllm_rope(
+    default_vllm_config, dtype, rope_parameters
+) -> None:
+    """Drafts loaded from vLLM reuse its table, so scaled RoPE matches too."""
+    _assert_rotary_matches(
+        _rope(64, dtype, **rope_parameters), copy_table=True, dtype=dtype
+    )
+
+
+def _assert_rotary_matches(rotary, *, copy_table: bool, dtype: torch.dtype) -> None:
     torch.manual_seed(0)
     heads, kv_heads, head_dim = 4, 2, 64
-    rotary = _rope(head_dim, dtype, **rope_parameters)
     positions = torch.tensor([0, 1, 7, 100, 2047, 4095])
     query = torch.randn(positions.numel(), heads * head_dim, dtype=dtype)
     key = torch.randn(positions.numel(), kv_heads * head_dim, dtype=dtype)
@@ -104,9 +139,10 @@ def test_rotary_matches_vllm(default_vllm_config, dtype, rope_parameters) -> Non
     def by_head(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.view(positions.numel(), -1, head_dim).transpose(0, 1)
 
-    actual_query, actual_key = apply_rotary_embedding(
-        by_head(query), by_head(key), positions, ROPE_THETA, rotary.rotary_dim
-    )
+    cpu_rotary = RotaryEmbedding(rotary.rotary_dim, ROPE_THETA)
+    if copy_table:
+        copy_vllm_rotary(cpu_rotary, rotary)
+    actual_query, actual_key = cpu_rotary(by_head(query), by_head(key), positions)
 
     torch.testing.assert_close(by_head(expected_query), actual_query)
     torch.testing.assert_close(by_head(expected_key), actual_key)
@@ -192,30 +228,20 @@ def test_load_copies_draft_weights_and_settings(default_vllm_config) -> None:
         assert torch.equal(model.state_dict()[name], tensor), name
 
 
-@pytest.mark.parametrize(
-    ("rope_parameters", "message"),
-    [
-        (
-            {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 64,
-            },
-            "RoPE does not match",
-        ),
-    ],
-)
-def test_load_rejects_rope_the_cpu_model_cannot_match(
-    default_vllm_config, rope_parameters, message
-) -> None:
-    source = Qwen3Eagle3ForCausalLM(_config())
+def test_load_copies_the_vllm_rope_table(default_vllm_config) -> None:
+    rotary = _rope(8, **YARN)
 
-    with pytest.raises(ValueError, match=message):
-        load_qwen3_eagle3_from_vllm(
-            _vllm_like_draft(source, _rope(8, **rope_parameters))
-        )
+    model = load_qwen3_eagle3_from_vllm(
+        _vllm_like_draft(Qwen3Eagle3ForCausalLM(_config()), rotary)
+    )
+
+    tables = [
+        module.cos_sin_cache
+        for module in model.modules()
+        if isinstance(module, RotaryEmbedding)
+    ]
+    assert tables
+    assert all(torch.equal(table, rotary.cos_sin_cache) for table in tables)
 
 
 def test_load_rejects_weights_outside_the_cpu_layout(default_vllm_config) -> None:

@@ -16,8 +16,8 @@ from online_draft.models.layers import (
     GatedMLP,
     LayerKV,
     RMSNorm,
-    apply_rotary_embedding,
-    validate_vllm_rotary,
+    RotaryEmbedding,
+    copy_vllm_rotary,
 )
 
 ContextKV = tuple[LayerKV, ...]
@@ -77,6 +77,7 @@ class DFlashAttention(nn.Module):
         self.o_proj = nn.Linear(self.q_size, config.hidden_size, bias=False)
         self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
+        self.rotary_emb = RotaryEmbedding(config.head_dim, config.rope_theta)
 
     def _heads(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.view(tensor.shape[0], -1, self.config.head_dim).transpose(0, 1)
@@ -85,7 +86,7 @@ class DFlashAttention(nn.Module):
         kv = F.linear(hidden, self.qkv_proj.weight[self.q_size :])
         key, value = kv.split(self.kv_size, dim=-1)
         key = self.k_norm(self._heads(key))
-        key, _ = apply_rotary_embedding(key, key, positions, self.config.rope_theta)
+        key, _ = self.rotary_emb(key, key, positions)
         return key, self._heads(value)
 
     def _restrict(
@@ -119,9 +120,7 @@ class DFlashAttention(nn.Module):
         )
         query = self.q_norm(self._heads(query))
         key = self.k_norm(self._heads(key))
-        query, key = apply_rotary_embedding(
-            query, key, positions, self.config.rope_theta
-        )
+        query, key = self.rotary_emb(query, key, positions)
         value = self._heads(value)
         repeats = self.config.num_attention_heads // self.config.num_key_value_heads
         chunk = (
@@ -329,8 +328,6 @@ def load_qwen3_dflash_from_vllm(
         names = ", ".join(name for name, found in unsupported.items() if found)
         raise ValueError(f"online DFlash CPU model does not support: {names}")
 
-    rope_theta = config.rope_parameters["rope_theta"]
-    validate_vllm_rotary(rotary, rotary.rotary_dim, rope_theta, "DFlash")
     cpu_config = Qwen3DFlashConfig(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
@@ -341,7 +338,7 @@ def load_qwen3_dflash_from_vllm(
         vocab_size=config.vocab_size,
         num_aux_hidden_states=len(config.dflash_config["target_layer_ids"]),
         rms_norm_eps=config.rms_norm_eps,
-        rope_theta=rope_theta,
+        rope_theta=config.rope_parameters["rope_theta"],
         grouped_query_attention=grouped_query_attention,
         selective_last_layer=selective_last_layer,
         layer_attention=tuple(
@@ -358,4 +355,5 @@ def load_qwen3_dflash_from_vllm(
             for name in model.state_dict()
         }
         model.load_state_dict(weights, assign=True)
+        copy_vllm_rotary(model, rotary)
     return model

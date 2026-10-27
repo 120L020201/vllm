@@ -22,9 +22,9 @@ from online_draft.models.layers import (
     GatedMLP,
     LayerKV,
     RMSNorm,
-    apply_rotary_embedding,
+    RotaryEmbedding,
     cached_attention,
-    validate_vllm_rotary,
+    copy_vllm_rotary,
 )
 
 
@@ -64,6 +64,7 @@ class Qwen3_5MTPAttention(nn.Module):
         self.o_proj = nn.Linear(self.q_size, config.hidden_size, bias=False)
         self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps, unit_offset=True)
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps, unit_offset=True)
+        self.rotary_emb = RotaryEmbedding(config.rotary_dim, config.rope_theta)
 
     def forward(
         self,
@@ -88,9 +89,7 @@ class Qwen3_5MTPAttention(nn.Module):
             tokens, config.num_key_value_heads, config.head_dim
         ).transpose(0, 1)
 
-        query, key = apply_rotary_embedding(
-            query, key, positions, config.rope_theta, config.rotary_dim
-        )
+        query, key = self.rotary_emb(query, key, positions)
         output, present = cached_attention(
             query, key, value, past_key_value, attention_mask, config.attention_backend
         )
@@ -234,8 +233,6 @@ def load_qwen3_5_mtp_from_vllm(
         vocab_size=config.vocab_size,
         attention_backend=AttentionBackend(attention_backend or "eager"),
     )
-    validate_vllm_rotary(rotary, cpu_config.rotary_dim, cpu_config.rope_theta, "MTP")
-
     with torch.inference_mode(False), torch.device("meta"):
         model = Qwen3_5MTPForCausalLM(cpu_config)
 
@@ -261,4 +258,5 @@ def load_qwen3_5_mtp_from_vllm(
             for name in model.state_dict()
         }
         model.load_state_dict(weights, assign=True)
+        copy_vllm_rotary(model, rotary)
     return model
