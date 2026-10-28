@@ -144,7 +144,7 @@ def _online_config(method: str, **overrides) -> SimpleNamespace:
 )
 def test_online_draft_config_lists_unmet_requirements(method, name) -> None:
     """Both methods accept chunked prefill but need one contiguous request."""
-    speculator = SimpleNamespace(_speculator_name="DFlash")
+    speculator = SimpleNamespace(_speculator_name="DFlash", supports_mm_inputs=False)
     _validate_online_draft_config(_online_config(method), speculator)
 
     config = _online_config(method, max_num_seqs=2, enable_prefix_caching=True)
@@ -158,6 +158,15 @@ def test_online_draft_config_lists_unmet_requirements(method, name) -> None:
 def test_online_eagle3_rejects_other_speculative_methods() -> None:
     with pytest.raises(ValueError, match="online EAGLE3 requires method=eagle3"):
         _validate_online_draft_config(_online_config("eagle"), Mock())
+
+
+def test_online_draft_rejects_multimodal_draft_inputs() -> None:
+    """Capture embeds input ids only, so merged image embeddings would be lost."""
+    speculator = SimpleNamespace(supports_mm_inputs=True)
+    with pytest.raises(
+        ValueError, match="online EAGLE3 requires text-only draft inputs"
+    ):
+        _validate_online_draft_config(_online_config("eagle3"), speculator)
 
 
 def test_online_draft_settings_map_to_trainer_and_method() -> None:
@@ -197,7 +206,7 @@ def test_online_draft_settings_reject_keys_the_method_ignores(
 
 def test_online_mtp_requires_a_qwen3_5_target() -> None:
     """The CPU MTP layer mirrors Qwen3.5's gated attention only."""
-    speculator = SimpleNamespace(_speculator_name="MTP")
+    speculator = SimpleNamespace(_speculator_name="MTP", supports_mm_inputs=False)
     _validate_online_draft_config(
         _online_config("mtp", model_type="qwen3_5"), speculator
     )

@@ -428,10 +428,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         prefill_input_embeds = None
         if self.explicit_input_embeds:
             prefill_input_embeds = self._prepare_input_embeds(
-                prefill_batch_desc.num_tokens,
-                mm_inputs,
+                prefill_batch_desc.num_tokens
             )
-            assert prefill_input_embeds is not None
 
             self.last_prefill_input_embeds = prefill_input_embeds
             self.last_prefill_positions = (
@@ -550,37 +548,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             hidden_states = last_hidden_states
         self.hidden_states[:num_tokens_padded].copy_(hidden_states)
 
-    def _prepare_input_embeds(
-        self,
-        num_tokens: int,
-        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
-    ) -> torch.Tensor | None:
-        input_ids = self.input_buffers.input_ids[:num_tokens]
-        self.last_input_embeds = None
-
-        if not self.supports_mm_inputs:
-            if not self.explicit_input_embeds:
-                return None
-            inputs_embeds = self.model.embed_input_ids(input_ids)
-            self.last_input_embeds = inputs_embeds
-            return inputs_embeds
-
-        assert self.inputs_embeds is not None
-
-        mm_embeds, is_mm_embed = mm_inputs or (None, None)
-        num_input_tokens = (
-            is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
+    def _prepare_input_embeds(self, num_tokens: int) -> torch.Tensor:
+        """Embed text-only draft inputs explicitly so online capture sees them."""
+        self.last_input_embeds = self.model.embed_input_ids(
+            self.input_buffers.input_ids[:num_tokens]
         )
-        self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
-            input_ids[:num_input_tokens],
-            multimodal_embeddings=mm_embeds,
-            is_multimodal=is_mm_embed,
-        )
-        inputs_embeds = self.inputs_embeds[:num_tokens]
-        if self.explicit_input_embeds:
-            # Online capture records the merged embeddings the draft consumes.
-            self.last_input_embeds = inputs_embeds
-        return inputs_embeds
+        return self.last_input_embeds
 
     @torch.inference_mode()
     def _run_model(
@@ -603,12 +576,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
-            input_ids = self.input_buffers.input_ids[:num_tokens]
-            if inputs_embeds is None:
-                inputs_embeds = self._prepare_input_embeds(num_tokens, mm_inputs)
+            if inputs_embeds is None and self.explicit_input_embeds:
+                inputs_embeds = self._prepare_input_embeds(num_tokens)
+            elif inputs_embeds is None and self.supports_mm_inputs:
+                assert self.inputs_embeds is not None
+                # Merge multimodal embeddings with input ids.
+                mm_embeds, is_mm_embed = mm_inputs or (None, None)
+                num_input_tokens = (
+                    is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
+                )
+                self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
+                    self.input_buffers.input_ids[:num_input_tokens],
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
+                inputs_embeds = self.inputs_embeds[:num_tokens]
 
             model_inputs = dict(
-                input_ids=input_ids,
+                input_ids=self.input_buffers.input_ids[:num_tokens],
                 positions=self.input_buffers.positions[:num_tokens],
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,

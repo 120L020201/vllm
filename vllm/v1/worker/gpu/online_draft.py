@@ -343,7 +343,7 @@ def _parse_online_draft_settings(
 
 
 def _validate_online_draft_config(vllm_config: VllmConfig, speculator: Any) -> None:
-    """Reject configs that break one request's contiguous capture history."""
+    """Reject configs the online capture and training path does not support."""
     recipe_type = _recipe_type(vllm_config)
     parallel_config = vllm_config.parallel_config
 
@@ -361,6 +361,7 @@ def _validate_online_draft_config(vllm_config: VllmConfig, speculator: Any) -> N
             vllm_config.model_config.hf_config.model_type
             in recipe_type.target_model_types
         ),
+        "text-only draft inputs": not speculator.supports_mm_inputs,
     }
 
     unmet = [requirement for requirement, ok in requirements.items() if not ok]
