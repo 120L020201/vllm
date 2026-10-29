@@ -1,14 +1,14 @@
 # 在线 draft 训练代码导航
 
 这里实现 EAGLE3、DFlash 和 MTP 的请求内异步 CPU 在线训练（target 支持 Qwen3 与
-Qwen3.5，MTP 仅 Qwen3.5）。当前主路径使用单 GPU、
+Qwen3.5，MTP 仅 Qwen3.5）。运行时使用单 GPU、
 单活动请求：GPU 持续推理，后台采集线程搬运数据，后台训练线程更新 CPU draft，
 推理线程在安全位置安装已完成上传的新权重。每个请求结束后恢复初始权重 W0。
 
-本文对应结构重构后的代码，包含启动配置与脚本入口（见[运行](#运行)）。两种方法的
+本文介绍代码结构、启动配置与脚本入口（见[运行](#运行)）。EAGLE3 与 DFlash 的
 差异见 [EAGLE3 / DFlash 对比](docs/dflash/change_summary_eagle3_comparison.md)。
 
-## 最终目录
+## 目录
 
 ```text
 online_draft/
@@ -91,11 +91,10 @@ DFlash 的 context cache 较简单，和窗口训练放在一起。
 它本身不训练模型。`capture/` 属于 `runtime/`，因为它依赖请求状态、GPU 完成事件、
 异步队列及跨线程数据生命周期；其中的 CPU batch 构造器仍保留模型专用语义。
 
-三个原有 weight 文件已合并为 `runtime/weights.py`，只保留
-`DraftWeightSnapshot` 和 `DraftWeightInstaller` 两个主要对象。
-领取快照直接使用 `pipeline.poll_snapshot` 回调，交接通过
-`installer.advance(snapshot)` 完成。GPU 模型参数绑定仍留在 vLLM，避免训练包
-依赖具体推理模型。
+权重交接集中在 `runtime/weights.py`，主要对象是 `DraftWeightSnapshot` 和
+`DraftWeightInstaller`。推理侧通过 `pipeline.poll_snapshot` 回调领取快照，再由
+`installer.advance(snapshot)` 完成交接。GPU 模型参数绑定放在 vLLM 一侧，训练包
+不依赖具体推理模型。
 
 ## 线程与数据所有权
 
@@ -133,8 +132,8 @@ flowchart LR
 ```
 
 装配入口是 [`create_online_draft`](../vllm/v1/worker/gpu/online_draft.py)。
-它注入 EAGLE3 的 `train_eagle3_rounds` 或绑定参数后的 DFlash
-`train_dflash_window`，所以 pipeline 不需要按模型分支。训练函数接收 trainer、
+它按方法注入绑定了 `max_train_rounds` 的 `train_eagle3_rounds`（EAGLE3、MTP）或
+`train_dflash_window`（DFlash），所以 pipeline 不需要按模型分支。训练函数接收 trainer、
 完整 round 的 batch 元组、旧 cache 和 profiling 开关，返回新 cache 与训练结果。
 
 两种模型共用同一个步内顺序，由 `spec_decode/online.py` 的
@@ -162,7 +161,7 @@ DFlash: 上述顺序位于 FC 之后（FC 冻结，采集其输出）、context 
 
 关闭在线训练时不创建上述 runtime、CPU 模型、工作线程或 capture buffer。
 
-## 依赖与保留的差异
+## 依赖与方法差异
 
 独立 `online_draft` 包不导入 vLLM。vLLM 的装配层和推理状态对象依赖训练包；
 公共 transport 只依赖 packet 协议，公共 pipeline 只依赖训练回调、trainer 和
@@ -176,11 +175,11 @@ EAGLE3 cache 对 window 类型的引用在 `TYPE_CHECKING` 下，不会触发运
 推理共用 slot，但 DFlash 仍需要派生 buffer 和每个 slot 一套 query graph。
 EAGLE3 与 MTP 在线时同样为每个 slot 捕获一套 prefill/decode FULL graph，prompt 步
 与不支持 fused decode 的后端走 eager（见[报告五](docs/reports/05_eagle3_online_overhead_root_cause.md)）。
-两种方法也保留各自的 loss、query 布局与 context 构建方式。
+各方法有各自的 loss、query 布局与 context 构建方式。
 
 仓库根目录的 [`methods/`](../methods/README.md) 是另一组 EAGLE3 实验策略入口，
 包含 TTS、随机采样和 OSpec 等策略，复用部分训练组件。它不由这里的
-`create_online_draft` 装配，也不应作为失效的旧目录删除。
+`create_online_draft` 装配，与这里的在线训练路径相互独立。
 
 ## 运行
 
@@ -193,7 +192,8 @@ EAGLE3 与 MTP 在线时同样为每个 slot 捕获一套 prefill/decode FULL gr
 | `VLLM_USE_V2_MODEL_RUNNER=1` | 必需，在线训练只接在 V2 model runner 上 |
 | `VLLM_ONLINE_DRAFT_TRAIN=1` | 开启在线训练；为 0 时不创建 CPU 模型、线程和 capture buffer |
 | `VLLM_ONLINE_DRAFT_PROFILE=1` | 可选，记录在线训练的 profile 时间线 |
-| `OMP_NUM_THREADS` / `MKL_NUM_THREADS` | 未配置 `cpu_threads` 时 CPU 训练使用的线程数 |
+| `OMP_NUM_THREADS` / `MKL_NUM_THREADS` | 未配置 `cpu_threads` 时 CPU 训练使用的线程数，需在启动命令中设置；两者都没有时 vLLM 在 warmup 后把 Torch 线程设为 1，CPU 训练只有单线程 |
+| `VLLM_ENABLE_V1_MULTIPROCESSING` | 保持默认，不要设为 0：engine 与 `LLM` 前端同进程时，前端的 `torch.set_num_threads` 会让训练线程只剩单线程 |
 
 启动时 `_validate_online_draft_config` 检查以下条件，不满足时报出全部未满足项：
 
@@ -229,8 +229,7 @@ CPU attention backward 使用独立 C++ extension，需要 C++ 编译器和 Ninj
 | `cpu_threads` | 全部 | `{}` | `inference` / `capture` / `training` 各自的线程数 |
 | `cpu_affinity` | 全部 | `{}` | 同上三个角色绑定的 CPU 列表 |
 | `attention_backend` | EAGLE3、MTP | `"eager"` | CPU attention：`"eager"` 或 `"flash_attention"` |
-| `max_train_rounds` | DFlash | `16` | 每次训练使用最近 N 个完整 query block；0 表示不限 |
-| `loss_decay_gamma` | DFlash | `7.0` | block 内位置衰减 KL 的 γ，须为正 |
+| `max_train_rounds` | 全部 | `0` | 每次训练只用两次安装之间最近 N 个 round；0 表示全部 |
 | `grouped_query_attention` | DFlash | `False` | CPU attention 按 GQA 重排，不展开历史 K/V |
 | `selective_last_layer` | DFlash | `False` | 最后一层只计算监督行 |
 
@@ -239,6 +238,16 @@ MTP 与 target 共享 lm_head，不训练 lm_head。EAGLE3 draft 的 lm_head 与
 `frozen_parameter_prefixes: ["lm_head"]`。
 
 ### 示例
+
+CPU 训练的线程数有两种配法，二选一；两者都不配时 CPU 训练只有单线程。
+
+#### 写法一：环境变量指定线程数，不绑核
+
+把下面的代码保存为 `launch.py`，在启动命令中设置线程数：
+
+```bash
+OMP_NUM_THREADS=20 MKL_NUM_THREADS=20 .venv/bin/python launch.py
+```
 
 ```python
 import os
@@ -270,8 +279,68 @@ llm = LLM(
 )
 ```
 
-改用 MTP 时去掉 `speculative_config.model`；改用 DFlash 时换成 DFlash draft，并把
-`attention_backend` 换成 DFlash 的键。
+CPU 训练使用 `OMP_NUM_THREADS` 个 OpenMP 线程。推理、capture 与训练线程都不绑核，
+由操作系统调度，任何机器都可以直接使用。
+
+#### 写法二：`cpu_threads` 与 `cpu_affinity` 按机器拓扑绑核
+
+在写法一的 `online_draft` 中加入：
+
+```python
+"cpu_threads": {"inference": 1, "capture": 1, "training": 16},
+"cpu_affinity": {
+    "inference": [18],
+    "capture": [19],
+    "training": list(range(16)),
+},
+```
+
+推理、capture 与训练线程各自设置线程数与绑核，不依赖 `OMP_NUM_THREADS`。上面是本工作站
+（20 个物理核，CPU n 与 n+20 是同一物理核的两个超线程）的取值：训练 16 线程用 CPU 0–15，
+推理与 capture 各占一个物理核，它们的超线程 38、39 空闲，训练线程不会与推理线程共享物理核。
+Qwen3.5 与 Qwen3.6 的 AIME 实验都使用这一布局。换机器需按
+`/sys/devices/system/cpu/cpu*/topology/thread_siblings_list` 重新选择。
+
+#### 改用 MTP 或 DFlash
+
+MTP：`method` 改为 `"mtp"`，去掉 `speculative_config.model`，`num_speculative_tokens`
+常用 3，`online_draft` 不变。
+
+DFlash：换成 DFlash draft，`num_speculative_tokens` 常用 15；`online_draft` 去掉 EAGLE3 的
+`attention_backend`，加入 DFlash 的键：
+
+```python
+speculative_config={
+    "method": "dflash",
+    "model": "/data/models/Qwen3.5-4B-BF16/Qwen3.5-4B-DFlash",
+    "num_speculative_tokens": 15,
+    "attention_backend": "FLASH_ATTN",
+},
+additional_config={
+    "online_draft": {
+        "learning_rate": 1e-5,
+        "max_train_rounds": 16,
+        "grouped_query_attention": True,
+        "selective_last_layer": True,
+        "log_updates": True,
+    }
+},
+```
+
+#### `max_train_rounds`
+
+每次更新拿到两次权重安装之间的全部 round。`max_train_rounds=N` 时只对其中最近 N 个 round
+计算 loss 与 backward；更早的 round 不产生 loss，但它们确认的 target 特征照常进入训练的
+上下文（DFlash 的 context KV，EAGLE3 与 MTP 的 confirmed spine 与持久 KV），之后的 round
+能看到。默认 0，训练全部 round；三种方法都接受这个键，写在 `online_draft` 中。
+
+N 越大单次训练越久，两次安装之间积累的 round 越多，安装越稀疏。DFlash 建议配 16：
+Qwen3-8B 的扫描（`results/experiments/2026-10-28_dflash_train_rounds_8b_9b`，FlashInfer，
+lr 1e-4，前 8 题）中，0 的窗口最大到 2,450 个 round，接受长度 3.23，低于 frozen 的 3.55；
+16 为 3.76。
+
+DFlash 的实验用写法二绑核，并在启动命令中设置
+`OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OMP_WAIT_POLICY=PASSIVE`。
 
 ### 实机 smoke
 
@@ -310,7 +379,7 @@ MTP 与 DFlash 常用的 `--speculative-tokens` 分别为 3 和 15。去掉 `--o
 | `--cpu-isolation` | 本工作站（20 物理核）专用：推理绑 18、采集 19、训练 0..N-1 |
 | `--target-graphs` | target 与 draft slot 开启 CUDA graph |
 | `--check-math` | 请求前做 CPU/GPU 前向、非零 slot 安装与 reset 对拍；会同步 GPU，不属于推理路径 |
-| `--max-train-rounds`、`--loss-decay-gamma`、`--grouped-query-attention`、`--selective-last-layer`、`--master-weights` | 对应 `online_draft` 配置项 |
+| `--max-train-rounds`、`--grouped-query-attention`、`--selective-last-layer`、`--master-weights` | 对应 `online_draft` 配置项；`--max-train-rounds` 默认 16，`0` 训练全部 round |
 | `--queue-metrics` | 仅在线 DFlash：记录队列长度和驻留时间 |
 | `--aime-questions`、`--aime-offset`、`--context-tokens`、`--max-model-len` | 使用本地 AIME 数据自然生成至 EOS 或上下文上限 |
 | `--gsm8k-questions` | 复用 GSM8K 回归工具 |
@@ -327,21 +396,22 @@ MTP 与 DFlash 常用的 `--speculative-tokens` 分别为 3 和 15。去掉 `--o
   baseline 与 online、请求指标及 profile，用法见[实机 smoke](#实机-smoke)。
 - [`smoke_async_eagle3.py`](scripts/smoke_async_eagle3.py) 与
   [`smoke_async_eagle3_two_requests.py`](scripts/smoke_async_eagle3_two_requests.py)：
-  早期 EAGLE3 实机 smoke；在线运行需外部设置 `VLLM_USE_V2_MODEL_RUNNER=1`
+  EAGLE3 单请求与两请求实机 smoke；在线运行需外部设置 `VLLM_USE_V2_MODEL_RUNNER=1`
   和 `VLLM_ONLINE_DRAFT_TRAIN=1`。
 - [`check_dflash_math.py`](scripts/check_dflash_math.py)、
   [`check_eagle3_math.py`](scripts/check_eagle3_math.py) 与
   [`check_mtp_math.py`](scripts/check_mtp_math.py)：`smoke_async_dflash.py --online
   --check-math` 按方法调用的 CPU/GPU 实机对拍，覆盖完整前向、安装后的权重与 reset。
 - [`summarize_dflash_trace.py`](scripts/summarize_dflash_trace.py)：解析 profiler trace。
-- [`benchmark_aime_2026.py`](scripts/benchmark_aime_2026.py)：从
-  `myvllm-rebuild` 复制的 AIME 公共 runner，支持 target-only / EAGLE3 的
-  eager / graph 基线；模型与数据路径集中在文件顶部。
+- [`benchmark_aime_2026.py`](scripts/benchmark_aime_2026.py)：AIME 公共 runner，支持
+  target-only / EAGLE3 的 eager / graph 基线；模型与数据路径集中在文件顶部。
 - [`benchmark_aime_2026_online.py`](scripts/benchmark_aime_2026_online.py) 与
   [`benchmark_aime_2026_speculative_baseline.py`](scripts/benchmark_aime_2026_speculative_baseline.py)：
   EAGLE3 在线训练和冻结 draft 的对照入口，可用 `--problem-limit` 限制题数。
 - [`profile_aime_2026_online.py`](scripts/profile_aime_2026_online.py)：
-  EAGLE3 指定 AIME 题目的 profile，可用 `--no-profile` 运行普通请求。
+  EAGLE3 指定 AIME 题目的 profile，可用 `--no-profile` 运行普通请求。它设置了
+  `VLLM_ENABLE_V1_MULTIPROCESSING=0`，CPU 训练只有单线程，trace 中的训练耗时偏大；
+  需要多线程训练的 trace 时，engine 用默认的独立进程运行。
 
 脚本中的模型、数据路径及 CPU 绑核配置对应本地工作站。
 回归入口如下，在仓库根目录及已配置好的虚拟环境中执行：
@@ -360,8 +430,8 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 .venv/bin/python -m pytest \
 ```
 
 该回归验证模型计算、数据对齐、线程队列、安装/reset 及推理接入；不等同于真实
-请求的模型评估或性能复测。历史阶段报告保留当时的实现和实验数据，
-其中旧模块名、已删除脚本与产物路径不能作为当前代码导航。
+请求的模型评估或性能复测。`docs/` 下的阶段报告记录写作时的实现和实验数据，其中的
+模块名、脚本与产物路径可能已变化，代码导航以本文为准。
 
-复制 rebuild 的 EAGLE3 脚本后进行的真实 AIME、权重安装和两请求 reset 检查见
+EAGLE3 的真实 AIME、权重安装和两请求 reset 检查见
 [EAGLE3 实机验证报告](docs/experiments/eagle3_refactor_validation.md)。
