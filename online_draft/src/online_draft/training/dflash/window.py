@@ -115,7 +115,6 @@ def train_dflash_window(
     profile_timeline: bool = False,
     *,
     max_train_rounds: int = 0,
-    loss_decay_gamma: float = 7.0,
 ) -> tuple[DFlashCache, DFlashWindowResult]:
     """Train recent complete blocks; append all confirmed target context KV."""
     model = cast(Qwen3DFlashForCausalLM, trainer.model)
@@ -127,9 +126,7 @@ def train_dflash_window(
                 model, rounds, cache, max_train_rounds
             )
         with profile_range("online_draft.loss", profile_timeline):
-            loss = dflash_kl_loss(
-                logits, teacher, position_weights(selected, loss_decay_gamma)
-            )
+            loss = dflash_kl_loss(logits, teacher, position_weights(selected))
         loss_value = trainer.backward_and_step(loss, profile_timeline=profile_timeline)
         del loss, logits, teacher
 

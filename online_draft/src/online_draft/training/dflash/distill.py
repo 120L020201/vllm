@@ -5,13 +5,14 @@ import torch
 import torch.nn.functional as F
 from online_draft.training.dflash.batch import DFlashBatch
 
+# DFlash Eq. 4 decay; part of the loss definition, not a runtime setting.
+_LOSS_DECAY_GAMMA = 7.0
 
-def position_weights(
-    rounds: tuple[DFlashBatch, ...], gamma: float = 7.0
-) -> torch.Tensor:
+
+def position_weights(rounds: tuple[DFlashBatch, ...]) -> torch.Tensor:
     """DFlash Eq. 4: first predicted position has weight one in every block."""
     offsets = torch.cat([torch.arange(batch.target_count) for batch in rounds])
-    return torch.exp(-offsets.float() / gamma)
+    return torch.exp(-offsets.float() / _LOSS_DECAY_GAMMA)
 
 
 def dflash_kl_loss(

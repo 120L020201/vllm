@@ -90,6 +90,11 @@ def _autoregressive_capture_adapter(
     )
 
 
+def _check_max_train_rounds(max_train_rounds: int) -> None:
+    if max_train_rounds < 0:
+        raise ValueError("max_train_rounds must be >= 0 (0 trains every round)")
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Eagle3Recipe:
     """EAGLE3 captures before its trainable FC; fields are its settings."""
@@ -98,6 +103,10 @@ class _Eagle3Recipe:
     target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3", "qwen3_5"})
 
     attention_backend: str | None = None
+    max_train_rounds: int = 0
+
+    def __post_init__(self) -> None:
+        _check_max_train_rounds(self.max_train_rounds)
 
     @staticmethod
     def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
@@ -113,7 +122,7 @@ class _Eagle3Recipe:
         assert isinstance(speculator, EagleSpeculator)
 
     def train_rounds(self) -> TrainRounds:
-        return train_eagle3_rounds
+        return partial(train_eagle3_rounds, max_train_rounds=self.max_train_rounds)
 
     def create_adapter(
         self,
@@ -143,6 +152,10 @@ class _MTPRecipe:
     target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3_5"})
 
     attention_backend: str | None = None
+    max_train_rounds: int = 0
+
+    def __post_init__(self) -> None:
+        _check_max_train_rounds(self.max_train_rounds)
 
     @staticmethod
     def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
@@ -165,7 +178,7 @@ class _MTPRecipe:
         )
 
     def train_rounds(self) -> TrainRounds:
-        return train_eagle3_rounds
+        return partial(train_eagle3_rounds, max_train_rounds=self.max_train_rounds)
 
     def create_adapter(
         self,
@@ -191,14 +204,10 @@ class _DFlashRecipe:
 
     grouped_query_attention: bool = False
     selective_last_layer: bool = False
-    max_train_rounds: int = 16
-    loss_decay_gamma: float = 7.0
+    max_train_rounds: int = 0
 
     def __post_init__(self) -> None:
-        if self.max_train_rounds < 0 or not 0 < self.loss_decay_gamma < float("inf"):
-            raise ValueError(
-                "DFlash requires max_train_rounds >= 0 and finite loss_decay_gamma > 0"
-            )
+        _check_max_train_rounds(self.max_train_rounds)
 
     @staticmethod
     def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
@@ -226,11 +235,7 @@ class _DFlashRecipe:
     def train_rounds(self) -> TrainRounds:
         from online_draft.training.dflash.window import train_dflash_window
 
-        return partial(
-            train_dflash_window,
-            max_train_rounds=self.max_train_rounds,
-            loss_decay_gamma=self.loss_decay_gamma,
-        )
+        return partial(train_dflash_window, max_train_rounds=self.max_train_rounds)
 
     def create_adapter(
         self,

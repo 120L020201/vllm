@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.online_draft import (
     OnlineDraftRuntime,
     _DFlashRecipe,
     _Eagle3Recipe,
+    _MTPRecipe,
     _parse_online_draft_settings,
     _validate_online_draft_config,
 )
@@ -191,8 +192,9 @@ def test_online_draft_settings_map_to_trainer_and_method() -> None:
 @pytest.mark.parametrize(
     ("recipe", "values", "message"),
     [
-        (_Eagle3Recipe, {"max_train_rounds": 4}, "online EAGLE3 settings: max_train"),
+        (_Eagle3Recipe, {"selective_last_layer": True}, "online EAGLE3 settings"),
         (_DFlashRecipe, {"attention_backend": "eager"}, "online DFlash settings"),
+        (_DFlashRecipe, {"loss_decay_gamma": 7.0}, "settings: loss_decay_gamma"),
         (_Eagle3Recipe, {"cpu_threads": {"train": 2}}, "CPU roles: train"),
     ],
 )
@@ -202,6 +204,16 @@ def test_online_draft_settings_reject_keys_the_method_ignores(
     """A misspelled or other-method key would otherwise be silently ignored."""
     with pytest.raises(ValueError, match=message):
         _parse_online_draft_settings(values, recipe)
+
+
+@pytest.mark.parametrize("recipe", [_Eagle3Recipe, _MTPRecipe, _DFlashRecipe])
+def test_online_draft_max_train_rounds_defaults_to_every_round(recipe) -> None:
+    """Without the key every method trains all rounds since the last install."""
+    assert _parse_online_draft_settings({}, recipe).recipe.max_train_rounds == 0
+    settings = _parse_online_draft_settings({"max_train_rounds": 4}, recipe)
+    assert settings.recipe.max_train_rounds == 4
+    with pytest.raises(ValueError, match="max_train_rounds must be >= 0"):
+        _parse_online_draft_settings({"max_train_rounds": -1}, recipe)
 
 
 def test_online_mtp_requires_a_qwen3_5_target() -> None:

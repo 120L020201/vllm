@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import math
 
 import torch
@@ -331,6 +332,59 @@ def test_confirmed_path_window_uses_one_optimizer_step() -> None:
     _assert_cache_close(
         persistent_cache,
         _forward_full_window_history(model, window),
+    )
+
+
+def test_max_train_rounds_trains_recent_rows_over_the_full_spine() -> None:
+    """Older rounds still extend the spine and cache but add no loss rows.
+
+    The selected round's rows must match the same rows of a full-window
+    forward, so selection drops rows without changing their inputs.
+    """
+    torch.manual_seed(10)
+    model = _make_model()
+    full_model = copy.deepcopy(model)
+    rounds = (
+        _make_batch(anchor_position=1, draft_length=3, rejection_position=None),
+        _make_batch(anchor_position=5, draft_length=3, rejection_position=1),
+    )
+
+    def train(train_model, **kwargs):
+        positions: list[list[int]] = []
+        lm_head_inputs: list[torch.Tensor] = []
+        handles = (
+            train_model.register_forward_pre_hook(
+                lambda _m, _a, kw: positions.append(kw["positions"].tolist()),
+                with_kwargs=True,
+            ),
+            train_model.lm_head.register_forward_pre_hook(
+                lambda _m, args: lm_head_inputs.append(args[0].detach().clone())
+            ),
+        )
+        try:
+            with torch.inference_mode():
+                cache, result = train_eagle3_rounds(
+                    DraftTrainer(train_model, TrainerConfig(learning_rate=1e-2)),
+                    rounds,
+                    None,
+                    **kwargs,
+                )
+        finally:
+            for handle in handles:
+                handle.remove()
+        return cache, result, positions, lm_head_inputs[0]
+
+    cache, result, positions, rows = train(model, max_train_rounds=1)
+    _, _, _, full_rows = train(full_model)
+
+    assert positions == [list(range(8)), [5, 6], list(range(8))]
+    torch.testing.assert_close(rows, full_rows[-2:])
+    assert result.round_count == 1
+    assert result.target_count == 2
+    assert result.confirmed_length == 6
+    assert persistent_cache_length(cache) == 8
+    _assert_cache_close(
+        cache, _forward_full_window_history(model, Eagle3TrainingWindow(rounds))
     )
 
 

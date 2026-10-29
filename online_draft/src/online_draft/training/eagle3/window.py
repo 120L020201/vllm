@@ -112,10 +112,16 @@ def train_eagle3_rounds(
     profile_timeline: bool = False,
     *,
     mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
+    max_train_rounds: int = 0,
 ) -> tuple[Eagle3KVCache, Eagle3WindowResult]:
     """Train the rounds selected by the shared asynchronous pipeline."""
     return train_eagle3_window(
-        trainer, Eagle3TrainingWindow(rounds), persistent_cache, mode, profile_timeline
+        trainer,
+        Eagle3TrainingWindow(rounds),
+        persistent_cache,
+        mode,
+        profile_timeline,
+        max_train_rounds=max_train_rounds,
     )
 
 
@@ -125,6 +131,8 @@ def train_eagle3_window(
     persistent_cache: PersistentEagle3KVCache,
     mode: Eagle3WindowMode,
     profile_timeline: bool = False,
+    *,
+    max_train_rounds: int = 0,
 ) -> tuple[Eagle3KVCache, Eagle3WindowResult]:
     """Train one EAGLE3 window with one optimizer update.
 
@@ -141,6 +149,8 @@ def train_eagle3_window(
             None for the first window.
         mode: Window input and loss organization strategy.
         profile_timeline: Whether to annotate the training stages.
+        max_train_rounds: Train only the last N rounds' query rows; earlier
+            rounds still extend the confirmed spine and cache. 0 trains all.
 
     Returns:
         Updated persistent KV and metrics for the completed update.
@@ -149,6 +159,11 @@ def train_eagle3_window(
         ValueError: If the loss or gradients are invalid (see DraftTrainer).
     """
     model = cast(AutoregressiveDraftModel, trainer.model)
+    trained = (
+        Eagle3TrainingWindow(window.rounds[-max_train_rounds:])
+        if max_train_rounds
+        else window
+    )
 
     confirmed_length = sum(
         round_batch.confirmed_length for round_batch in window.rounds
@@ -169,13 +184,13 @@ def train_eagle3_window(
             if mode is Eagle3WindowMode.CONFIRMED_PATH:
                 training_inputs = prepare_eagle3_confirmed_path_inputs(
                     model,
-                    window,
+                    trained,
                     spine_length=spine_length,
                 )
             else:
                 training_inputs = prepare_eagle3_proposal_window_inputs(
                     model,
-                    window,
+                    trained,
                     spine_length=spine_length,
                 )
 
@@ -223,7 +238,7 @@ def train_eagle3_window(
         loss=loss_value,
         model_version=trainer.version,
         mode=mode,
-        round_count=window.round_count,
+        round_count=trained.round_count,
         input_length=input_length,
         target_count=target_count,
         confirmed_length=confirmed_length,
