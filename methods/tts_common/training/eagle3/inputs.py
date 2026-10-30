@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from methods.shared.eagle3.draft_model import AutoregressiveDraftModel
+from methods.tts_common.training.eagle3.draft_model import AutoregressiveDraftModel
 
 if TYPE_CHECKING:
-    from methods.shared.eagle3.window import (
+    from methods.tts_common.training.eagle3.window import (
         Eagle3TrainingWindow,
     )
 

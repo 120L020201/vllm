@@ -5,12 +5,12 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from methods.shared.eagle3.batch import validate_eagle3_rounds
-from methods.shared.eagle3.draft_model import AutoregressiveDraftModel
-from methods.shared.qwen3_eagle3 import Eagle3KVCache
+from methods.tts_common.training.eagle3.batch import validate_eagle3_rounds
+from methods.tts_common.training.eagle3.draft_model import AutoregressiveDraftModel
+from methods.tts_common.training.qwen3_eagle3 import Eagle3KVCache
 
 if TYPE_CHECKING:
-    from methods.shared.eagle3.window import (
+    from methods.tts_common.training.eagle3.window import (
         Eagle3TrainingWindow,
     )
 

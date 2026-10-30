@@ -6,7 +6,7 @@ distributions captured during verification. TTS runs training on a side CUDA
 stream while the draft serves the next `S-1` rounds, then installs the update
 before generating the next canvas. Parameters and optimizer reset after each
 request unless `--keep-weights` is specified.
-TTS owns its GPU training primitives under `methods/shared`; none of the TTS
+TTS owns its GPU training primitives under `methods/tts_common/training`; none of the TTS
 entry points imports the `online_draft` package or its CPU asynchronous
 pipeline.
 The paper's Qwen3-8B LiveCodeBench sweep found its best throughput at

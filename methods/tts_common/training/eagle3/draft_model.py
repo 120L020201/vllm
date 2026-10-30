@@ -14,7 +14,7 @@ from typing import Protocol, runtime_checkable
 import torch
 from torch import nn
 
-from methods.shared.layers import DraftForwardOutput, LayerKV
+from methods.tts_common.training.layers import DraftForwardOutput, LayerKV
 
 
 class AutoregressiveDraftConfig(Protocol):

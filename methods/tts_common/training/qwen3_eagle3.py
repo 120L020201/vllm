@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 
-from methods.shared.layers import (
+from methods.tts_common.training.layers import (
     VLLM_ATTENTION_STATE_SUFFIXES,
     AttentionBackend,
     DraftForwardOutput,

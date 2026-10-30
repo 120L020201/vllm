@@ -5,7 +5,7 @@
 
 import torch
 
-from methods.shared.eagle3.batch import (
+from methods.tts_common.training.eagle3.batch import (
     Eagle3DistillationBatch as _Eagle3DistillationBatch,
 )
 

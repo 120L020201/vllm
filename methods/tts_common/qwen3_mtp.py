@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from methods.shared.layers import (
+from methods.tts_common.training.layers import (
     VLLM_ATTENTION_STATE_SUFFIXES,
     AttentionBackend,
     DraftForwardOutput,

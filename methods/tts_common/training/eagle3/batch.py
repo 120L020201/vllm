@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from methods.shared.eagle3.draft_model import AutoregressiveDraftModel
+    from methods.tts_common.training.eagle3.draft_model import AutoregressiveDraftModel
 
 _POSITION_FIELD_NAMES = (
     "prefix_positions",

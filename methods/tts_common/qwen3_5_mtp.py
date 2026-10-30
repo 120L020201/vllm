@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from methods.shared.qwen3_5_mtp import (
+from methods.tts_common.training.qwen3_5_mtp import (
     Qwen3_5MTPForCausalLM,
     load_qwen3_5_mtp_from_vllm,
 )

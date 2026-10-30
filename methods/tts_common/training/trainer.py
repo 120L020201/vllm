@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from methods.shared.runtime import profile_range
+from methods.tts_common.training.runtime import profile_range
 
 
 @torch.compile(fullgraph=True)

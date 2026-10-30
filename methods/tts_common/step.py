@@ -5,11 +5,14 @@
 
 from collections.abc import Iterable
 
-from methods.shared.eagle3.cache import PersistentEagle3KVCache
-from methods.shared.eagle3.window import Eagle3TrainingWindow, Eagle3WindowMode
-from methods.shared.qwen3_eagle3 import Eagle3KVCache
-from methods.shared.trainer import DraftTrainer
 from methods.tts_common.batch import Eagle3DistillationBatch
+from methods.tts_common.training.eagle3.cache import PersistentEagle3KVCache
+from methods.tts_common.training.eagle3.window import (
+    Eagle3TrainingWindow,
+    Eagle3WindowMode,
+)
+from methods.tts_common.training.qwen3_eagle3 import Eagle3KVCache
+from methods.tts_common.training.trainer import DraftTrainer
 from methods.tts_common.window import train_tts_window
 
 

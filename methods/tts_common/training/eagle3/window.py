@@ -7,23 +7,23 @@ from typing import cast
 
 import torch
 
-from methods.shared.eagle3.batch import Eagle3DistillationBatch
-from methods.shared.eagle3.cache import (
+from methods.tts_common.training.eagle3.batch import Eagle3DistillationBatch
+from methods.tts_common.training.eagle3.cache import (
     PersistentEagle3KVCache,
     _append_confirmed_window,
     persistent_cache_length,
 )
-from methods.shared.eagle3.distill import (
+from methods.tts_common.training.eagle3.distill import (
     window_forward_kl_loss,
 )
-from methods.shared.eagle3.draft_model import AutoregressiveDraftModel
-from methods.shared.eagle3.inputs import (
+from methods.tts_common.training.eagle3.draft_model import AutoregressiveDraftModel
+from methods.tts_common.training.eagle3.inputs import (
     prepare_eagle3_confirmed_path_inputs,
     prepare_eagle3_proposal_window_inputs,
 )
-from methods.shared.qwen3_eagle3 import Eagle3KVCache
-from methods.shared.runtime import profile_range
-from methods.shared.trainer import DraftTrainer
+from methods.tts_common.training.qwen3_eagle3 import Eagle3KVCache
+from methods.tts_common.training.runtime import profile_range
+from methods.tts_common.training.trainer import DraftTrainer
 
 
 class Eagle3WindowMode(str, Enum):

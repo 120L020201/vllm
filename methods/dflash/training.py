@@ -15,8 +15,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from methods.shared.trainer import DraftTrainer, TrainerConfig
 from methods.tts_common.loss import window_forward_kl_loss
+from methods.tts_common.training.trainer import DraftTrainer, TrainerConfig
 
 _FROZEN_PARAMETER_PREFIXES = (
     "lm_head",
