@@ -341,7 +341,10 @@ def _write_dataset(
 
 def main() -> None:
     args = _parse_args()
-    selected = tuple(args.datasets or EXPECTED_ROWS)
+    selected = tuple(args.datasets or ())
+    if not selected:
+        print("No datasets selected; specify --dataset to download.", flush=True)
+        return
     formatters = {
         "aime2026": _format_aime,
         "gpqa_diamond": _format_gpqa,

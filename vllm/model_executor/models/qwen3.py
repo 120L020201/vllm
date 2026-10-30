@@ -337,6 +337,7 @@ class Qwen3ForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+            skip_prefixes=["mtp."]
+            + (["lm_head."] if self.config.tie_word_embeddings else []),
         )
         return loader.load_weights(weights)

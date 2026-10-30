@@ -15,6 +15,11 @@ class WorkerStats:
         raw_path = os.environ.get("OSD_STATS_FILE")
         self.path = Path(raw_path) if raw_path else None
         self.updates = 0
+        self.weight_installs = 0
+        self.cpu_train_calls = 0
+        self.cpu_train_rounds = 0
+        self.cpu_train_seconds = 0.0
+        self.cpu_install_wait_seconds = 0.0
         self.pending = 0
         self.active_requests = 0
         self._lock = threading.Lock()
@@ -50,6 +55,26 @@ class WorkerStats:
             self.active_requests = 0
             self._write_unlocked()
 
+    def record_weight_install(self) -> None:
+        with self._lock:
+            self.weight_installs += 1
+            self._write_unlocked()
+
+    def record_cpu_train(self, rounds: int, seconds: float = 0.0) -> None:
+        if rounds < 1:
+            raise ValueError("CPU training must include at least one round")
+        with self._lock:
+            self.cpu_train_calls += 1
+            self.cpu_train_rounds += rounds
+            self.cpu_train_seconds += seconds
+            self.updates += 1
+            self._write_unlocked()
+
+    def record_cpu_install_wait(self, seconds: float) -> None:
+        with self._lock:
+            self.cpu_install_wait_seconds += seconds
+            self._write_unlocked()
+
     def write(self) -> None:
         with self._lock:
             self._write_unlocked()
@@ -61,6 +86,11 @@ class WorkerStats:
         payload = {
             "active_requests": self.active_requests,
             "updates": self.updates,
+            "weight_installs": self.weight_installs,
+            "cpu_train_calls": self.cpu_train_calls,
+            "cpu_train_rounds": self.cpu_train_rounds,
+            "cpu_train_seconds": round(self.cpu_train_seconds, 6),
+            "cpu_install_wait_seconds": round(self.cpu_install_wait_seconds, 6),
             "pending": self.pending,
         }
         with tempfile.NamedTemporaryFile(

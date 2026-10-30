@@ -3,6 +3,8 @@
 
 import json
 import os
+import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,21 +12,38 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import psutil
 import torch
 from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
 )
-from online_draft.training.eagle3.batch import Eagle3DistillationBatch
 from online_draft.training.trainer import DraftTrainer, TrainerConfig
 
+from experiments import prepare_datasets as dataset_preparation
+from experiments import prepare_models as model_preparation
 from experiments.benchmark import (
     _acceptance_length,
     _completion_tokens,
     _fetch_spec_metrics,
+    _output_token_limit,
+    _parse_benchmark_specs,
+    _read_spec_prefixes,
+    _read_worker_stats,
+    _request_body,
+    _select_benchmark_records,
+    _spec_prefix_summary,
+    _training_metrics,
+    _wait_for_worker,
 )
 from experiments.prepare_datasets import _download_dataset_file, _line_count
 from experiments.prepare_models import MODEL_SPECS, _validate_model
+from experiments.server_guard import (
+    _owns_listener,
+    check_port_available,
+    server_url,
+    wait_for_server,
+)
 from methods.prepare import (
     DATASETS,
     MODELS,
@@ -38,14 +57,28 @@ from methods.prepare import (
 )
 from methods.run import (
     _capped_gpu_memory_utilization,
+    _validate_mtp_target,
     build_parser,
     configure,
 )
-from methods.utils.factory import _request_ids_to_reset
+from methods.tts_common.batch import Eagle3DistillationBatch
+from methods.utils.cpu_stats import attach_cpu_stats
+from methods.utils.gpu_factory import (
+    _create_gpu_bridge,
+    _is_intermediate_prefill_chunk,
+    _request_ids_to_reset,
+    _target_feature_rows,
+    _training_snapshot,
+)
 from methods.utils.stats import WorkerStats
+from vllm.config import AttentionConfig
+from vllm.engine.arg_utils import EngineArgs
+from vllm.entrypoints.openai.cli_args import make_arg_parser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
-def _make_trainer(learning_rate=1e-2):
+def _make_trainer(learning_rate=1e-2, device="cpu"):
     model = Qwen3Eagle3ForCausalLM(
         Qwen3Eagle3Config(
             hidden_size=4,
@@ -61,44 +94,240 @@ def _make_trainer(learning_rate=1e-2):
             num_aux_hidden_states=2,
         )
     )
+    model.to(device=device)
     return DraftTrainer(model, TrainerConfig(learning_rate=learning_rate))
 
 
-def _make_batch(anchor_position=2):
+def _make_batch(anchor_position=2, device="cpu"):
     hidden_size = 4
     auxiliary_size = 8
     draft_length = 2
     return Eagle3DistillationBatch(
-        prefix_positions=torch.arange(anchor_position + 1, dtype=torch.long),
-        prefix_input_embeds=torch.randn(anchor_position + 1, hidden_size),
-        prefix_aux_hidden_states=torch.randn(anchor_position + 1, auxiliary_size),
+        prefill_positions=torch.arange(
+            anchor_position + 1,
+            dtype=torch.long,
+            device=device,
+        ),
+        prefill_input_embeds=torch.randn(
+            anchor_position + 1,
+            hidden_size,
+            device=device,
+        ),
+        prefill_aux_hidden_states=torch.randn(
+            anchor_position + 1,
+            auxiliary_size,
+            device=device,
+        ),
         proposal_positions=torch.arange(
             anchor_position,
             anchor_position + draft_length,
             dtype=torch.long,
+            device=device,
         ),
-        draft_token_input_embeds=torch.randn(draft_length - 1, hidden_size),
-        draft_input_hidden_states=torch.randn(draft_length - 1, hidden_size),
-        teacher_probabilities=torch.randn(draft_length, 5).softmax(dim=-1),
-        confirmed_positions=torch.tensor([anchor_position + 1]),
-        confirmed_input_embeds=torch.randn(1, hidden_size),
-        confirmed_aux_hidden_states=torch.randn(1, auxiliary_size),
+        draft_token_input_embeds=torch.randn(
+            draft_length - 1,
+            hidden_size,
+            device=device,
+        ),
+        draft_recurrent_hidden_states=torch.randn(
+            draft_length - 1,
+            hidden_size,
+            device=device,
+        ),
+        teacher_coverage=torch.ones(draft_length, device=device),
+        teacher_probabilities=torch.randn(
+            draft_length,
+            5,
+            device=device,
+        ).softmax(dim=-1),
+        confirmed_positions=torch.tensor([anchor_position + 1], device=device),
+        confirmed_input_embeds=torch.randn(1, hidden_size, device=device),
+        confirmed_aux_hidden_states=torch.randn(1, auxiliary_size, device=device),
         rejection_position=0,
     )
 
 
 class LauncherTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(
+            patch.dict(
+                os.environ,
+                {"VLLM_ONLINE_DRAFT_TRAIN": "", "VLLM_ONLINE_DRAFT_PROFILE": "0"},
+            )
+        )
+
+    @staticmethod
+    def _online_draft_config(command):
+        value = command[command.index("--additional-config") + 1]
+        return json.loads(value)["online_draft"]
+
     def test_same_inference_args_for_every_method(self):
         commands = []
-        for method in ("eagle", "tts", "random_sampling", "ospec"):
+        for method in ("eagle", "online_draft", "tts", "random_sampling", "ospec"):
             args = build_parser().parse_args((method, "--dry-run"))
             command, env = configure(args)
-            commands.append(command)
+            config_index = command.index("--additional-config")
+            commands.append(command[:config_index] + command[config_index + 2 :])
             self.assertEqual(env["OSD_METHOD"], method)
             self.assertEqual(env["VLLM_USE_V2_MODEL_RUNNER"], "1")
+            self.assertEqual(
+                env["VLLM_ONLINE_DRAFT_TRAIN"], str(int(method == "online_draft"))
+            )
+            self.assertEqual(env["OSD_LOG_UPDATES"], str(int(method == "online_draft")))
             self.assertIn("--max-num-seqs", command)
             self.assertIn("1", command)
+            self.assertIn("-cc.cudagraph_mode=FULL_AND_PIECEWISE", command)
+            self.assertNotIn("--enforce-eager", command)
+            self.assertIn("--no-enable-chunked-prefill", command)
+            self.assertIn("--trust-remote-code", command)
+            self.assertNotIn("--torch-threads", command)
+            self.assertEqual(command[command.index("--seed") + 1], "0")
+            self.assertEqual(
+                command[command.index("--max-num-batched-tokens") + 1],
+                "32768",
+            )
+            self.assertEqual(
+                command[command.index("--gpu-memory-utilization") + 1],
+                "0.8",
+            )
         self.assertTrue(all(command == commands[0] for command in commands))
+
+    def test_conflicting_cpu_training_environment_is_rejected(self):
+        for method in ("eagle", "online_draft", "tts", "random_sampling", "ospec"):
+            with (
+                self.subTest(method=method),
+                patch.dict(
+                    os.environ,
+                    {"VLLM_ONLINE_DRAFT_TRAIN": str(int(method != "online_draft"))},
+                ),
+            ):
+                args = build_parser().parse_args((method, "--dry-run"))
+                with self.assertRaisesRegex(ValueError, "conflicts"):
+                    configure(args)
+
+    def test_gpu_attention_is_explicit_for_target_and_draft(self):
+        parser = make_arg_parser(FlexibleArgumentParser())
+        for flags, backend, autotune in (
+            ((), "FLASHINFER", False),
+            (
+                ("--gpu-attention-backend", "FLASH_ATTN", "--flashinfer-autotune"),
+                "FLASH_ATTN",
+                True,
+            ),
+        ):
+            with self.subTest(backend=backend, autotune=autotune):
+                args = build_parser().parse_args(("eagle", "--dry-run", *flags))
+                command, _ = configure(args)
+                engine_args = EngineArgs.from_cli_args(
+                    parser.parse_args(["--model", command[4], *command[5:]])
+                )
+
+                self.assertEqual(
+                    AttentionConfig(backend=engine_args.attention_backend).backend,
+                    AttentionBackendEnum[backend],
+                )
+                self.assertEqual(
+                    engine_args.speculative_config["attention_backend"], backend
+                )
+                self.assertEqual(engine_args.enable_flashinfer_autotune, autotune)
+                self.assertEqual(
+                    self._online_draft_config(command)["attention_backend"],
+                    "flash_attention",
+                )
+
+    def test_language_model_only_is_forwarded_when_requested(self):
+        default_args = build_parser().parse_args(("eagle", "--dry-run"))
+        default_command, _ = configure(default_args)
+        self.assertNotIn("--language-model-only", default_command)
+
+        args = build_parser().parse_args(
+            ("eagle", "--dry-run", "--language-model-only")
+        )
+        command, _ = configure(args)
+        self.assertIn("--language-model-only", command)
+
+    def test_cpu_online_trainer_defaults_match_artifact_configuration(self):
+        args = build_parser().parse_args(("online_draft", "--dry-run"))
+        with patch.dict(os.environ):
+            os.environ.pop("OMP_NUM_THREADS", None)
+            os.environ.pop("MKL_NUM_THREADS", None)
+            command, env = configure(args)
+
+        self.assertEqual(
+            self._online_draft_config(command),
+            {
+                "attention_backend": "flash_attention",
+                "learning_rate": 1e-5,
+                "fused_optimizer": True,
+                "frozen_parameter_prefixes": [],
+                "check_gradients": False,
+                "log_updates": True,
+                "loss_mode": "uniform",
+            },
+        )
+        self.assertEqual(env["OMP_NUM_THREADS"], "20")
+        self.assertEqual(env["MKL_NUM_THREADS"], "20")
+
+    def test_cpu_online_trainer_options_are_configurable(self):
+        args = build_parser().parse_args(
+            (
+                "online_draft",
+                "--dry-run",
+                "--check-gradients",
+                "--no-fused-optimizer",
+                "--no-log-updates",
+                "--frozen-parameter-prefixes",
+                "model.embed_tokens, lm_head",
+            )
+        )
+        with patch.dict(os.environ, {"OMP_NUM_THREADS": "8", "MKL_NUM_THREADS": "4"}):
+            command, env = configure(args)
+        config = self._online_draft_config(command)
+
+        self.assertTrue(config["check_gradients"])
+        self.assertFalse(config["fused_optimizer"])
+        self.assertFalse(config["log_updates"])
+        self.assertEqual(env["OMP_NUM_THREADS"], "8")
+        self.assertEqual(env["MKL_NUM_THREADS"], "4")
+        self.assertEqual(
+            config["frozen_parameter_prefixes"],
+            ["model.embed_tokens", "lm_head"],
+        )
+
+    def test_removed_experiment_env_vars_do_not_change_online_training(self):
+        args = build_parser().parse_args(("online_draft", "--dry-run"))
+        with patch.dict(os.environ):
+            os.environ.pop("OSD_CHECK_GRADIENTS", None)
+            os.environ["VLLM_ONLINE_DRAFT_FP32_MASTER_WEIGHTS"] = "1"
+            command, env = configure(args)
+
+        self.assertNotIn("master_weights", self._online_draft_config(command))
+        self.assertNotIn("OSD_CHECK_GRADIENTS", env)
+
+        enabled = build_parser().parse_args(
+            ("online_draft", "--master-weights", "--dry-run")
+        )
+        enabled_command, _ = configure(enabled)
+        self.assertTrue(self._online_draft_config(enabled_command)["master_weights"])
+
+    def test_cpu_training_optimizations_are_forwarded(self):
+        args = build_parser().parse_args(
+            (
+                "online_draft",
+                "--master-weights",
+                "--persistent-grads",
+                "--continuous-training",
+                "--dry-run",
+            )
+        )
+        command, env = configure(args)
+        config = self._online_draft_config(command)
+
+        self.assertTrue(config["master_weights"])
+        self.assertTrue(config["persistent_grads"])
+        self.assertTrue(config["continuous_training"])
+        self.assertEqual(env["OSD_PERSISTENT_GRADS"], "1")
+        self.assertEqual(env["OSD_CONTINUOUS_TRAINING"], "1")
 
     def test_invalid_options_fail_before_start(self):
         for flags in (
@@ -132,25 +361,32 @@ class LauncherTest(unittest.TestCase):
 
         self.assertEqual(utilization, 22 / 48)
 
-    def test_model_size_selects_memory_limit(self):
+    def test_memory_limit_is_only_applied_when_explicit(self):
         properties = SimpleNamespace(total_memory=48 * 2**30)
         with (
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.get_device_properties", return_value=properties),
         ):
-            args_4b = build_parser().parse_args(
+            default_args = build_parser().parse_args(
                 ("eagle", "--model-size", "4b", "--dry-run")
             )
-            args_8b = build_parser().parse_args(
-                ("eagle", "--model-size", "8b", "--dry-run")
+            capped_args = build_parser().parse_args(
+                (
+                    "eagle",
+                    "--model-size",
+                    "8b",
+                    "--max-gpu-memory-gib",
+                    "32",
+                    "--dry-run",
+                )
             )
-            command_4b, _ = configure(args_4b)
-            command_8b, _ = configure(args_8b)
+            default_command, _ = configure(default_args)
+            capped_command, _ = configure(capped_args)
 
-        index_4b = command_4b.index("--gpu-memory-utilization") + 1
-        index_8b = command_8b.index("--gpu-memory-utilization") + 1
-        self.assertEqual(float(command_4b[index_4b]), 22 / 48)
-        self.assertEqual(float(command_8b[index_8b]), 30 / 48)
+        default_index = default_command.index("--gpu-memory-utilization") + 1
+        capped_index = capped_command.index("--gpu-memory-utilization") + 1
+        self.assertEqual(float(default_command[default_index]), 0.8)
+        self.assertEqual(float(capped_command[capped_index]), 30 / 48)
 
     def test_warmup_with_no_preemptions_has_no_resets(self):
         scheduler_output = SimpleNamespace(
@@ -160,8 +396,644 @@ class LauncherTest(unittest.TestCase):
 
         self.assertEqual(_request_ids_to_reset(scheduler_output), set())
 
+    def test_only_intermediate_prefill_chunks_defer_training_capture(self):
+        intermediate = SimpleNamespace(
+            has_prefill=True,
+            num_scheduled_tokens=torch.tensor([512]),
+            num_computed_prefill_tokens_np=torch.tensor([0]),
+            prefill_len_np=torch.tensor([700]),
+        )
+        final = SimpleNamespace(
+            has_prefill=True,
+            num_scheduled_tokens=torch.tensor([200]),
+            num_computed_prefill_tokens_np=torch.tensor([500]),
+            prefill_len_np=torch.tensor([700]),
+        )
+        exact_final = SimpleNamespace(
+            has_prefill=True,
+            num_scheduled_tokens=torch.tensor([512]),
+            num_computed_prefill_tokens_np=torch.tensor([0]),
+            prefill_len_np=torch.tensor([512]),
+        )
+        decode = SimpleNamespace(
+            has_prefill=False,
+            num_scheduled_tokens=torch.tensor([512]),
+            num_computed_prefill_tokens_np=torch.tensor([700]),
+            prefill_len_np=torch.tensor([700]),
+        )
+
+        self.assertTrue(_is_intermediate_prefill_chunk(intermediate))
+        self.assertFalse(_is_intermediate_prefill_chunk(final))
+        self.assertFalse(_is_intermediate_prefill_chunk(exact_final))
+        self.assertFalse(_is_intermediate_prefill_chunk(decode))
+
+    def test_gpu_tts_uses_vllm_native_proposal_capture(self):
+        proposal = SimpleNamespace(
+            draft_token_input_embeds=torch.randn(2, 4),
+            draft_input_hidden_states=torch.randn(2, 4),
+        )
+        speculator = SimpleNamespace(
+            last_prefill_input_embeds=torch.randn(3, 4),
+            last_prefill_positions=torch.arange(3),
+            last_prefill_length=torch.tensor(3),
+            get_proposal_snapshot=lambda: proposal,
+        )
+
+        snapshot = _training_snapshot(speculator)
+
+        self.assertIs(
+            snapshot.prefill_input_embeds,
+            speculator.last_prefill_input_embeds,
+        )
+        self.assertIs(
+            snapshot.draft_token_input_embeds,
+            proposal.draft_token_input_embeds,
+        )
+        self.assertIs(
+            snapshot.draft_recurrent_hidden_states,
+            proposal.draft_input_hidden_states,
+        )
+
+    def test_mtp_training_features_use_target_final_hidden_states(self):
+        hidden = torch.randn(3, 4)
+        auxiliary = [torch.randn(3, 4)]
+        args = (object(), object(), hidden, auxiliary)
+
+        self.assertEqual(_target_feature_rows("mtp", args, {}), [hidden])
+        self.assertIs(_target_feature_rows("eagle3", args, {}), auxiliary)
+        self.assertEqual(
+            _target_feature_rows("mtp", (), {"last_hidden_states": hidden}),
+            [hidden],
+        )
+
+
+class RunScriptTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[2]
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.env = {
+            "PATH": os.defpath,
+            "PYTHON_BIN": sys.executable,
+            "MODEL": str(self.directory),
+            "SPEC_MODEL": str(self.directory),
+            "DATA_DIR": str(self.directory),
+            "OUTPUT_DIR": str(self.directory / "results"),
+            "BENCHMARKS": "aime2026[14]",
+            "DRY_RUN": "1",
+        }
+
+    def _run(self, method, **overrides):
+        return subprocess.run(
+            ["bash", str(self.root / "experiments" / "run.sh"), method],
+            env={**self.env, **overrides},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_method_selects_training_and_resume_defaults(self):
+        for method in (
+            "base",
+            "eagle3",
+            "dflash",
+            "mtp",
+            "online_draft",
+            "tts",
+            "ospec",
+        ):
+            with self.subTest(method=method):
+                result = self._run(method)
+                resume = (
+                    "question"
+                    if method in ("base", "eagle3", "dflash", "mtp")
+                    else "none"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"--resume-mode {resume}", result.stdout)
+                self.assertIn(
+                    f"training: cpu_online={int(method == 'online_draft')}",
+                    result.stdout,
+                )
+                if method == "online_draft":
+                    self.assertIn("-m methods.run online_draft", result.stdout)
+                    self.assertIn("--no-check-gradients", result.stdout)
+                    self.assertIn("--log-updates", result.stdout)
+                elif method in ("tts", "ospec"):
+                    self.assertIn("--no-log-updates", result.stdout)
+                if method == "dflash":
+                    self.assertIn("-m methods.run dflash", result.stdout)
+                    self.assertIn("--draft-method dflash", result.stdout)
+                    self.assertIn("--spec-tokens 15", result.stdout)
+                if method == "mtp":
+                    self.assertIn("-m methods.run mtp", result.stdout)
+                    self.assertIn("--draft-method mtp", result.stdout)
+                    self.assertIn("--spec-tokens 3", result.stdout)
+                    self.assertNotIn("--draft ", result.stdout)
+
+    def test_online_draft_aliases_select_cpu_training_and_loss(self):
+        for method, draft in (
+            ("online_draft+eagle3", "eagle3"),
+            ("online_draft+dflash", "dflash"),
+            ("online_draft+mtp", "mtp"),
+        ):
+            with self.subTest(method=method):
+                result = self._run(method, ONLINE_DRAFT_LOSS="position")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("training: cpu_online=1", result.stdout)
+                self.assertIn(f"--draft-method {draft}", result.stdout)
+                self.assertIn("--online-draft-loss position", result.stdout)
+                if draft == "mtp":
+                    self.assertNotIn("--draft ", result.stdout)
+
+    def test_dflash_loss_controls_are_passed_only_to_dflash(self):
+        for method, draft in (
+            ("online_draft+eagle3", "eagle3"),
+            ("online_draft+dflash", "dflash"),
+        ):
+            with self.subTest(method=method):
+                result = self._run(
+                    method,
+                    ONLINE_DRAFT_LOSS="position",
+                    ONLINE_DRAFT_DFLASH_LOSS_GAMMA="7",
+                    ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION="block",
+                    ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT="2",
+                    ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE="overlap",
+                    ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT="0.5",
+                    ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE="0.6",
+                    ONLINE_DRAFT_DFLASH_LOSS_TOP_K="20",
+                    ONLINE_DRAFT_DFLASH_LOSS_TOP_P="0.95",
+                    ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT="0.25",
+                    ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS="4096",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if draft == "dflash":
+                    self.assertIn("--dflash-loss-gamma 7", result.stdout)
+                    self.assertIn("--dflash-loss-normalization block", result.stdout)
+                    self.assertIn("--dflash-loss-rejection-weight 2", result.stdout)
+                    self.assertIn("--dflash-loss-objective overlap", result.stdout)
+                    self.assertIn("--dflash-loss-overlap-weight 0.5", result.stdout)
+                    self.assertIn("--dflash-loss-temperature 0.6", result.stdout)
+                    self.assertIn("--dflash-loss-top-k 20", result.stdout)
+                    self.assertIn("--dflash-loss-top-p 0.95", result.stdout)
+                    self.assertIn("--dflash-loss-reference-weight 0.25", result.stdout)
+                    self.assertIn(
+                        "--dflash-loss-reference-decay-tokens 4096", result.stdout
+                    )
+                else:
+                    self.assertNotIn("--dflash-loss-gamma", result.stdout)
+
+    def test_mtp_methods_do_not_require_a_separate_draft(self):
+        for method in ("mtp", "online_draft+mtp", "tts+mtp"):
+            with self.subTest(method=method):
+                result = self._run(method, SPEC_MODEL="")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("--draft ", result.stdout)
+
+    def test_dflash_tts_selects_the_dflash_draft(self):
+        result = self._run("tts", DRAFT_METHOD="dflash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m methods.run tts", result.stdout)
+        self.assertIn("--draft-method dflash", result.stdout)
+        self.assertIn("--spec-tokens 15", result.stdout)
+        self.assertIn("--method tts-dflash", result.stdout)
+
+    def test_tts_aliases_select_gpu_training_with_the_requested_draft(self):
+        for method, draft, spec_tokens in (
+            ("tts+eagle3", "eagle3", 7),
+            ("tts+dflash", "dflash", 15),
+            ("tts+mtp", "mtp", 3),
+        ):
+            with self.subTest(method=method):
+                result = self._run(method)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("-m methods.run tts", result.stdout)
+                self.assertIn("training: cpu_online=0", result.stdout)
+                self.assertIn(f"--draft-method {draft}", result.stdout)
+                self.assertIn(f"--spec-tokens {spec_tokens}", result.stdout)
+                self.assertIn(f"--method {method.replace('+', '-')}", result.stdout)
+                self.assertNotIn("--online-draft-loss", result.stdout)
+
+    def test_tts_mtp_gpu_bridge_uses_target_embedded_weights(self):
+        draft = SimpleNamespace(
+            parameters=lambda: (torch.nn.Parameter(torch.zeros(1)),),
+        )
+        config = SimpleNamespace(
+            speculative_config=SimpleNamespace(method="mtp", parallel_drafting=False),
+            scheduler_config=SimpleNamespace(max_num_seqs=1),
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+            ),
+        )
+        bridge = object()
+        with (
+            patch.dict(
+                os.environ,
+                {"OSD_METHOD": "tts", "OSD_LEARNING_RATE": "3e-5"},
+            ),
+            patch("methods.utils.gpu_factory.create_mtp_gpu_policy_bridge") as create,
+        ):
+            os.environ.pop("OSD_DRAFT_MODEL", None)
+            create.return_value = bridge
+            self.assertIs(_create_gpu_bridge(config, draft), bridge)
+
+        args, kwargs = create.call_args
+        self.assertIs(args[0], draft)
+        self.assertEqual(kwargs["learning_rate"], 3e-5)
+        self.assertEqual(kwargs["method"], "tts")
+
+    def test_training_resume_is_rejected_before_creating_outputs(self):
+        for method in ("online_draft", "tts", "ospec"):
+            with self.subTest(method=method):
+                result = self._run(method, RESUME="1")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("does not support RESUME=1", result.stderr)
+                self.assertFalse((self.directory / "results").exists())
+
+    def test_occupied_port_is_rejected_before_changing_existing_outputs(self):
+        files = {
+            name: self.directory / name.lower()
+            for name in ("RUN_LOG", "SERVER_LOG", "STATS_FILE", "OUTPUT_FILE")
+        }
+        for path in files.values():
+            path.write_text("keep existing run\n", encoding="utf-8")
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            result = self._run(
+                "base",
+                DRY_RUN="0",
+                RESUME="0",
+                HOST="127.0.0.1",
+                PORT=str(listener.getsockname()[1]),
+                **{name: str(path) for name, path in files.items()},
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("cannot bind", result.stderr)
+            self.assertTrue(
+                listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+            )
+        self.assertFalse((self.directory / "results").exists())
+        for path in files.values():
+            self.assertEqual(path.read_text(encoding="utf-8"), "keep existing run\n")
+
+    def test_readiness_accepts_a_real_server_owned_by_the_launched_process(self):
+        program = """\
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_port, flush=True)
+server.serve_forever()
+"""
+        server = subprocess.Popen(
+            [sys.executable, "-c", program],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(server.communicate, timeout=5)
+        self.addCleanup(server.terminate)
+        port = server.stdout.readline().strip()
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(self.root / "experiments" / "server_guard.py"),
+                "wait",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                port,
+                "--pid",
+                str(server.pid),
+                "--timeout",
+                "2",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stats_path_is_exported_to_every_training_method(self):
+        path = str(self.directory / "stats.json")
+        for method in ("online_draft", "tts", "ospec"):
+            with self.subTest(method=method):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'trap \'printenv OSD_STATS_FILE\' EXIT; source "$1" "$2"',
+                        "test",
+                        str(self.root / "experiments" / "run.sh"),
+                        method,
+                    ],
+                    env={**self.env, "STATS_FILE": path},
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1], path)
+
+    def test_inference_resume_remains_configurable(self):
+        for method in ("base", "eagle3", "dflash", "mtp"):
+            for resume, mode in (("0", "none"), ("1", "question")):
+                with self.subTest(method=method, resume=resume):
+                    result = self._run(method, RESUME=resume)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"--resume-mode {mode}", result.stdout)
+
+    def test_training_flag_cannot_override_method(self):
+        for method in ("base", "eagle3", "online_draft", "tts", "ospec"):
+            with self.subTest(method=method):
+                result = self._run(
+                    method,
+                    VLLM_ONLINE_DRAFT_TRAIN=str(int(method != "online_draft")),
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("online_draft", result.stderr)
+                self.assertFalse((self.directory / "results").exists())
+
+    def test_profiling_requires_cpu_online_method(self):
+        for method in ("base", "eagle3", "online_draft", "tts", "ospec"):
+            with self.subTest(method=method):
+                result = self._run(method, VLLM_ONLINE_DRAFT_PROFILE="1")
+                if method == "online_draft":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("cpu_online=1 profile=1", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("requires the online_draft entry", result.stderr)
+
+
+class ServerGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.process = MagicMock(pid=123)
+        self.process.is_running.return_value = True
+        self.process.status.return_value = psutil.STATUS_RUNNING
+        self.enterContext(
+            patch("experiments.server_guard.psutil.Process", return_value=self.process)
+        )
+        self.opener = MagicMock()
+        response = self.opener.open.return_value.__enter__.return_value
+        response.status = 200
+        response.geturl.return_value = "http://127.0.0.1:8000/health"
+        self.enterContext(
+            patch(
+                "experiments.server_guard.urllib.request.build_opener",
+                return_value=self.opener,
+            )
+        )
+
+    def test_another_healthy_server_cannot_satisfy_readiness(self):
+        with (
+            patch("experiments.server_guard._owns_listener", return_value=False),
+            patch("experiments.server_guard.time.monotonic", side_effect=[0, 0, 1, 2]),
+            patch("experiments.server_guard.time.sleep"),
+            self.assertRaises(TimeoutError),
+        ):
+            wait_for_server("127.0.0.1", 8000, 123, timeout=1)
+        self.opener.open.assert_not_called()
+
+    def test_exited_launcher_is_rejected_before_health_probe(self):
+        self.process.is_running.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "exited"):
+            wait_for_server("127.0.0.1", 8000, 123)
+        self.opener.open.assert_not_called()
+
+    def test_process_exit_during_successful_health_probe_is_rejected(self):
+        self.process.is_running.side_effect = [True, False]
+        with (
+            patch("experiments.server_guard._owns_listener", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "exited"),
+        ):
+            wait_for_server("127.0.0.1", 8000, 123)
+
+    def test_ready_owned_server_uses_a_bounded_health_probe(self):
+        with patch(
+            "experiments.server_guard._owns_listener", return_value=True
+        ) as owned:
+            wait_for_server("127.0.0.1", 8000, 123)
+        self.opener.open.assert_called_once_with(
+            "http://127.0.0.1:8000/health", timeout=2.0
+        )
+        self.assertEqual(owned.call_count, 2)
+
+    def test_listener_must_match_address_and_port_in_the_process_tree(self):
+        self.process.net_connections.return_value = []
+        child = MagicMock()
+        self.process.children.return_value = [child]
+        child.net_connections.return_value = [
+            SimpleNamespace(
+                status=psutil.CONN_LISTEN,
+                laddr=SimpleNamespace(ip="127.0.0.1", port=8000),
+            )
+        ]
+        self.assertTrue(_owns_listener(self.process, {"127.0.0.1"}, 8000))
+        self.assertFalse(_owns_listener(self.process, {"127.0.0.2"}, 8000))
+        self.assertFalse(_owns_listener(self.process, {"127.0.0.1"}, 8001))
+
+    def test_unreadable_process_tree_retries_until_launcher_owns_listener(self):
+        self.process.children.side_effect = psutil.AccessDenied(2944124)
+        listener = SimpleNamespace(
+            status=psutil.CONN_LISTEN,
+            laddr=SimpleNamespace(ip="127.0.0.1", port=8000),
+        )
+        self.process.net_connections.side_effect = [[], [listener], [listener]]
+        with patch("experiments.server_guard.time.sleep") as sleep:
+            wait_for_server("127.0.0.1", 8000, 123)
+        sleep.assert_called_once()
+        self.opener.open.assert_called_once()
+
+    def test_unreadable_socket_table_cannot_satisfy_readiness(self):
+        self.process.children.return_value = []
+        self.process.net_connections.side_effect = psutil.AccessDenied(123)
+        with (
+            patch("experiments.server_guard.time.monotonic", side_effect=[0, 0, 1, 2]),
+            patch("experiments.server_guard.time.sleep"),
+            self.assertRaises(TimeoutError),
+        ):
+            wait_for_server("127.0.0.1", 8000, 123, timeout=1)
+        self.opener.open.assert_not_called()
+
+    def test_bind_probe_rejects_a_listener_and_accepts_a_released_port(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            listener.listen()
+            with self.assertRaisesRegex(RuntimeError, "cannot bind"):
+                check_port_available("127.0.0.1", port)
+        check_port_available("127.0.0.1", port)
+
+    def test_wildcard_listener_uses_a_local_client_address(self):
+        self.assertEqual(server_url("0.0.0.0", 8000), "http://127.0.0.1:8000")
+        self.assertEqual(server_url("::", 8000), "http://[::1]:8000")
+        self.assertEqual(server_url("::1", 8000), "http://[::1]:8000")
+
 
 class PreparationTest(unittest.TestCase):
+    def _prepare_script(self, *args, **env):
+        root = Path(__file__).resolve().parents[2]
+        return subprocess.run(
+            ["bash", str(root / "experiments" / "prepare.sh"), *args],
+            env={"PATH": os.defpath, "PYTHON_BIN": sys.executable, **env},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_unselected_assets_do_not_start_python_or_create_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for selection in ({}, {"DATASETS": "", "MODEL_SIZES": " \t"}):
+                with self.subTest(selection=selection):
+                    result = self._prepare_script(
+                        PYTHON_BIN=f"{directory}/missing-python",
+                        DATA_DIR=f"{directory}/datasets",
+                        MODEL_DIR=f"{directory}/models",
+                        **selection,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("nothing selected", result.stdout)
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_only_explicitly_selected_asset_classes_are_scheduled(self):
+        cases = (
+            ((), {"DATASETS": "aime2026"}, True, False),
+            ((), {"MODEL_SIZES": "8b"}, False, True),
+            ((), {"DATASETS": "aime2026", "MODEL_SIZES": "8b"}, True, True),
+            (("--dataset", "aime2026"), {}, True, False),
+            (("--model-size", "8b"), {}, False, True),
+            (("--dataset", "aime2026", "--model-size", "8b"), {}, True, True),
+        )
+        for args, env, datasets, models in cases:
+            with self.subTest(args=args, env=env):
+                result = self._prepare_script(*args, DRY_RUN="1", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("datasets:" in result.stdout, datasets)
+                self.assertEqual("models:" in result.stdout, models)
+                if datasets:
+                    self.assertIn("--dataset aime2026", result.stdout)
+                if models:
+                    self.assertIn("--model-size 8b", result.stdout)
+
+    def test_repeated_cli_selections_override_only_the_matching_environment(self):
+        result = self._prepare_script(
+            "--dataset",
+            "aime2026",
+            "--dataset",
+            "gpqa_diamond",
+            DATASETS="LongBench-v2",
+            MODEL_SIZES="8b",
+            DRY_RUN="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--dataset aime2026 --dataset gpqa_diamond", result.stdout)
+        self.assertNotIn("LongBench-v2", result.stdout)
+        self.assertIn("--model-size 8b", result.stdout)
+
+    def test_mtp_preparation_uses_target_embedded_weights(self):
+        result = self._prepare_script(
+            "--model-size",
+            "qwen3.5-4b",
+            "--draft-method",
+            "mtp",
+            DRY_RUN="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--model-size qwen3.5-4b", result.stdout)
+        self.assertIn("--draft-method mtp", result.stdout)
+
+        qwen3 = self._prepare_script(
+            "--model-size",
+            "8b",
+            "--draft-method",
+            "mtp",
+            DRY_RUN="1",
+        )
+        self.assertEqual(qwen3.returncode, 0, qwen3.stderr)
+        self.assertIn("--model-size 8b", qwen3.stdout)
+        self.assertIn("--draft-method mtp", qwen3.stdout)
+
+    def test_qwen3_mtp_preparation_does_not_create_a_drafter(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(model_preparation, "_prepare_model") as prepare_model,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "prepare_models",
+                    "--output-dir",
+                    directory,
+                    "--model-size",
+                    "8b",
+                    "--draft-method",
+                    "mtp",
+                ],
+            ),
+        ):
+            model_preparation.main()
+
+        specs = [call.args[1] for call in prepare_model.call_args_list]
+        self.assertEqual([spec.directory for spec in specs], ["Qwen3-8B-MTP"])
+        self.assertTrue(specs[0].requires_mtp)
+        self.assertFalse(specs[0].draft)
+
+    def test_invalid_prepare_arguments_fail_before_downloading(self):
+        for args in (("--unknown",), ("--dataset",), ("--model-size", "--dataset")):
+            with self.subTest(args=args):
+                result = self._prepare_script(
+                    *args, PYTHON_BIN="/missing-python", DATASETS="aime2026"
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertNotIn("PYTHON_BIN", result.stderr)
+                self.assertNotIn("starting", result.stdout)
+
+    def test_python_downloaders_require_explicit_selections(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("builtins.print"),
+            patch.object(dataset_preparation, "_load_dataset_rows") as load_rows,
+            patch.object(dataset_preparation, "_write_dataset") as write_dataset,
+            patch.object(model_preparation, "_prepare_model") as prepare_model,
+        ):
+            output = Path(directory) / "assets"
+            argv = ["prepare", "--output-dir", str(output)]
+            with patch.object(sys, "argv", argv):
+                dataset_preparation.main()
+                model_preparation.main()
+            load_rows.assert_not_called()
+            write_dataset.assert_not_called()
+            prepare_model.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_python_downloaders_prepare_only_requested_assets(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(dataset_preparation, "_load_dataset_rows") as load_rows,
+            patch.object(dataset_preparation, "_write_dataset"),
+            patch.object(model_preparation, "_prepare_model") as prepare_model,
+        ):
+            argv = ["prepare", "--output-dir", directory]
+            with patch.object(sys, "argv", [*argv, "--dataset", "aime2026"]):
+                dataset_preparation.main()
+            with patch.object(sys, "argv", [*argv, "--model-size", "8b"]):
+                model_preparation.main()
+            self.assertEqual(
+                [call.args[0] for call in load_rows.call_args_list], ["aime2026"]
+            )
+            self.assertEqual(
+                [call.args[1] for call in prepare_model.call_args_list],
+                list(MODEL_SPECS["8b"]),
+            )
+
     def test_manifest_contains_every_requested_artifact(self):
         self.assertEqual(
             {spec.name for spec in DATASETS},
@@ -172,7 +1044,6 @@ class PreparationTest(unittest.TestCase):
                 "computer_science",
                 "livecodebench_lite",
                 "longbench_v2",
-                "longwriter_6k",
             },
         )
         self.assertEqual(
@@ -310,8 +1181,184 @@ class PreparationTest(unittest.TestCase):
 
             _validate_model(path, spec)
 
+    def test_mtp_target_validation_requires_embedded_weight_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3",
+                        "architectures": ["Qwen3ForCausalLM"],
+                        "num_nextn_predict_layers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (path / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {"weight_map": {"mtp.fc.weight": "model-00001.safetensors"}}
+                ),
+                encoding="utf-8",
+            )
+
+            _validate_mtp_target(str(path))
+
+            (path / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {"weight_map": {"model.layers.0.mlp.down_proj.weight": "x"}}
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, r"no embedded mtp\.\* weights"):
+                _validate_mtp_target(str(path))
+
+    def test_model_preparation_validates_qwen3_mtp_target_weights(self):
+        spec = model_preparation.MTP_TARGET_MODEL_SPECS["8b"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3",
+                        "hidden_size": spec.hidden_size,
+                        "num_nextn_predict_layers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (path / "model.safetensors").write_bytes(b"weights")
+            (path / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "mtp.fc.weight": "model.safetensors",
+                            "model.embed_tokens.weight": "model.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            _validate_model(path, spec)
+
 
 class BenchmarkLoggingTest(unittest.TestCase):
+    def test_prefix_logs_match_only_the_response_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            snapshots = [
+                {"request_id": "chatcmpl-other-deadbeef", "drafts": 1000},
+                {
+                    "request_id": "chatcmpl-one-deadbeef",
+                    "drafts": 1000,
+                    "accepted_tokens": 1450,
+                    "acceptance_length": 2.45,
+                },
+            ]
+            path.write_text(
+                "other log\n"
+                + "\n".join(
+                    "INFO SPEC_DECODE_PREFIX " + json.dumps(item) + "\x1b[0m"
+                    for item in snapshots
+                )
+            )
+            actual = _read_spec_prefixes(path, "chatcmpl-one")
+            self.assertEqual(actual["1000"], snapshots[1])
+            self.assertIsNone(actual["2000"])
+            self.assertEqual(
+                _read_spec_prefixes(path, "chatcmpl-missing"),
+                {"1000": None, "2000": None},
+            )
+
+    def test_prefix_summary_preserves_missing_thresholds_and_request_ids(self):
+        results = [
+            {
+                "line": line,
+                "spec_decode_prefixes": {
+                    "1000": {"drafts": 1000, "accepted_tokens": accepted},
+                    "2000": None,
+                },
+            }
+            for line, accepted in ((1, 1000), (3, 2000))
+        ]
+        results.append({"line": 2, "spec_decode_prefixes": {}})
+        summary = _spec_prefix_summary(results)
+        self.assertEqual(summary["1000"]["acceptance_length"], 2.5)
+        self.assertEqual(summary["1000"]["measured_requests"], 2)
+        self.assertEqual(summary["1000"]["total_requests"], 3)
+        self.assertEqual(summary["1000"]["lines"], [1, 3])
+        self.assertIsNone(summary["2000"]["acceptance_length"])
+
+    def test_parentheses_select_a_seeded_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aime2026.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps({"id": index, "prompt": f"Question {index}"})
+                    for index in range(1, 13)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            spec = _parse_benchmark_specs("aime2026(3)")[0]
+
+            first = _select_benchmark_records(path, spec, seed=7)
+            repeated = _select_benchmark_records(path, spec, seed=7)
+
+        self.assertEqual(len(first), 3)
+        self.assertEqual(first, repeated)
+
+    def test_brackets_select_one_based_question_number(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aime2026.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps({"id": index, "prompt": f"Question {index}"})
+                    for index in range(1, 13)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            spec = _parse_benchmark_specs("aime2026[10]")[0]
+
+            selected = _select_benchmark_records(path, spec, seed=7)
+
+        self.assertEqual(
+            selected,
+            [(10, {"id": 10, "prompt": "Question 10"})],
+        )
+
+    def test_warmup_overrides_only_the_output_token_limit(self):
+        args = SimpleNamespace(
+            model="model",
+            enable_thinking=True,
+            max_output_tokens=1024,
+            max_prompt_tokens=2048,
+            temperature=0.6,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            repetition_penalty=1.0,
+            stop_token_ids="151645,151643",
+            seed=0,
+        )
+
+        body = _request_body(args, "Warm up.", max_tokens=16)
+
+        self.assertEqual(body["max_tokens"], 16)
+        self.assertEqual(body["messages"][0]["content"], "Warm up.")
+        self.assertEqual(body["presence_penalty"], 0.0)
+        self.assertEqual(body["stop_token_ids"], [151645, 151643])
+
+    def test_output_limit_uses_remaining_full_context_by_default(self):
+        self.assertEqual(_output_token_limit(32768, 768, 0), 32000)
+        self.assertEqual(_output_token_limit(32768, 768, 16384), 16384)
+        self.assertEqual(_output_token_limit(32768, 9000, 0, 8192), 24576)
+        with self.assertRaises(ValueError):
+            _output_token_limit(32768, 32768, 0)
+
     def test_acceptance_length_uses_counter_delta(self):
         before = {"drafts": 10, "draft_tokens": 70, "accepted_tokens": 20}
         after = {"drafts": 18, "draft_tokens": 126, "accepted_tokens": 35}
@@ -332,13 +1379,64 @@ class BenchmarkLoggingTest(unittest.TestCase):
                 stats.begin_request()
                 stats.enqueue()
                 stats.complete(3)
+                stats.record_weight_install()
+                stats.record_cpu_train(4)
                 stats.end_request()
             payload = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(
             payload,
-            {"active_requests": 0, "pending": 0, "updates": 3},
+            {
+                "active_requests": 0,
+                "pending": 0,
+                "updates": 4,
+                "weight_installs": 1,
+                "cpu_train_calls": 1,
+                "cpu_train_rounds": 4,
+                "cpu_train_seconds": 0.0,
+                "cpu_install_wait_seconds": 0.0,
+            },
         )
+
+    def test_missing_or_invalid_stats_do_not_report_zero_installs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stats.json"
+            self.assertIsNone(_read_worker_stats(path))
+            for payload in ("{", "{}", '{"updates": 3}'):
+                path.write_text(payload, encoding="utf-8")
+                self.assertIsNone(_read_worker_stats(path))
+        self.assertEqual(_training_metrics(None, None, "tts"), (None, None))
+        self.assertEqual(_training_metrics(None, None, "base"), (0, None))
+
+    def test_training_metrics_use_completed_request_deltas(self):
+        before = {
+            "active_requests": 0,
+            "pending": 0,
+            "weight_installs": 3,
+            "cpu_train_calls": 4,
+            "cpu_train_rounds": 10,
+        }
+        after = {
+            **before,
+            "weight_installs": 5,
+            "cpu_train_calls": 7,
+            "cpu_train_rounds": 22,
+        }
+        self.assertEqual(_training_metrics(before, after, "online_draft"), (2, 4.0))
+        self.assertEqual(_training_metrics(before, before, "online_draft"), (0, None))
+        self.assertEqual(_training_metrics(after, before, "online_draft"), (None, None))
+
+    def test_busy_worker_timeout_is_not_a_complete_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stats.json"
+            with patch.dict(os.environ, {"OSD_STATS_FILE": str(path)}):
+                stats = WorkerStats()
+                stats.begin_request()
+                self.assertIsNone(_wait_for_worker(path, timeout=0))
+                stats.end_request()
+                self.assertEqual(
+                    _wait_for_worker(path, timeout=0)["weight_installs"], 0
+                )
 
     def test_metrics_parser_ignores_per_position_counters(self):
         metrics = """\
@@ -360,6 +1458,146 @@ vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 7
 
 
 class PolicyTest(unittest.TestCase):
+    def test_cpu_stats_count_training_windows_and_installs_separately(self):
+        trainer = SimpleNamespace(version=0)
+        installer = SimpleNamespace(advance=MagicMock(return_value=1))
+        speculator = SimpleNamespace(
+            propose=MagicMock(),
+            draft_weight_installer=installer,
+            finish_request=MagicMock(),
+        )
+        pipeline = SimpleNamespace(
+            _trainer=trainer,
+            update_stats=[],
+            _train=MagicMock(),
+            _publish_snapshot=MagicMock(),
+            _handle_close_epoch=MagicMock(),
+        )
+        original_train = pipeline._train
+
+        def train(rounds):
+            trainer.version += 1
+            pipeline.update_stats.append({"trained_rounds": len(rounds)})
+
+        original_train.side_effect = train
+        stats = attach_cpu_stats(speculator, pipeline)
+        speculator.propose(SimpleNamespace(req_ids=["question"]))
+        for rounds in (1, 5):
+            pipeline._train([None] * rounds)
+        self.assertEqual(stats.updates, 2)
+        installer.advance(None)
+        speculator.finish_request("question")
+
+        self.assertEqual(stats.cpu_train_calls, 2)
+        self.assertEqual(stats.cpu_train_rounds, 6)
+        self.assertEqual(stats.weight_installs, 1)
+        self.assertEqual(stats.active_requests, 0)
+
+    def test_cpu_warmup_is_drained_but_not_counted(self):
+        trainer = SimpleNamespace(version=0)
+        installer = SimpleNamespace(advance=MagicMock(return_value=1))
+        speculator = SimpleNamespace(
+            propose=MagicMock(),
+            draft_weight_installer=installer,
+            finish_request=MagicMock(),
+        )
+        pipeline = SimpleNamespace(
+            _trainer=trainer,
+            update_stats=[],
+            _train=MagicMock(),
+            _publish_snapshot=MagicMock(),
+            _handle_close_epoch=MagicMock(),
+        )
+        stats = attach_cpu_stats(speculator, pipeline)
+        request_id = "chatcmpl-_warmup_run_sh"
+        speculator.propose(SimpleNamespace(req_ids=[request_id]))
+        self.assertEqual(stats.active_requests, 1)
+        pipeline._train([None])
+        installer.advance(None)
+        speculator.finish_request(request_id)
+        self.assertEqual((stats.cpu_train_calls, stats.weight_installs), (0, 0))
+        self.assertEqual(stats.active_requests, 0)
+
+    def test_failed_cpu_training_or_install_is_not_counted(self):
+        trainer = SimpleNamespace(version=0)
+        installer = SimpleNamespace(
+            advance=MagicMock(side_effect=RuntimeError("install"))
+        )
+        speculator = SimpleNamespace(
+            propose=MagicMock(),
+            draft_weight_installer=installer,
+            finish_request=MagicMock(),
+        )
+        pipeline = SimpleNamespace(
+            _trainer=trainer,
+            update_stats=[],
+            _train=MagicMock(side_effect=ValueError("train")),
+            _publish_snapshot=MagicMock(),
+            _handle_close_epoch=MagicMock(),
+        )
+        stats = attach_cpu_stats(speculator, pipeline)
+        speculator.propose(SimpleNamespace(req_ids=["question"]))
+        with self.assertRaises(ValueError):
+            pipeline._train([None])
+        with self.assertRaises(RuntimeError):
+            installer.advance(None)
+        self.assertEqual((stats.cpu_train_calls, stats.weight_installs), (0, 0))
+
+    def test_gpu_installs_exclude_initial_weight_restoration(self):
+        from methods.utils.gpu_adapter import GpuOnlineEagle3Adapter
+
+        stats = WorkerStats()
+        bridge = SimpleNamespace(
+            stats=stats,
+            maybe_apply_pending_weights=MagicMock(
+                side_effect=[
+                    SimpleNamespace(version=1),
+                    SimpleNamespace(version=0),
+                    None,
+                ]
+            ),
+        )
+        adapter = GpuOnlineEagle3Adapter(None, bridge, depth=2)
+        with patch.object(adapter, "_apply_snapshot"):
+            for _ in range(3):
+                adapter.apply_weights()
+        self.assertEqual(stats.weight_installs, 1)
+
+    def test_gpu_request_is_not_idle_until_final_weights_are_installed(self):
+        from methods.utils.gpu_adapter import GpuOnlineEagle3Adapter
+
+        stats = WorkerStats()
+        stats.begin_request()
+        bridge = SimpleNamespace(
+            stats=stats,
+            reset_request=lambda request_id: stats.end_request(),
+            maybe_apply_pending_weights=lambda: SimpleNamespace(version=1),
+        )
+        adapter = GpuOnlineEagle3Adapter(None, bridge, depth=2)
+        with patch.object(
+            adapter,
+            "_apply_snapshot",
+            side_effect=lambda snapshot: self.assertEqual(stats.pending, 1),
+        ):
+            adapter.reset_request("question")
+        self.assertEqual((stats.pending, stats.active_requests), (0, 0))
+        self.assertEqual(stats.weight_installs, 1)
+
+    def test_adapter_ignores_http_warmup_request(self):
+        from methods.utils.gpu_adapter import GpuOnlineEagle3Adapter
+
+        adapter = GpuOnlineEagle3Adapter(None, None, depth=2)
+        proposal = SimpleNamespace(
+            req_ids=["chatcmpl-_warmup_run_sh"],
+            num_reqs=1,
+        )
+
+        adapter.start_proposal(proposal, None)
+        adapter.reset_request("chatcmpl-_warmup_run_sh")
+
+        self.assertIsNone(adapter._trace)
+        self.assertIsNone(adapter._request_id)
+
     def test_gate_is_deterministic_without_global_rng_use(self):
         from methods.random_sampling.gating import BernoulliGate
 
@@ -442,7 +1680,7 @@ class PolicyTest(unittest.TestCase):
         )
 
         batch = bridge.observations[0][2]
-        torch.testing.assert_close(batch.prefix_positions, torch.tensor([0, 1, 2]))
+        torch.testing.assert_close(batch.prefill_positions, torch.tensor([0, 1, 2]))
         batch.validate(
             hidden_size=4,
             num_aux_hidden_states=2,
@@ -525,6 +1763,187 @@ class PolicyTest(unittest.TestCase):
                 self.assertIsNone(bridge.maybe_apply_pending_weights())
             finally:
                 bridge.shutdown()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class GpuPolicyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from methods.utils.gpu_training import install_cuda_training_validation
+
+        install_cuda_training_validation()
+
+    @classmethod
+    def tearDownClass(cls):
+        from methods.utils.gpu_training import uninstall_cuda_training_validation
+
+        uninstall_cuda_training_validation()
+
+    def test_tts_training_batch_and_snapshot_stay_on_cuda(self):
+        from methods.utils.gpu_training import GpuPolicyBridge
+
+        trainer = _make_trainer(device="cuda")
+        bridge = GpuPolicyBridge(trainer, method="tts")
+        initial = trainer.model.model.fc.weight.detach().clone()
+        try:
+            bridge.observe_step("request", 0, _make_batch(device="cuda"))
+            snapshot = bridge.maybe_apply_pending_weights()
+
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            self.assertEqual(trainer.version, 1)
+            self.assertFalse(torch.equal(initial, trainer.model.model.fc.weight))
+            self.assertTrue(
+                all(
+                    tensor.device.type == "cuda"
+                    for tensor in snapshot.state_dict.values()
+                )
+            )
+        finally:
+            bridge.shutdown()
+
+    def test_mtp_gpu_training_model_shares_the_frozen_target_head(self):
+        from methods.tts_common.qwen3_mtp import (
+            Qwen3MTPConfig,
+            Qwen3MTPForCausalLM,
+        )
+        from methods.utils.gpu_training import load_mtp_gpu_training_model
+
+        source_model = Qwen3MTPForCausalLM(
+            Qwen3MTPConfig(
+                hidden_size=8,
+                intermediate_size=16,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                rotary_dim=4,
+                rope_theta=10000.0,
+                rms_norm_eps=1e-6,
+                vocab_size=12,
+            )
+        )
+        source = {
+            name: value.clone() for name, value in source_model.state_dict().items()
+        }
+        attention = SimpleNamespace(
+            qkv_proj=SimpleNamespace(bias=None),
+            total_num_heads=2,
+            total_num_kv_heads=1,
+            head_dim=8,
+            scaling=8**-0.5,
+            rotary_emb=SimpleNamespace(
+                is_neox_style=True,
+                rotary_dim=4,
+                base=10000.0,
+                cos_sin_cache=torch.randn(16, 4),
+            ),
+        )
+        gpu_model = SimpleNamespace(
+            config=SimpleNamespace(
+                model_type="qwen3_mtp",
+                hidden_size=8,
+                intermediate_size=16,
+                vocab_size=12,
+            ),
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        self_attn=attention,
+                        input_layernorm=SimpleNamespace(variance_epsilon=1e-6),
+                    )
+                ]
+            ),
+            logits_processor=SimpleNamespace(scale=1.0),
+            lm_head=torch.nn.Linear(8, 12, bias=False, device="cuda"),
+            state_dict=lambda: source,
+        )
+        gpu_model.lm_head.requires_grad_(True)
+
+        model = load_mtp_gpu_training_model(
+            gpu_model,
+            device=torch.device("cuda"),
+            dtype=torch.float32,
+        )
+
+        self.assertIs(model.lm_head, gpu_model.lm_head)
+        self.assertFalse(model.lm_head.weight.requires_grad)
+        self.assertEqual(model.model.fc.weight.device.type, "cuda")
+        torch.testing.assert_close(
+            model.model.fc.weight.cpu(),
+            source_model.model.fc.weight,
+        )
+
+    def test_chunked_prefill_is_merged_into_trainable_cuda_tensors(self):
+        from methods.utils.gpu_adapter import GpuOnlineEagle3Adapter
+
+        adapter = GpuOnlineEagle3Adapter(None, None, depth=2)
+        input_batch = SimpleNamespace(req_ids=["request"], num_reqs=1)
+
+        def snapshot(start, length):
+            return SimpleNamespace(
+                prefill_length=torch.tensor(length, device="cuda"),
+                prefill_positions=torch.arange(
+                    start,
+                    start + length,
+                    device="cuda",
+                ),
+                prefill_input_embeds=torch.randn(length, 4, device="cuda"),
+                draft_token_input_embeds=torch.randn(1, 4, device="cuda"),
+                draft_recurrent_hidden_states=torch.randn(1, 4, device="cuda"),
+            )
+
+        with torch.inference_mode():
+            adapter.start_proposal(
+                input_batch,
+                [torch.randn(2, 4, device="cuda") for _ in range(2)],
+                defer=True,
+            )
+            adapter.finish_proposal(snapshot(0, 2))
+            adapter.start_proposal(
+                input_batch,
+                [torch.randn(1, 4, device="cuda") for _ in range(2)],
+            )
+            adapter.finish_proposal(snapshot(2, 1))
+
+        assert adapter._pending is not None
+        torch.testing.assert_close(
+            adapter._pending["prefill_positions"],
+            torch.arange(3, device="cuda"),
+        )
+        self.assertTrue(
+            all(tensor.device.type == "cuda" for tensor in adapter._pending.values())
+        )
+        self.assertTrue(
+            all(not tensor.is_inference() for tensor in adapter._pending.values())
+        )
+
+    def test_ospec_keeps_three_learners_and_merge_on_cuda(self):
+        from methods.utils.gpu_training import GpuPolicyBridge
+
+        with patch.dict(os.environ, {"OSD_CHUNK_SIZE": "1"}):
+            bridge = GpuPolicyBridge(_make_trainer(device="cuda"), method="ospec")
+            assert bridge.ensemble is not None
+            bridge.observe_step("request", 0, _make_batch(device="cuda"))
+            bridge.reset_request("request")
+            snapshot = bridge.maybe_apply_pending_weights()
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(len(bridge.ensemble.learners), 3)
+        self.assertTrue(
+            all(not learner.config.fused for learner in bridge.ensemble.learners)
+        )
+        self.assertEqual(bridge.stats.updates, 3)
+        self.assertTrue(
+            all(
+                parameter.device.type == "cuda"
+                for learner in bridge.ensemble.learners
+                for parameter in learner.model.parameters()
+            )
+        )
+        self.assertTrue(
+            all(tensor.device.type == "cuda" for tensor in snapshot.state_dict.values())
+        )
 
 
 if __name__ == "__main__":

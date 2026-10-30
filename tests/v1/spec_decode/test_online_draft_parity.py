@@ -30,6 +30,11 @@ from online_draft.models.qwen3_eagle3 import (
     Qwen3Eagle3ForCausalLM,
     load_qwen3_eagle3_from_vllm,
 )
+from online_draft.models.qwen3_mtp import (
+    Qwen3MTPConfig,
+    Qwen3MTPForCausalLM,
+    load_qwen3_mtp_from_vllm,
+)
 
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -349,6 +354,65 @@ def test_mtp_load_rejects_settings_the_cpu_model_cannot_match(
         load_qwen3_5_mtp_from_vllm(
             _vllm_like_mtp(_mtp(), _rope(8, partial_rotary_factor=0.5), **overrides)
         )
+
+
+def _qwen3_mtp(rotary_dim: int = 4) -> Qwen3MTPForCausalLM:
+    return Qwen3MTPForCausalLM(
+        Qwen3MTPConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            rotary_dim=rotary_dim,
+            rope_theta=ROPE_THETA,
+            rms_norm_eps=1e-6,
+            vocab_size=10,
+        )
+    )
+
+
+def _vllm_like_qwen3_mtp(source: Qwen3MTPForCausalLM, rotary):
+    """Mirror the Qwen3MTP attributes the loader reads."""
+    config = source.config
+    attention = SimpleNamespace(
+        total_num_heads=config.num_attention_heads,
+        total_num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        scaling=config.head_dim**-0.5,
+        qkv_proj=SimpleNamespace(bias=None),
+        rotary_emb=rotary,
+    )
+    layer = SimpleNamespace(
+        self_attn=attention,
+        input_layernorm=SimpleNamespace(variance_epsilon=config.rms_norm_eps),
+    )
+    state = dict(source.state_dict())
+    state["model.embed_tokens.weight"] = torch.zeros(config.vocab_size, 16)
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            vocab_size=config.vocab_size,
+        ),
+        model=SimpleNamespace(layers=[layer]),
+        logits_processor=SimpleNamespace(scale=1.0),
+        state_dict=lambda: state,
+    )
+
+
+def test_qwen3_mtp_load_copies_embedded_draft_weights(default_vllm_config) -> None:
+    torch.manual_seed(0)
+    source = _qwen3_mtp()
+
+    model = load_qwen3_mtp_from_vllm(
+        _vllm_like_qwen3_mtp(source, _rope(8, partial_rotary_factor=0.5))
+    )
+
+    assert model.config == source.config
+    assert not model.lm_head.weight.requires_grad
+    for name, tensor in source.state_dict().items():
+        assert torch.equal(model.state_dict()[name], tensor), name
 
 
 def test_load_keeps_vllm_head_padding_out_of_the_logits(default_vllm_config) -> None:

@@ -1793,6 +1793,10 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         trust_remote_code=True,
         is_available_online=False,
     ),
+    "Qwen3MTP": _HfExamplesInfo(
+        "AngelSlim/Qwen3-8B-MTP-TTT3",
+        speculative_model="AngelSlim/Qwen3-8B-MTP-TTT3",
+    ),
     "Qwen3NextMTP": _HfExamplesInfo(
         "Qwen/Qwen3-Next-80B-A3B-Instruct", min_transformers_version="4.56.3"
     ),

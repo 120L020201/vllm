@@ -6,14 +6,12 @@
 from collections.abc import Iterable
 
 from online_draft.models.qwen3_eagle3 import Eagle3KVCache
-from online_draft.training.eagle3.batch import Eagle3DistillationBatch
 from online_draft.training.eagle3.cache import PersistentEagle3KVCache
-from online_draft.training.eagle3.window import (
-    Eagle3TrainingWindow,
-    Eagle3WindowMode,
-    train_eagle3_window,
-)
+from online_draft.training.eagle3.window import Eagle3TrainingWindow, Eagle3WindowMode
 from online_draft.training.trainer import DraftTrainer
+
+from methods.tts_common.batch import Eagle3DistillationBatch
+from methods.tts_common.window import train_tts_window
 
 
 def train_batches(
@@ -21,16 +19,17 @@ def train_batches(
     batches: Iterable[Eagle3DistillationBatch],
     *,
     persistent_cache: PersistentEagle3KVCache = None,
+    mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
 ) -> tuple[Eagle3KVCache | None, tuple[float, ...]]:
-    """Train consecutive batches and return their final cache and losses."""
+    """Train each batch with one update and return its final cache and losses."""
     cache = persistent_cache
     losses: list[float] = []
     for batch in batches:
-        cache, result = train_eagle3_window(
+        cache, result = train_tts_window(
             trainer=trainer,
             window=Eagle3TrainingWindow(rounds=(batch,)),
             persistent_cache=cache,
-            mode=Eagle3WindowMode.CONFIRMED_PATH,
+            mode=mode,
         )
         losses.append(result.loss)
     return cache, tuple(losses)

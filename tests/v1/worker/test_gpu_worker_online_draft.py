@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.online_draft import (
     OnlineDraftRuntime,
     _DFlashRecipe,
     _Eagle3Recipe,
+    _MTPRecipe,
     _parse_online_draft_settings,
     _validate_online_draft_config,
 )
@@ -174,7 +175,20 @@ def test_online_draft_settings_map_to_trainer_and_method() -> None:
         {
             "fused_optimizer": False,
             "frozen_parameter_prefixes": ["model.fc"],
+            "loss_mode": "position",
+            "loss_gamma": 7.0,
+            "loss_normalization": "weights",
+            "loss_rejection_weight": 2.0,
+            "loss_objective": "overlap",
+            "loss_overlap_weight": 0.5,
+            "loss_temperature": 0.6,
+            "loss_top_k": 20,
+            "loss_top_p": 0.95,
+            "loss_reference_weight": 0.25,
+            "loss_reference_decay_tokens": 4096,
             "max_train_rounds": 4,
+            "persistent_grads": True,
+            "continuous_training": True,
             "cpu_threads": {"training": 2},
         },
         _DFlashRecipe,
@@ -183,7 +197,22 @@ def test_online_draft_settings_map_to_trainer_and_method() -> None:
     assert settings.trainer.fused is False
     assert settings.trainer.check_gradients is False
     assert settings.trainer.frozen_parameter_prefixes == ("model.fc",)
-    assert settings.recipe == _DFlashRecipe(max_train_rounds=4)
+    assert settings.trainer.loss_mode == "position"
+    assert settings.trainer.persistent_grads is True
+    assert settings.recipe == _DFlashRecipe(
+        max_train_rounds=4,
+        loss_gamma=7.0,
+        loss_normalization="weights",
+        loss_rejection_weight=2.0,
+        loss_objective="overlap",
+        loss_overlap_weight=0.5,
+        loss_temperature=0.6,
+        loss_top_k=20,
+        loss_top_p=0.95,
+        loss_reference_weight=0.25,
+        loss_reference_decay_tokens=4096,
+    )
+    assert settings.continuous_training is True
     assert settings.cpu["training"].threads == 2
     assert settings.cpu["capture"].threads is None
 
@@ -204,14 +233,39 @@ def test_online_draft_settings_reject_keys_the_method_ignores(
         _parse_online_draft_settings(values, recipe)
 
 
-def test_online_mtp_requires_a_qwen3_5_target() -> None:
-    """The CPU MTP layer mirrors Qwen3.5's gated attention only."""
+@pytest.mark.parametrize("model_type", ["qwen3", "qwen3_5"])
+def test_online_mtp_accepts_targets_with_embedded_mtp(model_type) -> None:
     speculator = SimpleNamespace(_speculator_name="MTP", supports_mm_inputs=False)
     _validate_online_draft_config(
-        _online_config("mtp", model_type="qwen3_5"), speculator
+        _online_config("mtp", model_type=model_type), speculator
     )
 
+
+def test_online_mtp_rejects_targets_without_embedded_mtp() -> None:
+    speculator = SimpleNamespace(_speculator_name="MTP", supports_mm_inputs=False)
     with pytest.raises(
-        ValueError, match=r"online MTP requires target model_type in \['qwen3_5'\]"
+        ValueError,
+        match=r"online MTP requires target model_type in \['qwen3', 'qwen3_5'\]",
     ):
-        _validate_online_draft_config(_online_config("mtp"), speculator)
+        _validate_online_draft_config(
+            _online_config("mtp", model_type="qwen2"), speculator
+        )
+
+
+def test_online_mtp_loads_qwen3_5_text_draft_config(monkeypatch) -> None:
+    """Qwen3.5 MTP wraps its text config, whose model type is qwen3_5_text."""
+    from online_draft.models import qwen3_5_mtp
+
+    gpu_model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5_text"))
+    calls = []
+
+    def load_model(model, *, attention_backend):
+        calls.append((model, attention_backend))
+        return "cpu_model"
+
+    monkeypatch.setattr(qwen3_5_mtp, "load_qwen3_5_mtp_from_vllm", load_model)
+
+    result = _MTPRecipe(attention_backend="eager").load_model(gpu_model)
+
+    assert result == "cpu_model"
+    assert calls == [(gpu_model, "eager")]

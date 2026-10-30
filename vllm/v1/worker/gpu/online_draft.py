@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from functools import partial
@@ -133,14 +134,14 @@ class _Eagle3Recipe:
 
 @dataclass(frozen=True, kw_only=True)
 class _MTPRecipe:
-    """Qwen3.5 MTP reuses the EAGLE3 capture and training path.
+    """Qwen3/Qwen3.5 MTP reuses the EAGLE3 capture and training path.
 
     The draft fuses the target's final hidden state inside its layer, so it
     captures one feature row and distills over the full shared vocabulary.
     """
 
     name: ClassVar[str] = "MTP"
-    target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3_5"})
+    target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3", "qwen3_5"})
 
     attention_backend: str | None = None
 
@@ -150,11 +151,18 @@ class _MTPRecipe:
         return vllm_config.speculative_config.method == "mtp"
 
     def load_model(self, gpu_draft_model: nn.Module) -> nn.Module:
-        from online_draft.models.qwen3_5_mtp import load_qwen3_5_mtp_from_vllm
+        model_type = gpu_draft_model.config.model_type
+        if model_type == "qwen3_mtp":
+            from online_draft.models.qwen3_mtp import load_qwen3_mtp_from_vllm
 
-        return load_qwen3_5_mtp_from_vllm(
-            gpu_draft_model, attention_backend=self.attention_backend
-        )
+            loader = load_qwen3_mtp_from_vllm
+        elif model_type in ("qwen3_5_mtp", "qwen3_5_text"):
+            from online_draft.models.qwen3_5_mtp import load_qwen3_5_mtp_from_vllm
+
+            loader = load_qwen3_5_mtp_from_vllm
+        else:
+            raise ValueError(f"online MTP cannot load draft type {model_type!r}")
+        return loader(gpu_draft_model, attention_backend=self.attention_backend)
 
     def check(self, trainer: DraftTrainer, speculator: Any) -> None:
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
@@ -175,8 +183,9 @@ class _MTPRecipe:
         **capture: Any,
     ) -> Eagle3CaptureAdapter:
         from online_draft.models.qwen3_5_mtp import Qwen3_5MTPForCausalLM
+        from online_draft.models.qwen3_mtp import Qwen3MTPForCausalLM
 
-        assert isinstance(cpu_model, Qwen3_5MTPForCausalLM)
+        assert isinstance(cpu_model, (Qwen3MTPForCausalLM, Qwen3_5MTPForCausalLM))
         return _autoregressive_capture_adapter(
             vllm_config, cpu_model.config, None, **capture
         )
@@ -192,13 +201,50 @@ class _DFlashRecipe:
     grouped_query_attention: bool = False
     selective_last_layer: bool = False
     max_train_rounds: int = 16
-    loss_decay_gamma: float = 7.0
+    loss_gamma: float | None = None
+    loss_normalization: str = "mean"
+    loss_rejection_weight: float = 1.0
+    loss_objective: str = "kl"
+    loss_overlap_weight: float = 1.0
+    loss_temperature: float = 1.0
+    loss_top_k: int = 0
+    loss_top_p: float = 1.0
+    loss_reference_weight: float = 0.0
+    loss_reference_decay_tokens: int = 0
 
     def __post_init__(self) -> None:
-        if self.max_train_rounds < 0 or not 0 < self.loss_decay_gamma < float("inf"):
+        if self.max_train_rounds < 0:
+            raise ValueError("DFlash requires max_train_rounds >= 0")
+        if self.loss_gamma is not None and (
+            not math.isfinite(self.loss_gamma) or self.loss_gamma <= 0
+        ):
+            raise ValueError("DFlash loss gamma must be finite and positive")
+        if self.loss_normalization not in ("mean", "weights", "block"):
             raise ValueError(
-                "DFlash requires max_train_rounds >= 0 and finite loss_decay_gamma > 0"
+                "DFlash loss normalization must be mean, weights, or block"
             )
+        if (
+            not math.isfinite(self.loss_rejection_weight)
+            or self.loss_rejection_weight <= 0
+        ):
+            raise ValueError("DFlash rejection weight must be finite and positive")
+        if self.loss_objective not in ("kl", "overlap", "ce", "kl_overlap"):
+            raise ValueError("DFlash loss objective is invalid")
+        if not math.isfinite(self.loss_overlap_weight) or self.loss_overlap_weight <= 0:
+            raise ValueError("DFlash overlap weight must be finite and positive")
+        if not math.isfinite(self.loss_temperature) or self.loss_temperature <= 0:
+            raise ValueError("DFlash loss temperature must be finite and positive")
+        if self.loss_top_k < 0:
+            raise ValueError("DFlash loss top-k must be nonnegative")
+        if not 0 < self.loss_top_p <= 1:
+            raise ValueError("DFlash loss top-p must be in (0, 1]")
+        if (
+            not math.isfinite(self.loss_reference_weight)
+            or self.loss_reference_weight < 0
+        ):
+            raise ValueError("DFlash reference loss weight must be nonnegative")
+        if self.loss_reference_decay_tokens < 0:
+            raise ValueError("DFlash reference decay tokens must be nonnegative")
 
     @staticmethod
     def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
@@ -229,7 +275,16 @@ class _DFlashRecipe:
         return partial(
             train_dflash_window,
             max_train_rounds=self.max_train_rounds,
-            loss_decay_gamma=self.loss_decay_gamma,
+            loss_gamma=self.loss_gamma,
+            loss_normalization=self.loss_normalization,
+            loss_rejection_weight=self.loss_rejection_weight,
+            loss_objective=self.loss_objective,
+            loss_overlap_weight=self.loss_overlap_weight,
+            loss_temperature=self.loss_temperature,
+            loss_top_k=self.loss_top_k,
+            loss_top_p=self.loss_top_p,
+            loss_reference_weight=self.loss_reference_weight,
+            loss_reference_decay_tokens=self.loss_reference_decay_tokens,
         )
 
     def create_adapter(
@@ -269,9 +324,19 @@ _TRAINER_SETTINGS = {
     "fused_optimizer": "fused",
     "check_gradients": "check_gradients",
     "master_weights": "master_weights",
+    "persistent_grads": "persistent_grads",
+    "lr_reference_rows": "lr_reference_rows",
     "frozen_parameter_prefixes": "frozen_parameter_prefixes",
+    "loss_mode": "loss_mode",
 }
-_RUNTIME_SETTINGS = {"cpu_threads", "cpu_affinity", "log_queue_sizes", "log_updates"}
+_RUNTIME_SETTINGS = {
+    "cpu_threads",
+    "cpu_affinity",
+    "log_queue_sizes",
+    "log_updates",
+    "continuous_training",
+    "train_schedule",
+}
 _CPU_ROLES = ("inference", "capture", "training")
 
 
@@ -284,6 +349,8 @@ class _OnlineDraftSettings:
     cpu: dict[str, CPUWorkerConfig]
     log_queue_sizes: bool
     log_updates: bool
+    continuous_training: bool
+    train_schedule: tuple[int, ...] | None
 
 
 def _recipe_type(vllm_config: VllmConfig) -> type[_Recipe]:
@@ -325,6 +392,12 @@ def _parse_online_draft_settings(
         trainer["frozen_parameter_prefixes"] = tuple(
             trainer["frozen_parameter_prefixes"]
         )
+    train_schedule = tuple(values.get("train_schedule", ()))
+    if train_schedule and (
+        any(value < 1 for value in train_schedule)
+        or any(left >= right for left, right in zip(train_schedule, train_schedule[1:]))
+    ):
+        raise ValueError("train_schedule must be strictly increasing rounds")
 
     return _OnlineDraftSettings(
         recipe=recipe_type(
@@ -339,6 +412,8 @@ def _parse_online_draft_settings(
         },
         log_queue_sizes=values.get("log_queue_sizes", False),
         log_updates=values.get("log_updates", False),
+        continuous_training=values.get("continuous_training", False),
+        train_schedule=train_schedule or None,
     )
 
 
@@ -411,6 +486,8 @@ def create_online_draft(
         on_queue_size=queue_logger("train"),
         profile_timeline=profile_online_draft,
         cpu_config=settings.cpu["training"],
+        continuous_training=settings.continuous_training,
+        train_schedule=settings.train_schedule,
     )
     adapter = recipe.create_adapter(
         vllm_config,

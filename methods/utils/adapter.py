@@ -6,9 +6,9 @@
 import logging
 
 import torch
-from online_draft.training.eagle3.batch import Eagle3DistillationBatch
-from online_draft.training.eagle3.distill import project_teacher_distribution
 
+from methods.tts_common.batch import Eagle3DistillationBatch
+from methods.tts_common.loss import project_teacher_distribution
 from methods.utils.bridge import PolicyBridge, WeightSnapshot
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ class OnlineEagle3Adapter:
             ],
             "proposal_positions": [],
             "draft_token_input_embeds": [],
-            "draft_input_hidden_states": [],
+            "draft_recurrent_hidden_states": [],
         }
 
     def record_prefill(
@@ -99,7 +99,7 @@ class OnlineEagle3Adapter:
         self._trace["draft_token_input_embeds"].append(
             self.model.embed_input_ids(input_ids[indices]).detach().clone()
         )
-        self._trace["draft_input_hidden_states"].append(
+        self._trace["draft_recurrent_hidden_states"].append(
             hidden_states[indices].detach().clone()
         )
 
@@ -119,7 +119,7 @@ class OnlineEagle3Adapter:
             torch.empty(0, hidden_size, dtype=pending["prefill_input_embeds"].dtype),
         )
         pending.setdefault(
-            "draft_input_hidden_states",
+            "draft_recurrent_hidden_states",
             torch.empty(0, hidden_size, dtype=pending["prefill_input_embeds"].dtype),
         )
         self._pending = pending
@@ -137,10 +137,11 @@ class OnlineEagle3Adapter:
         target_token_ids = self.bridge.trainer.model.get_target_token_ids(
             device=logits.device
         )
-        probabilities, _ = project_teacher_distribution(
+        probabilities, coverage = project_teacher_distribution(
             logits[: self.depth], target_token_ids
         )
         self._pending["teacher_probabilities"] = _cpu_clone(probabilities)
+        self._pending["teacher_coverage"] = _cpu_clone(coverage.clamp(0.0, 1.0))
         self._sampled_token_ids = _cpu_clone(sampled_token_ids)
         self._num_sampled = _cpu_clone(num_sampled)
 
@@ -169,13 +170,16 @@ class OnlineEagle3Adapter:
             )
         )
         batch = Eagle3DistillationBatch(
-            prefix_positions=self._pending["prefill_positions"],
-            prefix_input_embeds=self._pending["prefill_input_embeds"],
-            prefix_aux_hidden_states=self._pending["prefill_aux_hidden_states"],
+            prefill_positions=self._pending["prefill_positions"],
+            prefill_input_embeds=self._pending["prefill_input_embeds"],
+            prefill_aux_hidden_states=self._pending["prefill_aux_hidden_states"],
             proposal_positions=self._pending["proposal_positions"],
             draft_token_input_embeds=self._pending["draft_token_input_embeds"],
-            draft_input_hidden_states=(self._pending["draft_input_hidden_states"]),
+            draft_recurrent_hidden_states=(
+                self._pending["draft_recurrent_hidden_states"]
+            ),
             teacher_probabilities=self._pending["teacher_probabilities"],
+            teacher_coverage=self._pending["teacher_coverage"],
             confirmed_positions=_cpu_clone(input_batch.positions[:count]),
             confirmed_input_embeds=_cpu_clone(self.model.embed_input_ids(shifted_ids)),
             confirmed_aux_hidden_states=_cpu_clone(
