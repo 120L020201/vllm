@@ -4,7 +4,8 @@
 """Compatibility batch for the local GPU training adapters."""
 
 import torch
-from online_draft.training.eagle3.batch import (
+
+from methods.shared.eagle3.batch import (
     Eagle3DistillationBatch as _Eagle3DistillationBatch,
 )
 

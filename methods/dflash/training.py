@@ -14,8 +14,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from online_draft.training.trainer import DraftTrainer, TrainerConfig
 
+from methods.shared.trainer import DraftTrainer, TrainerConfig
 from methods.tts_common.loss import window_forward_kl_loss
 
 _FROZEN_PARAMETER_PREFIXES = (

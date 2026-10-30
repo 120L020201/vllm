@@ -192,6 +192,24 @@ class LauncherTest(unittest.TestCase):
             )
         self.assertTrue(all(command == commands[0] for command in commands))
 
+    def test_only_online_draft_adds_its_package_to_pythonpath(self):
+        root = Path(__file__).resolve().parents[2]
+        online_draft_path = str(root / "online_draft" / "src")
+
+        for method in ("tts", "random_sampling", "ospec"):
+            with (
+                self.subTest(method=method),
+                patch.dict(os.environ, {"PYTHONPATH": ""}),
+            ):
+                args = build_parser().parse_args((method, "--dry-run"))
+                _, env = configure(args)
+                self.assertNotIn(online_draft_path, env["PYTHONPATH"].split(os.pathsep))
+
+        with patch.dict(os.environ, {"PYTHONPATH": ""}):
+            args = build_parser().parse_args(("online_draft", "--dry-run"))
+            _, env = configure(args)
+        self.assertIn(online_draft_path, env["PYTHONPATH"].split(os.pathsep))
+
     def test_conflicting_cpu_training_environment_is_rejected(self):
         for method in ("eagle", "online_draft", "tts", "random_sampling", "ospec"):
             with (

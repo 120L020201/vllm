@@ -6,6 +6,9 @@ distributions captured during verification. TTS runs training on a side CUDA
 stream while the draft serves the next `S-1` rounds, then installs the update
 before generating the next canvas. Parameters and optimizer reset after each
 request unless `--keep-weights` is specified.
+TTS owns its GPU training primitives under `methods/shared`; none of the TTS
+entry points imports the `online_draft` package or its CPU asynchronous
+pipeline.
 The paper's Qwen3-8B LiveCodeBench sweep found its best throughput at
 `--update-stride 10` (1.83x relative speedup with 0.88x the `S=1` acceptance
 length); the CLI keeps `S=1` as the algorithm default.

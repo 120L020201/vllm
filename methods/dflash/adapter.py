@@ -9,7 +9,6 @@ import os
 from dataclasses import dataclass
 
 import torch
-from online_draft.training.trainer import DraftTrainer
 
 from methods.dflash.training import (
     DflashTrainingBatch,
@@ -18,6 +17,7 @@ from methods.dflash.training import (
     train_dflash_round,
 )
 from methods.random_sampling.gating import BernoulliGate
+from methods.shared.trainer import DraftTrainer
 from methods.tts_common.loss import project_teacher_distribution
 from methods.utils.cuda_worker import CudaStreamResult, CudaStreamWorker
 from methods.utils.stats import WorkerStats

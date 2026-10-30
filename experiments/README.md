@@ -263,6 +263,10 @@ checkpoint 内嵌的 `mtp.*` 权重。
 | TTS + MTP | `tts+mtp` | `MODEL=<含内嵌 MTP 的 target>` | 3 | GPU side stream | 0 |
 | OSpec | `ospec` | `BASE_MODEL_PATH`、`EA_MODEL_PATH_1` | 7 | GPU 异步 ensemble | 0 |
 
+TTS 的训练基础模块位于 `methods/shared`，三种 TTS 入口都不会导入
+`online_draft` 包；`online_draft/src` 只会加入 `online_draft` 入口的
+`PYTHONPATH`。
+
 下面的示例复用相同的数据集、target 和上下文配置；按实验需要修改
 `BENCHMARKS`、`SEED`、`MAX_MODEL_LEN` 等公共变量即可。
 

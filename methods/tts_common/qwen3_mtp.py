@@ -13,7 +13,9 @@ target vocabulary.
 from dataclasses import dataclass
 
 import torch
-from online_draft.models.layers import (
+from torch import nn
+
+from methods.shared.layers import (
     VLLM_ATTENTION_STATE_SUFFIXES,
     AttentionBackend,
     DraftForwardOutput,
@@ -24,7 +26,6 @@ from online_draft.models.layers import (
     cached_attention,
     copy_vllm_rotary,
 )
-from torch import nn
 
 
 @dataclass(frozen=True, slots=True)

@@ -374,6 +374,12 @@ def configure(args):
             require_gpu=not args.dry_run,
         )
     env = os.environ.copy()
+    python_path = [str(BOOTSTRAP), str(ROOT)]
+    if args.method == "online_draft":
+        python_path.append(str(ROOT / "online_draft" / "src"))
+    existing_python_path = env.get("PYTHONPATH", "")
+    if existing_python_path:
+        python_path.append(existing_python_path)
     if args.method == "online_draft":
         omp_threads = env.setdefault("OMP_NUM_THREADS", "20")
         env.setdefault("MKL_NUM_THREADS", omp_threads)
@@ -404,14 +410,7 @@ def configure(args):
             "OSD_PERSISTENT_GRADS": str(int(persistent_grads)),
             "OSD_CONTINUOUS_TRAINING": str(int(continuous_training)),
             "OSD_FROZEN_PARAMETER_PREFIXES": ",".join(prefixes),
-            "PYTHONPATH": os.pathsep.join(
-                (
-                    str(BOOTSTRAP),
-                    str(ROOT),
-                    str(ROOT / "online_draft" / "src"),
-                    env.get("PYTHONPATH", ""),
-                )
-            ),
+            "PYTHONPATH": os.pathsep.join(python_path),
         }
     )
     online_draft_config = {

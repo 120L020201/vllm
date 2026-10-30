@@ -13,26 +13,26 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-import online_draft.training.eagle3.batch as eagle3_batch_module
-import online_draft.training.eagle3.cache as eagle3_cache_module
 import torch
-from online_draft.models.qwen3_eagle3 import (
+from safetensors.torch import load_file as load_safetensors_file
+
+import methods.shared.eagle3.batch as eagle3_batch_module
+import methods.shared.eagle3.cache as eagle3_cache_module
+from methods.random_sampling.gating import BernoulliGate
+from methods.shared.eagle3.cache import (
+    append_confirmed_window_to_persistent_cache,
+)
+from methods.shared.eagle3.window import (
+    Eagle3TrainingWindow,
+    Eagle3WindowMode,
+)
+from methods.shared.qwen3_eagle3 import (
     Eagle3KVCache,
     Qwen3Eagle3Config,
     Qwen3Eagle3ForCausalLM,
     convert_angelslim_eagle3_state_dict,
 )
-from online_draft.training.eagle3.cache import (
-    append_confirmed_window_to_persistent_cache,
-)
-from online_draft.training.eagle3.window import (
-    Eagle3TrainingWindow,
-    Eagle3WindowMode,
-)
-from online_draft.training.trainer import DraftTrainer, TrainerConfig
-from safetensors.torch import load_file as load_safetensors_file
-
-from methods.random_sampling.gating import BernoulliGate
+from methods.shared.trainer import DraftTrainer, TrainerConfig
 from methods.tts_common.batch import Eagle3DistillationBatch
 from methods.tts_common.step import train_batches
 from methods.utils.cuda_worker import CudaStreamResult, CudaStreamWorker

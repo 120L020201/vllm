@@ -6,25 +6,25 @@
 from typing import cast
 
 import torch
-from online_draft.models.qwen3_eagle3 import Eagle3KVCache
-from online_draft.runtime import profile_range
-from online_draft.training.eagle3.cache import (
+
+from methods.shared.eagle3.cache import (
     PersistentEagle3KVCache,
     _append_confirmed_window,
     persistent_cache_length,
 )
-from online_draft.training.eagle3.draft_model import AutoregressiveDraftModel
-from online_draft.training.eagle3.inputs import (
+from methods.shared.eagle3.draft_model import AutoregressiveDraftModel
+from methods.shared.eagle3.inputs import (
     prepare_eagle3_confirmed_path_inputs,
     prepare_eagle3_proposal_window_inputs,
 )
-from online_draft.training.eagle3.window import (
+from methods.shared.eagle3.window import (
     Eagle3TrainingWindow,
     Eagle3WindowMode,
     Eagle3WindowResult,
 )
-from online_draft.training.trainer import DraftTrainer
-
+from methods.shared.qwen3_eagle3 import Eagle3KVCache
+from methods.shared.runtime import profile_range
+from methods.shared.trainer import DraftTrainer
 from methods.tts_common.loss import forward_kl_loss
 
 
