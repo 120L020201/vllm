@@ -5,7 +5,22 @@
 
 import os
 
-if os.environ.get("OSD_METHOD") in {"tts", "random_sampling", "ospec"}:
-    from methods.utils.factory import install
+_METHOD = os.environ.get("OSD_METHOD")
+_DRAFT_METHOD = os.environ.get("OSD_DRAFT_METHOD", "eagle3")
+
+if _DRAFT_METHOD == "mtp":
+    from methods.tts_common.vllm_ext import install as install_qwen3_mtp
+
+    install_qwen3_mtp()
+
+if _METHOD in {"tts", "random_sampling", "ospec"}:
+    if _DRAFT_METHOD == "dflash":
+        from methods.dflash.factory import install
+    else:
+        from methods.utils.gpu_factory import install
+
+    install()
+elif _METHOD == "online_draft":
+    from methods.utils.cpu_stats import install
 
     install()

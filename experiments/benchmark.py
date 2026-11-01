@@ -21,7 +21,7 @@ import regex as re
 
 ResultKey = tuple[str, int]
 ResumeMode = Literal["none", "question", "dataset"]
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 4
 
 _SPEC_METRIC_KEYS = ("drafts", "draft_tokens", "accepted_tokens")
 _REQUEST_TIMING_METRICS = {
@@ -29,7 +29,9 @@ _REQUEST_TIMING_METRICS = {
     "decode": "vllm:request_decode_time_seconds",
 }
 _BENCHMARK_PATTERN = re.compile(
-    r"^(?P<name>[A-Za-z0-9_.-]+)(?:\[(?P<sample_size>[0-9]+)\])?$"
+    r"^(?P<name>[A-Za-z0-9_.-]+)"
+    r"(?:(?:\((?P<sample_size>[0-9]+)\))|"
+    r"\[(?P<question_numbers>[0-9]+(?:,[0-9]+)*)\])?$"
 )
 
 
@@ -37,20 +39,45 @@ _BENCHMARK_PATTERN = re.compile(
 class BenchmarkSpec:
     name: str
     sample_size: int | None = None
+    question_numbers: tuple[int, ...] | None = None
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--method",
+        choices=(
+            "base",
+            "eagle3",
+            "dflash",
+            "mtp",
+            "online_draft",
+            "online-draft-eagle3",
+            "online-draft-dflash",
+            "online-draft-mtp",
+            "tts",
+            "tts-eagle3",
+            "tts-dflash",
+            "tts-mtp",
+            "ospec",
+        ),
+    )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--benchmarks", required=True)
+    parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--max-output-tokens", type=int, required=True)
     parser.add_argument("--max-prompt-tokens", type=int, required=True)
     parser.add_argument("--temperature", type=float, required=True)
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
+    parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--presence-penalty", type=float, required=True)
+    parser.add_argument("--frequency-penalty", type=float, default=0.0)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--stop-token-ids", default="151645,151643")
+    parser.add_argument("--warmup-tokens", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--enable-thinking",
@@ -61,6 +88,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=float, default=7200)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--stats-file", type=Path)
+    parser.add_argument("--server-log", type=Path)
     parser.add_argument(
         "--resume-mode",
         choices=("none", "question", "dataset"),
@@ -85,9 +113,23 @@ def _parse_benchmark_specs(value: str) -> list[BenchmarkSpec]:
             raise ValueError(f"duplicate benchmark: {name}")
         raw_sample_size = match.group("sample_size")
         sample_size = int(raw_sample_size) if raw_sample_size is not None else None
+        raw_question_numbers = match.group("question_numbers")
+        question_numbers = (
+            tuple(int(item) for item in raw_question_numbers.split(","))
+            if raw_question_numbers is not None
+            else None
+        )
         if sample_size is not None and sample_size < 1:
             raise ValueError(f"benchmark sample size must be positive: {item}")
-        specs.append(BenchmarkSpec(name, sample_size))
+        if question_numbers is not None and any(
+            question_number < 1 for question_number in question_numbers
+        ):
+            raise ValueError(f"benchmark question number must be positive: {item}")
+        if question_numbers is not None and len(set(question_numbers)) != len(
+            question_numbers
+        ):
+            raise ValueError(f"duplicate benchmark question number: {item}")
+        specs.append(BenchmarkSpec(name, sample_size, question_numbers))
         names.add(name)
     if not specs:
         raise ValueError("BENCHMARKS must not be empty")
@@ -107,6 +149,20 @@ def _select_benchmark_records(
             if line.strip():
                 records.append((line_number, json.loads(line)))
 
+    if spec.question_numbers is not None:
+        unavailable = [
+            question_number
+            for question_number in spec.question_numbers
+            if question_number > len(records)
+        ]
+        if unavailable:
+            raise ValueError(
+                f"{spec.name} requested questions {unavailable}, "
+                f"but only {len(records)} are available"
+            )
+        return [
+            records[question_number - 1] for question_number in spec.question_numbers
+        ]
     if spec.sample_size is None:
         return records
     if spec.sample_size > len(records):
@@ -135,45 +191,123 @@ def _prompt(record: dict[str, Any]) -> str:
     raise ValueError("record has no supported prompt field")
 
 
-def _request_body(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
-    return {
+def _request_body(
+    args: argparse.Namespace,
+    prompt: str,
+    *,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    output_limit = args.max_output_tokens if max_tokens is None else max_tokens
+    if output_limit < 1:
+        raise ValueError("a positive per-request output limit is required")
+    body = {
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
         "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
-        "max_tokens": args.max_output_tokens,
-        "truncate_prompt_tokens": args.max_prompt_tokens,
-        "truncation_side": "left",
+        "max_tokens": output_limit,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "min_p": getattr(args, "min_p", 0.0),
         "presence_penalty": args.presence_penalty,
+        "frequency_penalty": getattr(args, "frequency_penalty", 0.0),
+        "repetition_penalty": getattr(args, "repetition_penalty", 1.0),
+        "stop_token_ids": _parse_token_ids(
+            getattr(args, "stop_token_ids", "151645,151643")
+        ),
         "seed": args.seed,
         "stream": False,
     }
+    if args.max_prompt_tokens:
+        body["truncate_prompt_tokens"] = args.max_prompt_tokens
+        body["truncation_side"] = "left"
+    return body
+
+
+def _parse_token_ids(value: str) -> list[int]:
+    if not value.strip():
+        return []
+    try:
+        token_ids = [int(item.strip()) for item in value.split(",")]
+    except ValueError as exc:
+        raise ValueError("stop token IDs must be comma-separated integers") from exc
+    if any(token_id < 0 for token_id in token_ids):
+        raise ValueError("stop token IDs must be nonnegative")
+    return token_ids
+
+
+def _tokenize_prompt(args: argparse.Namespace, prompt: str) -> int:
+    body = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
+    }
+    request = urllib.request.Request(
+        f"{args.base_url.rstrip('/')}/tokenize",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=args.request_timeout) as response:
+        payload = json.load(response)
+    return int(payload["count"])
+
+
+def _output_token_limit(
+    max_model_len: int,
+    prompt_tokens: int,
+    configured_limit: int,
+    max_prompt_tokens: int = 0,
+) -> int:
+    effective_prompt_tokens = (
+        min(prompt_tokens, max_prompt_tokens) if max_prompt_tokens else prompt_tokens
+    )
+    remaining = max_model_len - effective_prompt_tokens
+    if remaining < 1:
+        raise ValueError(
+            f"prompt uses {effective_prompt_tokens} tokens, leaving no generation "
+            f"space in the {max_model_len}-token context"
+        )
+    return min(remaining, configured_limit) if configured_limit else remaining
 
 
 def _request_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "endpoint": "/v1/chat/completions",
         "model": args.model,
+        "max_model_len": args.max_model_len,
         "max_output_tokens": args.max_output_tokens,
         "max_prompt_tokens": args.max_prompt_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "min_p": args.min_p,
         "presence_penalty": args.presence_penalty,
+        "frequency_penalty": args.frequency_penalty,
+        "repetition_penalty": args.repetition_penalty,
+        "stop_token_ids": _parse_token_ids(args.stop_token_ids),
+        "warmup_tokens": getattr(args, "warmup_tokens", 16),
         "enable_thinking": args.enable_thinking,
         "seed": args.seed,
         "benchmarks": args.benchmarks,
     }
 
 
-def _request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
-    body = _request_body(args, prompt)
+def _request(
+    args: argparse.Namespace,
+    prompt: str,
+    *,
+    max_tokens: int | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    body = _request_body(args, prompt, max_tokens=max_tokens)
+    headers = {"Content-Type": "application/json"}
+    if request_id is not None:
+        headers["X-Request-Id"] = request_id
     request = urllib.request.Request(
         f"{args.base_url.rstrip('/')}/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=args.request_timeout) as response:
@@ -248,29 +382,53 @@ def _fetch_spec_metrics(base_url: str) -> dict[str, int] | None:
     return metrics["spec_decode"]
 
 
-def _read_worker_stats(path: Path | None) -> dict[str, int]:
+def _read_worker_stats(path: Path | None) -> dict[str, int] | None:
     if path is None or not path.is_file():
-        return {"active_requests": 0, "updates": 0, "pending": 0}
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return {
-            "active_requests": int(payload.get("active_requests", 0)),
-            "updates": int(payload.get("updates", 0)),
-            "pending": int(payload.get("pending", 0)),
-        }
-    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-        return {"active_requests": 0, "updates": 0, "pending": 0}
+        keys = (
+            "active_requests",
+            "pending",
+            "weight_installs",
+            "cpu_train_calls",
+            "cpu_train_rounds",
+        )
+        stats = {key: payload[key] for key in keys}
+        if any(type(value) is not int or value < 0 for value in stats.values()):
+            return None
+        return stats
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
+        return None
 
 
-def _wait_for_worker(path: Path | None, timeout: float) -> dict[str, int]:
+def _wait_for_worker(path: Path | None, timeout: float) -> dict[str, int] | None:
     deadline = time.monotonic() + timeout
     stats = _read_worker_stats(path)
-    while (
-        stats["pending"] > 0 or stats["active_requests"] > 0
-    ) and time.monotonic() < deadline:
+    while stats is not None and (stats["pending"] > 0 or stats["active_requests"] > 0):
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(0.05)
         stats = _read_worker_stats(path)
     return stats
+
+
+def _training_metrics(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+    method: str | None,
+) -> tuple[int | None, float | None]:
+    if method in ("base", "eagle3", "dflash", "mtp"):
+        return 0, None
+    if before is None or after is None:
+        return None, None
+    if any(stats["active_requests"] or stats["pending"] for stats in (before, after)):
+        return None, None
+    keys = ("weight_installs", "cpu_train_calls", "cpu_train_rounds")
+    installs, calls, rounds = (after[key] - before[key] for key in keys)
+    if min(installs, calls, rounds) < 0:
+        return None, None
+    return installs, rounds / calls if calls else None
 
 
 def _acceptance_length(
@@ -352,6 +510,51 @@ def _phase_performance(
             else None
         ),
     }
+
+
+def _read_spec_prefixes(
+    server_log: Path | None, response_id: str | None
+) -> dict[str, Any]:
+    prefixes: dict[str, Any] = {"1000": None, "2000": None}
+    if server_log is None or response_id is None or not server_log.exists():
+        return prefixes
+    request_pattern = re.compile(re.escape(response_id) + r"(?:-[0-9a-f]{8})?")
+    decoder = json.JSONDecoder()
+    with server_log.open(encoding="utf-8", errors="replace") as source:
+        for line in source:
+            _, marker, payload = line.partition("SPEC_DECODE_PREFIX ")
+            if not marker:
+                continue
+            snapshot, _ = decoder.raw_decode(payload)
+            if not request_pattern.fullmatch(snapshot["request_id"]):
+                continue
+            threshold = str(snapshot["drafts"])
+            if threshold not in prefixes or prefixes[threshold] is not None:
+                raise ValueError("unexpected or duplicate speculative prefix snapshot")
+            prefixes[threshold] = snapshot
+    return prefixes
+
+
+def _spec_prefix_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {}
+    for threshold in ("1000", "2000"):
+        measured = [
+            (result, prefix)
+            for result in results
+            if (prefix := result.get("spec_decode_prefixes", {}).get(threshold))
+            is not None
+        ]
+        drafts = sum(prefix["drafts"] for _, prefix in measured)
+        accepted = sum(prefix["accepted_tokens"] for _, prefix in measured)
+        summary[threshold] = {
+            "measured_requests": len(measured),
+            "total_requests": len(results),
+            "lines": [result["line"] for result, _ in measured],
+            "drafts": drafts,
+            "accepted_tokens": accepted,
+            "acceptance_length": 1 + accepted / drafts if drafts else None,
+        }
+    return summary
 
 
 def _new_dataset_totals() -> dict[str, int | float]:
@@ -630,15 +833,18 @@ def _prepare_resume(
 def main() -> None:
     args = _parse_args()
     if (
-        args.max_output_tokens < 1
-        or args.max_prompt_tokens < 1
+        args.max_model_len < 1
+        or args.max_output_tokens < 0
+        or args.max_prompt_tokens < 0
         or args.top_k < -1
         or args.seed < 0
+        or args.warmup_tokens < 0
     ):
         raise ValueError(
-            "max output and prompt tokens must be positive, top-k >= -1, "
-            "and seed nonnegative"
+            "model length must be positive; output, prompt, seed, and warmup "
+            "limits must be nonnegative; top-k must be >= -1"
         )
+    _parse_token_ids(args.stop_token_ids)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     benchmark_specs = _parse_benchmark_specs(args.benchmarks)
     benchmark_records = {
@@ -654,6 +860,14 @@ def main() -> None:
         benchmark: {line_number for line_number, _ in records}
         for benchmark, records in benchmark_records.items()
     }
+
+    if args.warmup_tokens:
+        _request(
+            args,
+            "Warm up.",
+            max_tokens=args.warmup_tokens,
+            request_id="_warmup_run_sh",
+        )
 
     request_config = _request_config(args)
     completed_keys: set[ResultKey] = set()
@@ -683,9 +897,11 @@ def main() -> None:
     with args.output.open(output_mode, encoding="utf-8") as output:
         for benchmark in benchmarks:
             dataset_totals = _new_dataset_totals()
+            dataset_results = []
             for key, result in retained_results.items():
                 if key[0] == benchmark:
                     _update_dataset_totals(dataset_totals, result)
+                    dataset_results.append(result)
             for line_number, record in benchmark_records[benchmark]:
                 if args.max_samples is not None and written >= args.max_samples:
                     break
@@ -693,18 +909,26 @@ def main() -> None:
                 if key in completed_keys:
                     continue
                 prompt = _prompt(record)
+                tokenized_prompt_tokens = _tokenize_prompt(args, prompt)
+                output_limit = _output_token_limit(
+                    args.max_model_len,
+                    tokenized_prompt_tokens,
+                    args.max_output_tokens,
+                    args.max_prompt_tokens,
+                )
+                worker_before = _wait_for_worker(args.stats_file, args.request_timeout)
                 metrics_before = _fetch_server_metrics(args.base_url)
-                worker_before = _read_worker_stats(args.stats_file)
                 started = time.monotonic()
                 try:
-                    response = _request(args, prompt)
+                    response = _request(args, prompt, max_tokens=output_limit)
                     error = None
                 except (urllib.error.HTTPError, urllib.error.URLError) as exc:
                     response = None
                     error = f"{type(exc).__name__}: {exc}"
-                worker_after = _wait_for_worker(
-                    args.stats_file,
-                    args.request_timeout,
+                worker_after = (
+                    _wait_for_worker(args.stats_file, args.request_timeout)
+                    if error is None
+                    else None
                 )
                 metrics_after = _fetch_server_metrics(args.base_url)
                 elapsed = time.monotonic() - started
@@ -730,7 +954,11 @@ def main() -> None:
                 timing = _request_timing_delta(timing_before, timing_after)
                 phase_performance = _phase_performance(response, timing)
                 tokens = int(phase_performance["completion_tokens"] or 0)
-                updates = worker_after["updates"] - worker_before["updates"]
+                weight_installs, cpu_rounds_per_train = _training_metrics(
+                    worker_before,
+                    worker_after,
+                    args.method,
+                )
                 acceptance_length = _acceptance_length(spec_before, spec_after)
                 tokens_per_second = tokens / elapsed if elapsed > 0 else 0.0
                 record_id = record.get("id") or f"{benchmark}-{line_number}"
@@ -740,12 +968,18 @@ def main() -> None:
                     "line": line_number,
                     "id": record.get("id"),
                     "prompt": prompt,
+                    "tokenized_prompt_tokens": tokenized_prompt_tokens,
+                    "requested_max_tokens": output_limit,
                     "request_config": request_config,
                     "response": response,
                     "error": error,
                     "acceptance_length": acceptance_length,
                     "spec_decode": spec_decode,
-                    "updates": updates,
+                    "spec_decode_prefixes": _read_spec_prefixes(
+                        args.server_log, response.get("id") if response else None
+                    ),
+                    "weight_installs": weight_installs,
+                    "cpu_rounds_per_train": cpu_rounds_per_train,
                     "tokens": tokens,
                     "elapsed_seconds": elapsed,
                     "tokens_per_second": tokens_per_second,
@@ -754,6 +988,7 @@ def main() -> None:
                 output.write(json.dumps(result, ensure_ascii=False) + "\n")
                 output.flush()
                 _update_dataset_totals(dataset_totals, result)
+                dataset_results.append(result)
                 written += 1
                 prefill_log = _phase_log(
                     "prefill",
@@ -767,9 +1002,19 @@ def main() -> None:
                     phase_performance["decode_seconds"],
                     phase_performance["decode_tokens_per_second"],
                 )
+                installs_log = (
+                    str(weight_installs) if weight_installs is not None else "N/A"
+                )
+                cpu_train_log = (
+                    f"{cpu_rounds_per_train:.2f}"
+                    if cpu_rounds_per_train is not None
+                    else "N/A"
+                )
                 print(
                     f"{record_id}: AL={acceptance_length:.3f}, "
-                    f"updates={updates}, tokens={tokens}, time={elapsed:.1f}s, "
+                    f"weight_installs={installs_log}, "
+                    f"cpu_rounds/train={cpu_train_log}, "
+                    f"tokens={tokens}, time={elapsed:.1f}s, "
                     f"tokens/s={tokens_per_second:.2f}, {prefill_log}, "
                     f"{decode_log}",
                     flush=True,
@@ -779,6 +1024,7 @@ def main() -> None:
                         f"request failed for {benchmark}:{line_number}: {error}"
                     )
             summary = _dataset_summary(dataset_totals)
+            summary["spec_decode_prefixes"] = _spec_prefix_summary(dataset_results)
             summaries[benchmark] = summary
             _write_summaries(summary_path, request_config, summaries)
             spec_summary = summary["spec_decode"]

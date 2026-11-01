@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Download selected Qwen3 target and matching EAGLE3 draft checkpoints."""
+"""Download selected Qwen3 targets and matching external draft checkpoints."""
 
 import argparse
 import json
@@ -18,6 +18,7 @@ class ModelSpec:
     revision: str
     hidden_size: int
     draft: bool
+    requires_mtp: bool = False
 
 
 MODEL_SPECS = {
@@ -53,6 +54,52 @@ MODEL_SPECS = {
             True,
         ),
     ),
+    "qwen3.5-4b": (
+        ModelSpec(
+            "Qwen3.5-4B",
+            "Qwen/Qwen3.5-4B",
+            "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+            2560,
+            False,
+            True,
+        ),
+    ),
+}
+
+MTP_TARGET_MODEL_SPECS = {
+    "8b": ModelSpec(
+        "Qwen3-8B-MTP",
+        "AngelSlim/Qwen3-8B-MTP-TTT3",
+        "098ace0fd1b858c81e3bdbb58d4796400e154582",
+        4096,
+        False,
+        True,
+    ),
+    "qwen3.5-4b": MODEL_SPECS["qwen3.5-4b"][0],
+}
+
+DRAFT_MODEL_SPECS = {
+    "4b": {
+        "eagle3": MODEL_SPECS["4b"][1],
+        "dflash": ModelSpec(
+            "Qwen3-4B_dflash",
+            "z-lab/Qwen3-4B-DFlash-b16",
+            "b74e3a329c4d963783143b1e970d95b002be72bd",
+            2560,
+            True,
+        ),
+    },
+    "8b": {
+        "eagle3": MODEL_SPECS["8b"][1],
+        "dflash": ModelSpec(
+            "Qwen3-8B_dflash",
+            "z-lab/Qwen3-8B-DFlash-b16",
+            "9b41424b7109f9c5413454f481b09a82b85333f4",
+            4096,
+            True,
+        ),
+    },
+    "qwen3.5-4b": {},
 }
 
 
@@ -64,7 +111,17 @@ def _parse_args() -> argparse.Namespace:
         action="append",
         choices=tuple(MODEL_SPECS),
         dest="model_sizes",
-        help="download this target/draft pair; may be repeated",
+        help="download this target and selected draft(s); may be repeated",
+    )
+    parser.add_argument(
+        "--draft-method",
+        action="append",
+        choices=("eagle3", "dflash", "mtp"),
+        dest="draft_methods",
+        help=(
+            "select a draft type; may be repeated; MTP uses target-embedded "
+            "weights and has no separate download"
+        ),
     )
     parser.add_argument("--max-workers", type=int, default=8)
     parser.add_argument("--force", action="store_true")
@@ -76,8 +133,41 @@ def _validate_model(path: Path, spec: ModelSpec) -> None:
     if not config_path.is_file():
         raise FileNotFoundError(f"missing {config_path}")
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    if int(config.get("hidden_size", 0)) != spec.hidden_size:
+    model_config = config.get("text_config", config)
+    if int(model_config.get("hidden_size", 0)) != spec.hidden_size:
         raise ValueError(f"unexpected hidden_size in {config_path}")
+
+    if spec.requires_mtp:
+        model_type = model_config.get("model_type", config.get("model_type"))
+        if model_type == "qwen3":
+            mtp_layers = model_config.get(
+                "num_nextn_predict_layers",
+                config.get("num_nextn_predict_layers", 0),
+            )
+        elif model_type in {
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+        }:
+            mtp_layers = model_config.get(
+                "mtp_num_hidden_layers",
+                config.get("mtp_num_hidden_layers", 0),
+            )
+        else:
+            raise ValueError(f"{path} is not a target with embedded MTP weights")
+        if int(mtp_layers or 0) < 1:
+            raise ValueError(f"{path} has no embedded MTP layers")
+
+        index_paths = tuple(path.glob("*.index.json"))
+        if index_paths and not any(
+            name.startswith("mtp.") or ".mtp." in name
+            for index_path in index_paths
+            for name in json.loads(index_path.read_text(encoding="utf-8")).get(
+                "weight_map", {}
+            )
+        ):
+            raise ValueError(f"{path} has no embedded mtp.* weights")
 
     index_paths = tuple(path.glob("*.index.json"))
     if index_paths:
@@ -142,15 +232,44 @@ def _prepare_model(
 
 def main() -> None:
     args = _parse_args()
+    if not args.model_sizes:
+        print("No models selected; specify --model-size to download.", flush=True)
+        return
     if args.max_workers < 1:
         raise ValueError("max-workers must be positive")
-    for size in args.model_sizes or MODEL_SPECS:
-        for spec in MODEL_SPECS[size]:
+    draft_methods = tuple(dict.fromkeys(args.draft_methods or ("eagle3",)))
+    for size in args.model_sizes:
+        target_spec = MODEL_SPECS[size][0]
+        use_mtp = "mtp" in draft_methods
+        if use_mtp and size not in MTP_TARGET_MODEL_SPECS:
+            raise ValueError(
+                f"{target_spec.repo_id} has no prepared checkpoint with embedded "
+                "MTP weights; select --model-size 8b or qwen3.5-4b"
+            )
+        external_drafts = tuple(method for method in draft_methods if method != "mtp")
+        unavailable = set(external_drafts) - DRAFT_MODEL_SPECS[size].keys()
+        if unavailable:
+            raise ValueError(
+                f"{size} has no external draft download for "
+                f"{', '.join(sorted(unavailable))}"
+            )
+        specs = [] if draft_methods == ("mtp",) else [target_spec]
+        specs.extend(DRAFT_MODEL_SPECS[size][method] for method in external_drafts)
+        if use_mtp:
+            specs.append(MTP_TARGET_MODEL_SPECS[size])
+        for spec in specs:
             _prepare_model(
                 args.output_dir,
                 spec,
                 max_workers=args.max_workers,
                 force=args.force,
+            )
+        if use_mtp:
+            mtp_target = args.output_dir / MTP_TARGET_MODEL_SPECS[size].directory
+            print(
+                f"MTP weights are embedded in {mtp_target}; no separate drafter "
+                f"was downloaded. Use MODEL={mtp_target} for MTP runs.",
+                flush=True,
             )
 
 

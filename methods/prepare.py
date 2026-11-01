@@ -83,12 +83,6 @@ DATASETS = (
         revision="2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9",
         split="train",
     ),
-    DatasetSpec(
-        name="longwriter_6k",
-        repo_id="zai-org/LongWriter-6k",
-        revision="0db15c0624f19d63e2efe1021595af933cc5b6cc",
-        split="train",
-    ),
 )
 
 MODELS = (
@@ -106,6 +100,13 @@ MODELS = (
         draft=True,
     ),
     ModelSpec(
+        name="qwen3-4b-dflash",
+        repo_id="z-lab/Qwen3-4B-DFlash-b16",
+        revision="b74e3a329c4d963783143b1e970d95b002be72bd",
+        size="4b",
+        draft=True,
+    ),
+    ModelSpec(
         name="qwen3-8b",
         repo_id="Qwen/Qwen3-8B",
         revision="b968826d9c46dd6066d109eabc6255188de91218",
@@ -115,6 +116,13 @@ MODELS = (
         name="qwen3-8b-eagle3",
         repo_id="AngelSlim/Qwen3-8B_eagle3",
         revision="9629dfce7a4a10564dd48d3e5485c3976095653c",
+        size="8b",
+        draft=True,
+    ),
+    ModelSpec(
+        name="qwen3-8b-dflash",
+        repo_id="z-lab/Qwen3-8B-DFlash-b16",
+        revision="9b41424b7109f9c5413454f481b09a82b85333f4",
         size="8b",
         draft=True,
     ),
