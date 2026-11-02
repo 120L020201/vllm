@@ -44,6 +44,8 @@ class CPUWorkerConfig:
         if self.cpus:
             os.sched_setaffinity(0, self.cpus)
         if self.threads is not None:
+            # Finish ATen's lazy initialization before thread-local overrides.
+            torch.get_num_threads()
             library = _parallel_runtime()
             library.omp_set_num_threads(self.threads)
             library.MKL_Set_Num_Threads_Local(self.threads)

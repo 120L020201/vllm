@@ -14,24 +14,33 @@ from online_draft.runtime.cpu_worker import CPUWorkerConfig
 from torch import nn
 
 
-def test_cpu_worker_settings_do_not_change_inference_thread():
-    """Training parallelism and affinity must stay local to its worker thread."""
+@pytest.mark.parametrize("training_threads", [1, 2])
+def test_cpu_worker_settings_survive_first_op_without_changing_inference(
+    training_threads,
+):
+    """ATen initialization must preserve worker settings and inference isolation."""
     inference_threads = torch.get_num_threads()
     inference_cpus = os.sched_getaffinity(0)
     training_cpu = min(inference_cpus)
-    config = CPUWorkerConfig(threads=1, cpus=(training_cpu,))
+    config = CPUWorkerConfig(threads=training_threads, cpus=(training_cpu,))
+    tensor = torch.ones(65536)
     observed = []
 
     def run():
         config.apply()
+        torch.cat((tensor, tensor))
         observed.append((torch.get_num_threads(), os.sched_getaffinity(0)))
 
-    worker = Thread(target=run)
-    worker.start()
-    worker.join()
-    assert observed == [(1, {training_cpu})]
-    assert torch.get_num_threads() == inference_threads
-    assert os.sched_getaffinity(0) == inference_cpus
+    try:
+        torch.set_num_threads(1)
+        worker = Thread(target=run)
+        worker.start()
+        worker.join()
+        assert observed == [(training_threads, {training_cpu})]
+        assert torch.get_num_threads() == 1
+        assert os.sched_getaffinity(0) == inference_cpus
+    finally:
+        torch.set_num_threads(inference_threads)
 
 
 @dataclass
