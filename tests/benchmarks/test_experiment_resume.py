@@ -76,7 +76,7 @@ def test_benchmark_selection_is_seeded_per_dataset(tmp_path: Path) -> None:
     dataset_path = tmp_path / "aime2026.jsonl"
     _write_dataset(dataset_path, [f"question-{index}" for index in range(30)])
 
-    specs = _parse_benchmark_specs("aime2026[15] gpqa_diamond")
+    specs = _parse_benchmark_specs("aime2026(15) gpqa_diamond")
     first = _select_benchmark_records(dataset_path, specs[0], seed=7)
     repeated = _select_benchmark_records(dataset_path, specs[0], seed=7)
     changed = _select_benchmark_records(dataset_path, specs[0], seed=8)
@@ -85,6 +85,19 @@ def test_benchmark_selection_is_seeded_per_dataset(tmp_path: Path) -> None:
     assert len(first) == 15
     assert first == repeated
     assert first != changed
+
+
+def test_brackets_select_multiple_questions(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "aime2026.jsonl"
+    _write_dataset(dataset_path, [f"question-{index}" for index in range(1, 31)])
+
+    spec = _parse_benchmark_specs("aime2026[3,8,13,18,23]")[0]
+    selected = _select_benchmark_records(dataset_path, spec, seed=7)
+
+    assert spec == BenchmarkSpec("aime2026", question_numbers=(3, 8, 13, 18, 23))
+    assert selected == [
+        (line, {"prompt": f"question-{line}"}) for line in (3, 8, 13, 18, 23)
+    ]
 
 
 def test_sampled_resume_keeps_only_selected_questions(tmp_path: Path) -> None:

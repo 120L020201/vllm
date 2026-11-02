@@ -13,11 +13,13 @@ from dataclasses import dataclass
 
 import torch
 from online_draft.models.qwen3_eagle3 import Eagle3KVCache
-from online_draft.training.eagle3.batch import Eagle3DistillationBatch
 from online_draft.training.eagle3.cache import (
     append_confirmed_window_to_persistent_cache,
 )
-from online_draft.training.eagle3.window import Eagle3TrainingWindow
+from online_draft.training.eagle3.window import (
+    Eagle3TrainingWindow,
+    Eagle3WindowMode,
+)
 from online_draft.training.trainer import DraftTrainer
 
 from methods.ospec_common.ensemble import (
@@ -26,6 +28,7 @@ from methods.ospec_common.ensemble import (
     export_trainable_state,
 )
 from methods.random_sampling.gating import BernoulliGate
+from methods.tts_common.batch import Eagle3DistillationBatch
 from methods.tts_common.step import train_batches
 from methods.utils.stats import WorkerStats
 
@@ -206,6 +209,7 @@ class PolicyBridge:
                 self.trainer,
                 (observation.batch,),
                 persistent_cache=self._persistent_cache,
+                mode=Eagle3WindowMode.PROPOSAL_CANVAS,
             )
             completed_updates = 1
             self._publish(
