@@ -101,7 +101,7 @@ class _Eagle3Recipe:
 
     name: ClassVar[str] = "EAGLE3"
     target_model_types: ClassVar[frozenset[str]] = frozenset(
-        {"qwen3", "qwen3_5", "gemma4"}
+        {"llama", "qwen3", "qwen3_5", "gemma4"}
     )
 
     attention_backend: str | None = None
@@ -213,7 +213,7 @@ class _DFlashRecipe:
 
     name: ClassVar[str] = "DFlash"
     target_model_types: ClassVar[frozenset[str]] = frozenset(
-        {"qwen3", "qwen3_5", "gemma4"}
+        {"llama", "qwen3", "qwen3_5", "gemma4"}
     )
 
     grouped_query_attention: bool = False

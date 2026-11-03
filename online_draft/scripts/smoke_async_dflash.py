@@ -11,6 +11,52 @@ from pathlib import Path
 
 import regex as re
 
+# Target model and its draft per method; MTP is the target checkpoint's own head.
+MODELS = {
+    "llama3.1-8b": (
+        "/data/models/Meta-Llama-3.1-8B-Instruct/Meta-Llama-3.1-8B-Instruct",
+        {
+            "dflash": (
+                "/data/models/Meta-Llama-3.1-8B-Instruct/"
+                "LLaMA3.1-8B-Instruct-DFlash-UltraChat"
+            ),
+            "eagle3": (
+                "/data/models/Meta-Llama-3.1-8B-Instruct/"
+                "sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+            ),
+        },
+    ),
+    "qwen3-8b": (
+        "/data/models/Qwen3-8B-BF16/Qwen3-8B",
+        {
+            "dflash": "/data/models/Qwen3-8B-BF16/Qwen3-8B-DFlash-b16",
+            "eagle3": "/data/models/Qwen3-8B-BF16/Qwen3-8B-eagle3",
+        },
+    ),
+    "qwen3.5-4b": (
+        "/data/models/Qwen3.5-4B-BF16/Qwen3.5-4B",
+        {
+            "dflash": "/data/models/Qwen3.5-4B-BF16/Qwen3.5-4B-DFlash",
+            "eagle3": "/data/models/Qwen3.5-4B-BF16/Qwen3.5-4B-Eagle3",
+            "mtp": None,
+        },
+    ),
+    "gemma4-e4b": (
+        "/data/models/gemma-4-E4B/gemma-4-E4B-it",
+        {"mtp": "/data/models/gemma-4-E4B/gemma-4-E4B-it-assistant"},
+    ),
+    "gemma4-26b-a4b": (
+        "/data/models/gemma-4-26B-A4B/gemma-4-26B-A4B-it",
+        {
+            "dflash": "/data/models/gemma-4-26B-A4B/gemma-4-26B-A4B-it-DFlash",
+            "eagle3": (
+                "/data/models/gemma-4-26B-A4B/gemma-4-26B-A4B-it-speculator.eagle3"
+            ),
+            "mtp": "/data/models/gemma-4-26B-A4B/gemma-4-26B-A4B-it-assistant",
+        },
+    ),
+}
+
 
 def configure_baseline_cpu(worker, threads, cpus):
     from online_draft.runtime.cpu_worker import CPUWorkerConfig
@@ -63,21 +109,6 @@ def inspect_queue_measurement(worker):
     return worker.queue_measurements
 
 
-def configure_eagle_stats(worker):
-    speculator = worker._online_draft.speculator
-    finish = speculator.finish_request
-
-    def measured_finish(request_id, initial_weights):
-        speculator.finished_request = {
-            "request_id": request_id,
-            "gpu_version": speculator.draft_weight_installer.active_version,
-            "completed_rounds": speculator.capture_adapter.completed_rounds,
-        }
-        finish(request_id, initial_weights)
-
-    speculator.finish_request = measured_finish
-
-
 def inspect_online(worker, method="dflash"):
     runtime = worker._online_draft
     if runtime is None:
@@ -85,13 +116,13 @@ def inspect_online(worker, method="dflash"):
     pipeline = runtime.pipeline
     if runtime.speculator.capture_adapter is None:
         return None
-    if method == "eagle3":
+    if method != "dflash":
         speculator = runtime.speculator
         return {
             "cpu_version": runtime.trainer.version,
             "gpu_version": speculator.draft_weight_installer.active_version,
             "finished_cpu": pipeline.finished_request,
-            "finished_gpu": speculator.finished_request,
+            "finished_gpu": speculator.online_state.finished_request,
         }
     speculator = runtime.speculator
     state = speculator.online_state
@@ -145,12 +176,15 @@ def summarize_decode(timeline, prompt_tokens):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--online", action="store_true")
-    parser.add_argument("--method", choices=("dflash", "eagle3"), default="dflash")
+    parser.add_argument("--target", choices=MODELS, default="qwen3-8b")
+    parser.add_argument("--attention-backend", default="FLASHINFER")
+    parser.add_argument(
+        "--method", choices=("dflash", "eagle3", "mtp"), default="dflash"
+    )
     parser.add_argument("--speculative-tokens", type=int, default=15)
     parser.add_argument("--train-threads", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--max-train-rounds", type=int, default=16)
-    parser.add_argument("--loss-decay-gamma", type=float, default=7.0)
     parser.add_argument("--grouped-query-attention", action="store_true")
     parser.add_argument("--selective-last-layer", action="store_true")
     parser.add_argument("--queue-metrics", action="store_true")
@@ -177,6 +211,9 @@ def main():
         parser.error("this workstation's isolation requires 1..18 training threads")
     if args.queue_metrics and (not args.online or args.method != "dflash"):
         parser.error("queue metrics require online DFlash")
+    target_model, drafts = MODELS[args.target]
+    if args.method not in drafts:
+        parser.error(f"{args.target} has no {args.method} draft")
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     os.environ["VLLM_ONLINE_DRAFT_TRAIN"] = str(int(args.online))
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -184,8 +221,34 @@ def main():
         os.environ["VLLM_ONLINE_DRAFT_PROFILE"] = "1"
     from vllm import LLM, SamplingParams
 
+    method_settings = (
+        {
+            "max_train_rounds": args.max_train_rounds,
+            "grouped_query_attention": args.grouped_query_attention,
+            "selective_last_layer": args.selective_last_layer,
+        }
+        if args.method == "dflash"
+        # Gemma4 MTP attends captured target K/V with plain SDPA.
+        else {"max_train_rounds": args.max_train_rounds}
+        if args.method == "mtp" and args.target.startswith("gemma4")
+        else {"attention_backend": "flash_attention"}
+    )
+    speculative_config = {
+        "method": args.method,
+        "num_speculative_tokens": args.speculative_tokens,
+        "attention_backend": args.attention_backend,
+    }
+    if drafts[args.method] is not None:
+        speculative_config["model"] = drafts[args.method]
+    # Qwen3.5 and Gemma4 checkpoints are multimodal; prompts are text only.
+    text_only = (
+        {"limit_mm_per_prompt": {"image": 0, "video": 0}}
+        if args.target.startswith(("qwen3.5", "gemma4"))
+        else {}
+    )
     llm = LLM(
-        model="/data/models/Qwen3-8B",
+        model=target_model,
+        **text_only,
         dtype="bfloat16",
         max_num_seqs=1,
         max_model_len=args.max_model_len,
@@ -195,7 +258,7 @@ def main():
         compilation_config={
             "mode": 0,
             "cudagraph_mode": "FULL" if args.target_graphs else "NONE",
-            "cudagraph_capture_sizes": [args.speculative_tokens + 1],
+            "cudagraph_capture_sizes": [1, args.speculative_tokens + 1],
         },
         profiler_config=(
             {
@@ -211,26 +274,16 @@ def main():
             else {}
         ),
         disable_log_stats=False,
-        attention_config={"backend": "FLASHINFER"},
-        speculative_config={
-            "method": args.method,
-            "model": "/data/models/Qwen3-8B-"
-            + ("DFlash-b16" if args.method == "dflash" else "eagle3"),
-            "num_speculative_tokens": args.speculative_tokens,
-            "attention_backend": "FLASHINFER",
-        },
+        attention_config={"backend": args.attention_backend},
+        speculative_config=speculative_config,
         additional_config={
             "online_draft": {
                 "learning_rate": args.learning_rate,
-                "max_train_rounds": args.max_train_rounds,
-                "loss_decay_gamma": args.loss_decay_gamma,
-                "grouped_query_attention": args.grouped_query_attention,
-                "selective_last_layer": args.selective_last_layer,
                 "master_weights": args.master_weights,
                 "fused_optimizer": True,
                 "check_gradients": False,
                 "log_updates": True,
-                "attention_backend": "flash_attention",
+                **method_settings,
                 "cpu_threads": (
                     {"inference": 1, "capture": 1, "training": args.train_threads}
                     if args.train_threads
@@ -281,8 +334,6 @@ def main():
         inference_cpu = llm.collective_rpc(inspect_inference_cpu)
         if args.queue_metrics:
             llm.collective_rpc(configure_queue_measurement)
-        if args.online and args.method == "eagle3":
-            llm.collective_rpc(configure_eagle_stats)
         if args.gsm8k_questions:
             from tests.evals.gsm8k.gsm8k_eval import (
                 _build_gsm8k_prompts,
@@ -300,9 +351,16 @@ def main():
             questions = [problem["prompt"] for problem in problems]
             labels = [problem["answer"] for problem in problems]
         if args.check_math:
-            from check_dflash_math import check_dflash_math
+            if args.method == "dflash":
+                from check_dflash_math import check_dflash_math as check_math
+            elif args.method == "mtp" and args.target.startswith("gemma4"):
+                from check_gemma4_mtp_math import check_gemma4_mtp_math as check_math
+            elif args.method == "mtp":
+                from check_mtp_math import check_mtp_math as check_math
+            else:
+                from check_eagle3_math import check_eagle3_math as check_math
 
-            print("math:", llm.collective_rpc(check_dflash_math), flush=True)
+            print("math:", llm.collective_rpc(check_math), flush=True)
         if args.profile_dir:
             llm.start_profile()
         for index, question in enumerate(questions):
@@ -357,7 +415,6 @@ def main():
                 "training_threads": args.train_threads,
                 "learning_rate": args.learning_rate,
                 "max_train_rounds": args.max_train_rounds,
-                "loss_decay_gamma": args.loss_decay_gamma,
                 "grouped_query_attention": args.grouped_query_attention,
                 "selective_last_layer": args.selective_last_layer,
                 "master_weights": args.master_weights,

@@ -140,13 +140,20 @@ def _online_config(method: str, **overrides) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize(
-    ("method", "name"),
-    [("eagle3", "EAGLE3"), ("dflash", "DFlash")],
+    ("method", "name", "model_type"),
+    [
+        ("eagle3", "EAGLE3", "qwen3"),
+        ("dflash", "DFlash", "qwen3"),
+        ("eagle3", "EAGLE3", "llama"),
+        ("dflash", "DFlash", "llama"),
+    ],
 )
-def test_online_draft_config_lists_unmet_requirements(method, name) -> None:
+def test_online_draft_config_lists_unmet_requirements(method, name, model_type) -> None:
     """Both methods accept chunked prefill but need one contiguous request."""
     speculator = SimpleNamespace(_speculator_name="DFlash", supports_mm_inputs=False)
-    _validate_online_draft_config(_online_config(method), speculator)
+    _validate_online_draft_config(
+        _online_config(method, model_type=model_type), speculator
+    )
 
     config = _online_config(method, max_num_seqs=2, enable_prefix_caching=True)
     with pytest.raises(

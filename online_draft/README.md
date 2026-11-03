@@ -1,7 +1,7 @@
 # 在线 draft 训练代码导航
 
-这里实现 EAGLE3、DFlash 和 MTP 的请求内异步 CPU 在线训练（target 支持 Qwen3 与
-Qwen3.5，MTP 仅 Qwen3.5）。运行时使用单 GPU、
+这里实现 EAGLE3、DFlash 和 MTP 的请求内异步 CPU 在线训练（EAGLE3/DFlash target 支持
+Llama 3.1、Qwen3、Qwen3.5 与 Gemma4，MTP 支持 Qwen3.5 与 Gemma4）。运行时使用单 GPU、
 单活动请求：GPU 持续推理，后台采集线程搬运数据，后台训练线程更新 CPU draft，
 推理线程在安全位置安装已完成上传的新权重。每个请求结束后恢复初始权重 W0。
 
@@ -18,6 +18,7 @@ online_draft/
 │   │   ├── qwen3_eagle3.py           # EAGLE3（Qwen3 与 Qwen3.5 draft）
 │   │   ├── qwen3_dflash.py           # DFlash，逐层因果与滑动窗口
 │   │   ├── qwen3_5_mtp.py            # Qwen3.5 MTP（门控注意力）
+│   │   ├── gemma4_mtp.py             # Gemma4 MTP（只有 Q，读 target KV）
 │   │   ├── cpu_attention.py           # CPU attention / autograd 接入
 │   │   └── csrc/attention_backward.cpp
 │   ├── runtime/                      # 采集、搬运、调度与权重交接
@@ -25,6 +26,7 @@ online_draft/
 │   │   ├── capture/
 │   │   │   ├── base.py               # 共用 packet、adapter 状态机、历史构造器
 │   │   │   ├── eagle3.py             # EAGLE3 staging 布局、采集字段、batch 组装
+│   │   │   ├── gemma4_mtp.py         # EAGLE3 packet 加上 target KV 行
 │   │   │   └── dflash.py             # DFlash 同上
 │   │   ├── transport.py              # pinned staging、capture FIFO、D2H、event、finish
 │   │   ├── async_pipeline.py         # 训练 FIFO、窗口、snapshot、reset
@@ -39,6 +41,8 @@ online_draft/
 │       │   ├── distill.py            # teacher 分布、监督权重与 KL
 │       │   ├── cache.py              # detached context、确认历史 KV 追加
 │       │   └── window.py             # 多轮窗口及训练入口
+│       ├── gemma4_mtp/
+│       │   └── window.py             # 追加 target KV、anchor 位置的 query、窗口训练
 │       └── dflash/
 │           ├── batch.py              # 单轮 query block 定义
 │           ├── distill.py            # 位置衰减权重与 KL
@@ -59,6 +63,8 @@ vllm/v1/worker/
         │   └── speculator.py         # EAGLE3：采集 aux hidden
         ├── mtp/
         │   └── speculator.py         # MTP：采集 target 最终 hidden
+        ├── gemma4/
+        │   └── speculator.py         # Gemma4 MTP：另外按 slot 读 target KV
         ├── autoregressive/
         │   ├── online.py             # EAGLE3 与 MTP 共用的在线采集钩子
         │   └── speculator.py         # EAGLE 等自回归推测解码共用路径
@@ -200,7 +206,7 @@ EAGLE3 与 MTP 在线时同样为每个 slot 捕获一套 prefill/decode FULL gr
 | 配置 | 要求 |
 | --- | --- |
 | `speculative_config.method` | `eagle3`、`dflash` 或 `mtp` |
-| target `model_type` | EAGLE3 / DFlash：`qwen3` 或 `qwen3_5`；MTP：`qwen3_5` |
+| target `model_type` | EAGLE3 / DFlash：`llama`、`qwen3`、`qwen3_5` 或 `gemma4`；MTP：`qwen3_5`、`gemma4` 或 `gemma4_unified` |
 | `tensor_parallel_size` / `pipeline_parallel_size` | 1 |
 | `max_num_seqs` | 1 |
 | `enable_prefix_caching` | `False` |
@@ -230,10 +236,14 @@ CPU attention backward 使用独立 C++ extension，需要 C++ 编译器和 Ninj
 | `cpu_affinity` | 全部 | `{}` | 同上三个角色绑定的 CPU 列表 |
 | `attention_backend` | EAGLE3、MTP | `"eager"` | CPU attention：`"eager"` 或 `"flash_attention"` |
 | `max_train_rounds` | 全部 | `0` | 每次训练只用两次安装之间最近 N 个 round；0 表示全部 |
+| `rebuild_kv` | EAGLE3、Qwen3.5 MTP、DFlash | `True` | 训练更新后重新投影 confirmed KV；关闭时复用训练前已构造的 KV |
 | `grouped_query_attention` | DFlash | `False` | CPU attention 按 GQA 重排，不展开历史 K/V |
 | `selective_last_layer` | DFlash | `False` | 最后一层只计算监督行 |
 
-MTP 与 target 共享 lm_head，不训练 lm_head。EAGLE3 draft 的 lm_head 与 target
+MTP 与 target 共享 lm_head，不训练 lm_head。Gemma4 MTP（assistant）的 lm_head
+是自有参数，同样冻结；`post_projection` 只把输出送回下一个 draft 步，而这些输入是
+捕获的固定值，得不到梯度，因此也冻结。Gemma4 MTP 只接受 `max_train_rounds` 和
+公共键，CPU attention 固定用 SDPA。EAGLE3 draft 的 lm_head 与 target
 完全相同时（例如 Qwen3.6-27B PRISM `full`），vLLM 会共享它，需设置
 `frozen_parameter_prefixes: ["lm_head"]`。
 
@@ -339,6 +349,12 @@ Qwen3-8B 的扫描（`results/experiments/2026-10-28_dflash_train_rounds_8b_9b`�
 lr 1e-4，前 8 题）中，0 的窗口最大到 2,450 个 round，接受长度 3.23，低于 frozen 的 3.55；
 16 为 3.76。
 
+`rebuild_kv` 默认开启，使用 optimizer 更新后的权重重新生成本窗口新增的 confirmed KV。
+关闭后会复用训练 forward 前构造的 KV，因此这些新增位置保留更新前的 CPU 权重版本；这是
+与历史 KV 混合版本相同的近似，可减少一次 CPU KV 投影。对于当前的一层 EAGLE3 和 Qwen3.5 MTP，
+spine/rebuild 只执行输入 norm 与 K/V projection，不运行 attention、MLP 或最终 norm。
+Gemma4 MTP 直接复用 target KV，因此不接受这个配置项。
+
 DFlash 的实验用写法二绑核，并在启动命令中设置
 `OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OMP_WAIT_POLICY=PASSIVE`。
 
@@ -350,7 +366,25 @@ DFlash 的实验用写法二绑核，并在启动命令中设置
 | `--target` | 可用 `--method` |
 | --- | --- |
 | `qwen3-8b`（默认） | `dflash`、`eagle3` |
+| `llama3.1-8b` | `dflash`、`eagle3` |
 | `qwen3.5-4b` | `dflash`、`eagle3`、`mtp` |
+| `gemma4-e4b` | `mtp` |
+| `gemma4-26b-a4b` | `dflash`、`eagle3`、`mtp` |
+
+Llama 3.1-8B 本地模型可分别用以下命令做短请求 smoke。该 DFlash checkpoint 的
+block size 是 10，因此设 `--speculative-tokens 9`；EAGLE3 示例用 3：
+
+```bash
+.venv/bin/python online_draft/scripts/smoke_async_dflash.py \
+  --online --target llama3.1-8b --method dflash --speculative-tokens 9 \
+  --attention-backend FLASH_ATTN --max-tokens 128 --requests 1 \
+  --output /tmp/llama31-dflash-online.json
+
+.venv/bin/python online_draft/scripts/smoke_async_dflash.py \
+  --online --target llama3.1-8b --method eagle3 --speculative-tokens 3 \
+  --attention-backend FLASH_ATTN --max-tokens 128 --requests 1 \
+  --output /tmp/llama31-eagle3-online.json
+```
 
 ```bash
 # Qwen3.5-4B 三种方法的 CPU/GPU 对拍与在线 smoke
@@ -399,8 +433,9 @@ MTP 与 DFlash 常用的 `--speculative-tokens` 分别为 3 和 15。去掉 `--o
   EAGLE3 单请求与两请求实机 smoke；在线运行需外部设置 `VLLM_USE_V2_MODEL_RUNNER=1`
   和 `VLLM_ONLINE_DRAFT_TRAIN=1`。
 - [`check_dflash_math.py`](scripts/check_dflash_math.py)、
-  [`check_eagle3_math.py`](scripts/check_eagle3_math.py) 与
-  [`check_mtp_math.py`](scripts/check_mtp_math.py)：`smoke_async_dflash.py --online
+  [`check_eagle3_math.py`](scripts/check_eagle3_math.py)、
+  [`check_mtp_math.py`](scripts/check_mtp_math.py) 与
+  [`check_gemma4_mtp_math.py`](scripts/check_gemma4_mtp_math.py)：`smoke_async_dflash.py --online
   --check-math` 按方法调用的 CPU/GPU 实机对拍，覆盖完整前向、安装后的权重与 reset。
 - [`summarize_dflash_trace.py`](scripts/summarize_dflash_trace.py)：解析 profiler trace。
 - [`benchmark_aime_2026.py`](scripts/benchmark_aime_2026.py)：AIME 公共 runner，支持
