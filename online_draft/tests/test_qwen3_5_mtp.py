@@ -57,6 +57,28 @@ def test_cached_forward_matches_full_forward() -> None:
     assert full.recurrent_hidden_states is full.hidden_states
 
 
+def test_context_kv_projection_matches_full_forward() -> None:
+    model = _model()
+    positions = torch.arange(5)
+    embeds, hidden = torch.randn(5, HIDDEN), torch.randn(5, HIDDEN)
+
+    with torch.no_grad():
+        full = model(positions, embeds, hidden)
+        projected = model.project_context_kv(
+            positions=positions,
+            input_embeds=embeds,
+            hidden_states=hidden,
+        )
+
+    for full_layer, projected_layer in zip(
+        full.past_key_values, projected, strict=True
+    ):
+        for full_tensor, projected_tensor in zip(
+            full_layer, projected_layer, strict=True
+        ):
+            torch.testing.assert_close(full_tensor, projected_tensor)
+
+
 def test_window_training_updates_mtp_weights_but_not_the_shared_head() -> None:
     """MTP trains through the EAGLE3 window with one target feature row."""
     model = _model()

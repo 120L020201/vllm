@@ -111,14 +111,13 @@ def _append_fixed_inputs(
     # gives ordinary detached tensors that autograd may read as constants.
     with torch.inference_mode(False), torch.no_grad():
         new_hidden_states = model.combine_hidden_states(new_auxiliary_hidden_states)
-        output = model(
+        new_cache = model.project_context_kv(
             positions=new_positions,
             input_embeds=new_input_embeds,
             hidden_states=new_hidden_states,
             past_key_values=cache,
         )
-
-    return _detach_cache(output.past_key_values)
+    return _detach_cache(new_cache)
 
 
 def _detach_cache(

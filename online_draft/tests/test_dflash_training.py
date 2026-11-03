@@ -225,6 +225,28 @@ def test_window_preserves_old_kv_and_reprojects_increment_with_updated_weights()
             torch.testing.assert_close(new, right[:, 6:])
 
 
+def test_disabling_rebuild_reuses_context_projected_for_training():
+    model = tiny_model()
+    trainer = DraftTrainer(model, TrainerConfig(learning_rate=1e-3))
+    batch = make_batch(5, 1, prompt=True)
+    features = torch.cat((batch.prompt_fc, batch.confirmed_fc))
+    expected = model.project_context(features, torch.arange(7))
+
+    cache, result = train_dflash_window(
+        trainer,
+        (batch,),
+        None,
+        rebuild_kv=False,
+    )
+
+    assert result.model_version == 1
+    assert cache.length == 7
+    assert cache.segments == ((7, 0),)
+    for actual_layer, expected_layer in zip(cache.layers, expected, strict=True):
+        for actual, expected_tensor in zip(actual_layer, expected_layer, strict=True):
+            torch.testing.assert_close(actual, expected_tensor)
+
+
 def test_masked_suffix_remains_part_of_noncausal_forward():
     model = tiny_model()
     batch = make_batch(5, 0, prompt=True)

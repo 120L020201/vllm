@@ -44,6 +44,17 @@ class AutoregressiveDraftModel(Protocol):
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
 
+    def project_context_kv(
+        self,
+        *,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_values: tuple[LayerKV, ...] | None,
+    ) -> tuple[LayerKV, ...]:
+        """Build context KV for confirmed rows, reusing compatible history."""
+        ...
+
     def __call__(
         self,
         *,

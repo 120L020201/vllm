@@ -153,6 +153,52 @@ class Qwen3_5MTPForCausalLM(nn.Module):
         """MTP consumes the target's final hidden state as captured."""
         return auxiliary_hidden_states
 
+    @torch.no_grad()
+    def project_context_kv(
+        self,
+        *,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_values: tuple[LayerKV, ...] | None = None,
+    ) -> tuple[LayerKV, ...]:
+        """Project context K/V without running attention or the MLP."""
+        model = self.model
+        hidden_states = model.fc(
+            torch.cat(
+                (
+                    model.pre_fc_norm_embedding(input_embeds),
+                    model.pre_fc_norm_hidden(hidden_states),
+                ),
+                dim=-1,
+            )
+        )
+        layer = model.layers[0]
+        hidden_states = layer.input_layernorm(hidden_states)
+        config = self.config
+        query_gate_size = 2 * config.num_attention_heads * config.head_dim
+        kv_size = config.num_key_value_heads * config.head_dim
+        qkv_proj = layer.self_attn.qkv_proj
+        key, value = torch.nn.functional.linear(
+            hidden_states, qkv_proj.weight[query_gate_size:]
+        ).split((kv_size, kv_size), dim=-1)
+        tokens = hidden_states.shape[0]
+        key = key.view(tokens, config.num_key_value_heads, config.head_dim)
+        key = layer.self_attn.k_norm(key).transpose(0, 1)
+        value = value.view(
+            tokens, config.num_key_value_heads, config.head_dim
+        ).transpose(0, 1)
+        _, key = layer.self_attn.rotary_emb(key, key, positions)
+        if past_key_values is None:
+            return ((key, value),)
+        past_key, past_value = past_key_values[0]
+        return (
+            (
+                torch.cat((past_key, key), dim=1),
+                torch.cat((past_value, value), dim=1),
+            ),
+        )
+
     def forward(
         self,
         positions: torch.Tensor,

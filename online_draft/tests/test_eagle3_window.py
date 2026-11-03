@@ -301,9 +301,7 @@ def test_confirmed_path_window_uses_one_optimizer_step() -> None:
         lm_head_handle.remove()
 
     assert forward_records == [
-        ([0, 1, 2, 3, 4, 5, 6, 7], False),
         ([1, 2, 3, 5, 6], True),
-        ([0, 1, 2, 3, 4, 5, 6, 7], False),
     ]
     assert lm_head_token_counts == [5]
 
@@ -377,7 +375,7 @@ def test_max_train_rounds_trains_recent_rows_over_the_full_spine() -> None:
     cache, result, positions, rows = train(model, max_train_rounds=1)
     _, _, _, full_rows = train(full_model)
 
-    assert positions == [list(range(8)), [5, 6], list(range(8))]
+    assert positions == [[5, 6]]
     torch.testing.assert_close(rows, full_rows[-2:])
     assert result.round_count == 1
     assert result.target_count == 2
@@ -418,6 +416,27 @@ def test_profile_timeline_labels_training_stages() -> None:
         "online_draft.optimizer",
         "online_draft.rebuild_cache",
     } <= names
+
+
+def test_disabling_rebuild_reuses_pre_update_spine() -> None:
+    torch.manual_seed(12)
+    model = _make_model()
+    trainer = DraftTrainer(model, TrainerConfig(learning_rate=1e-2))
+    window = Eagle3TrainingWindow(
+        rounds=(_make_batch(anchor_position=1, rejection_position=1),),
+    )
+    expected = append_confirmed_window_to_persistent_cache(model, window, None)
+
+    cache, result = train_eagle3_rounds(
+        trainer,
+        window.rounds,
+        None,
+        rebuild_kv=False,
+    )
+
+    assert result.model_version == 1
+    _assert_cache_close(cache, expected)
+    assert cache[0][0].shape[1] == result.persistent_cache_length
 
 
 def test_later_confirmed_path_window_preserves_fixed_history() -> None:
@@ -493,9 +512,7 @@ def test_later_confirmed_path_window_preserves_fixed_history() -> None:
         handle.remove()
 
     assert forward_records == [
-        ([3, 4, 5, 6], False),
         ([2, 3, 5], True),
-        ([3, 4, 5, 6], False),
     ]
     assert trainer.version == 1
     assert result.round_count == 2

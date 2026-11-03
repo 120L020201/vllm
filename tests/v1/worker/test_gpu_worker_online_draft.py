@@ -216,6 +216,13 @@ def test_online_draft_max_train_rounds_defaults_to_every_round(recipe) -> None:
         _parse_online_draft_settings({"max_train_rounds": -1}, recipe)
 
 
+@pytest.mark.parametrize("recipe", [_Eagle3Recipe, _MTPRecipe, _DFlashRecipe])
+def test_rebuild_kv_is_configurable_and_enabled_by_default(recipe) -> None:
+    assert _parse_online_draft_settings({}, recipe).recipe.rebuild_kv is True
+    settings = _parse_online_draft_settings({"rebuild_kv": False}, recipe)
+    assert settings.recipe.rebuild_kv is False
+
+
 def test_online_mtp_requires_a_qwen3_5_target() -> None:
     """The CPU MTP layer mirrors Qwen3.5's gated attention only."""
     speculator = SimpleNamespace(_speculator_name="MTP", supports_mm_inputs=False)

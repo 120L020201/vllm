@@ -315,6 +315,44 @@ class Qwen3Eagle3DecoderLayer(nn.Module):
 
         return hidden_states, residual, present_key_value
 
+    @torch.no_grad()
+    def project_context_kv(
+        self,
+        *,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> LayerKV:
+        """Project context K/V without computing attention or the MLP."""
+        if self.layer_index != 0:
+            raise ValueError("context KV projection requires the first draft layer")
+
+        normalized_embeds = cast(torch.Tensor, self.input_layernorm(input_embeds))
+        normalized_hidden, _ = self._normalize_first_layer_hidden_states(hidden_states)
+        layer_input = torch.cat((normalized_embeds, normalized_hidden), dim=-1)
+        query_size = self.self_attn.num_attention_heads * self.self_attn.head_dim
+        key_value_size = self.self_attn.num_key_value_heads * self.self_attn.head_dim
+        qkv_proj = self.self_attn.qkv_proj
+        kv_bias = None if qkv_proj.bias is None else qkv_proj.bias[query_size:]
+        key, value = torch.nn.functional.linear(
+            layer_input, qkv_proj.weight[query_size:], kv_bias
+        ).split((key_value_size, key_value_size), dim=-1)
+        sequence_length = key.shape[0]
+        key = key.view(
+            sequence_length,
+            self.self_attn.num_key_value_heads,
+            self.self_attn.head_dim,
+        )
+        key = key.transpose(0, 1)
+        value = value.view(
+            sequence_length,
+            self.self_attn.num_key_value_heads,
+            self.self_attn.head_dim,
+        )
+        value = value.transpose(0, 1)
+        _, key = self.self_attn.rotary_emb(key, key, positions)
+        return key, value
+
     def _normalize_first_layer_hidden_states(
         self,
         hidden_states: torch.Tensor,
@@ -457,6 +495,34 @@ class Qwen3Eagle3Model(nn.Module):
             past_key_values=tuple(present_key_values),
         )
 
+    @torch.no_grad()
+    def project_context_kv(
+        self,
+        *,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_values: Eagle3KVCache | None,
+    ) -> Eagle3KVCache:
+        suffix = (
+            self.layers[0].project_context_kv(
+                positions=positions,
+                input_embeds=input_embeds,
+                hidden_states=hidden_states,
+            ),
+        )
+        if past_key_values is None:
+            return suffix
+        return tuple(
+            (
+                torch.cat((past_key[0], new_key), dim=1),
+                torch.cat((past_key[1], new_value), dim=1),
+            )
+            for past_key, (new_key, new_value) in zip(
+                past_key_values, suffix, strict=True
+            )
+        )
+
 
 class Qwen3Eagle3ForCausalLM(nn.Module):
     def __init__(
@@ -503,6 +569,29 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         auxiliary_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.model.combine_hidden_states(auxiliary_hidden_states)
+
+    @torch.no_grad()
+    def project_context_kv(
+        self,
+        *,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_values: Eagle3KVCache | None = None,
+    ) -> Eagle3KVCache:
+        if len(self.model.layers) != 1:
+            return self(
+                positions=positions,
+                input_embeds=input_embeds,
+                hidden_states=hidden_states,
+                past_key_values=past_key_values,
+            ).past_key_values
+        return self.model.project_context_kv(
+            positions=positions,
+            input_embeds=input_embeds,
+            hidden_states=hidden_states,
+            past_key_values=past_key_values,
+        )
 
     def compute_draft_logits(
         self,

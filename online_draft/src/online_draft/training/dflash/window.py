@@ -51,6 +51,7 @@ def forward_dflash_window(
     rounds: tuple[DFlashBatch, ...],
     cache: DFlashCache | None,
     max_train_rounds: int = 0,
+    prepared_context: ContextKV | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return aligned logits and teacher probabilities for selected full blocks."""
     old_length = 0 if cache is None else cache.length
@@ -76,7 +77,12 @@ def forward_dflash_window(
         query_length += query_count
         teachers.append(batch.teacher_probabilities)
 
-    if new_features:
+    if prepared_context is not None:
+        context = tuple(
+            (key[:, :context_length], value[:, :context_length])
+            for key, value in prepared_context
+        )
+    elif new_features:
         context = append_context(
             context,
             model.project_context(
@@ -115,37 +121,61 @@ def train_dflash_window(
     profile_timeline: bool = False,
     *,
     max_train_rounds: int = 0,
+    rebuild_kv: bool = True,
 ) -> tuple[DFlashCache, DFlashWindowResult]:
     """Train recent complete blocks; append all confirmed target context KV."""
     model = cast(Qwen3DFlashForCausalLM, trainer.model)
     old_length = 0 if cache is None else cache.length
     selected = rounds[_first_query_round(rounds, max_train_rounds) :]
+    source_context_version = trainer.version
+    prepared_context = None
+    if not rebuild_kv:
+        features = []
+        if rounds[0].prompt_fc is not None:
+            features.append(rounds[0].prompt_fc)
+        features.extend(batch.confirmed_fc for batch in rounds)
+        total_length = sum(feature.shape[0] for feature in features)
+        positions = torch.arange(old_length, old_length + total_length)
+        prepared_context = append_context(
+            None if cache is None else cache.layers,
+            model.project_context(torch.cat(features), positions),
+        )
     with torch.inference_mode(False), torch.enable_grad():
         with profile_range("online_draft.forward", profile_timeline):
             logits, teacher = forward_dflash_window(
-                model, rounds, cache, max_train_rounds
+                model,
+                rounds,
+                cache,
+                max_train_rounds,
+                prepared_context,
             )
         with profile_range("online_draft.loss", profile_timeline):
             loss = dflash_kl_loss(logits, teacher, position_weights(selected))
         loss_value = trainer.backward_and_step(loss, profile_timeline=profile_timeline)
         del loss, logits, teacher
 
-    new_features = [batch.confirmed_fc for batch in rounds]
-    if rounds[0].prompt_fc is not None:
-        new_features.insert(0, rounds[0].prompt_fc)
-    features = torch.cat(new_features)
-    positions = torch.arange(old_length, old_length + features.shape[0])
-    with (
-        torch.inference_mode(False),
-        torch.no_grad(),
-        profile_range("online_draft.rebuild_cache", profile_timeline),
-    ):
-        layers = append_context(
-            None if cache is None else cache.layers,
-            model.project_context(features, positions),
-        )
-    end = old_length + features.shape[0]
-    segments = (() if cache is None else cache.segments) + ((end, trainer.version),)
+    if rebuild_kv:
+        new_features = [batch.confirmed_fc for batch in rounds]
+        if rounds[0].prompt_fc is not None:
+            new_features.insert(0, rounds[0].prompt_fc)
+        features = torch.cat(new_features)
+        positions = torch.arange(old_length, old_length + features.shape[0])
+        with (
+            torch.inference_mode(False),
+            torch.no_grad(),
+            profile_range("online_draft.rebuild_cache", profile_timeline),
+        ):
+            layers = append_context(
+                None if cache is None else cache.layers,
+                model.project_context(features, positions),
+            )
+        context_version = trainer.version
+    else:
+        assert prepared_context is not None
+        layers = prepared_context
+        context_version = source_context_version
+    end = layers[0][0].shape[1]
+    segments = (() if cache is None else cache.segments) + ((end, context_version),)
     updated = DFlashCache(layers, segments)
     return updated, DFlashWindowResult(
         model_version=trainer.version,

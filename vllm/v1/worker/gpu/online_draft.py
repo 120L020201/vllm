@@ -106,6 +106,7 @@ class _Eagle3Recipe:
 
     attention_backend: str | None = None
     max_train_rounds: int = 0
+    rebuild_kv: bool = True
 
     def __post_init__(self) -> None:
         _check_max_train_rounds(self.max_train_rounds)
@@ -124,7 +125,11 @@ class _Eagle3Recipe:
         assert isinstance(speculator, EagleSpeculator)
 
     def train_rounds(self) -> TrainRounds:
-        return partial(train_eagle3_rounds, max_train_rounds=self.max_train_rounds)
+        return partial(
+            train_eagle3_rounds,
+            max_train_rounds=self.max_train_rounds,
+            rebuild_kv=self.rebuild_kv,
+        )
 
     def create_adapter(
         self,
@@ -155,6 +160,7 @@ class _MTPRecipe:
 
     attention_backend: str | None = None
     max_train_rounds: int = 0
+    rebuild_kv: bool = True
 
     def __post_init__(self) -> None:
         _check_max_train_rounds(self.max_train_rounds)
@@ -180,7 +186,11 @@ class _MTPRecipe:
         )
 
     def train_rounds(self) -> TrainRounds:
-        return partial(train_eagle3_rounds, max_train_rounds=self.max_train_rounds)
+        return partial(
+            train_eagle3_rounds,
+            max_train_rounds=self.max_train_rounds,
+            rebuild_kv=self.rebuild_kv,
+        )
 
     def create_adapter(
         self,
@@ -209,6 +219,7 @@ class _DFlashRecipe:
     grouped_query_attention: bool = False
     selective_last_layer: bool = False
     max_train_rounds: int = 0
+    rebuild_kv: bool = True
 
     def __post_init__(self) -> None:
         _check_max_train_rounds(self.max_train_rounds)
@@ -239,7 +250,11 @@ class _DFlashRecipe:
     def train_rounds(self) -> TrainRounds:
         from online_draft.training.dflash.window import train_dflash_window
 
-        return partial(train_dflash_window, max_train_rounds=self.max_train_rounds)
+        return partial(
+            train_dflash_window,
+            max_train_rounds=self.max_train_rounds,
+            rebuild_kv=self.rebuild_kv,
+        )
 
     def create_adapter(
         self,

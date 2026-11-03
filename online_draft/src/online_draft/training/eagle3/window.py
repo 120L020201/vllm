@@ -113,6 +113,7 @@ def train_eagle3_rounds(
     *,
     mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
     max_train_rounds: int = 0,
+    rebuild_kv: bool = True,
 ) -> tuple[Eagle3KVCache, Eagle3WindowResult]:
     """Train the rounds selected by the shared asynchronous pipeline."""
     return train_eagle3_window(
@@ -122,6 +123,7 @@ def train_eagle3_rounds(
         mode,
         profile_timeline,
         max_train_rounds=max_train_rounds,
+        rebuild_kv=rebuild_kv,
     )
 
 
@@ -133,6 +135,7 @@ def train_eagle3_window(
     profile_timeline: bool = False,
     *,
     max_train_rounds: int = 0,
+    rebuild_kv: bool = True,
 ) -> tuple[Eagle3KVCache, Eagle3WindowResult]:
     """Train one EAGLE3 window with one optimizer update.
 
@@ -224,15 +227,17 @@ def train_eagle3_window(
         del hidden_states_for_loss
         del output
         del training_inputs
-        del training_prefix
 
-    with profile_range("online_draft.rebuild_cache", profile_timeline):
-        updated_cache = _append_confirmed_window(
-            model,
-            window,
-            persistent_cache,
-        )
-        updated_cache_length = persistent_cache_length(updated_cache)
+    if rebuild_kv:
+        with profile_range("online_draft.rebuild_cache", profile_timeline):
+            updated_cache = _append_confirmed_window(
+                model,
+                window,
+                persistent_cache,
+            )
+    else:
+        updated_cache = training_prefix
+    updated_cache_length = persistent_cache_length(updated_cache)
 
     result = Eagle3WindowResult(
         loss=loss_value,
