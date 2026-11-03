@@ -9,6 +9,7 @@ with the target model via cross-model KV sharing.
 
 from collections import defaultdict
 
+import torch
 import torch.nn as nn
 
 from vllm.compilation.backends import set_model_tag
@@ -16,6 +17,9 @@ from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.worker.gpu.spec_decode.autoregressive.online import (
+    AutoRegressiveOnlineDraft,
+)
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
@@ -23,7 +27,27 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
 logger = init_logger(__name__)
 
 
-class Gemma4Speculator(AutoRegressiveSpeculator):
+def _read_kv(attn: nn.Module, slots: torch.Tensor) -> torch.Tensor:
+    """Gather [tokens, kv_heads, 2 * head_dim] K|V rows from a paged cache."""
+    kv_cache = attn.kv_cache
+    backend = attn.attn_backend.get_name()
+    if backend == "TRITON_ATTN":
+        # (num_blocks, kv_heads, block_size, 2 * head_dim)
+        block_size = kv_cache.shape[2]
+        return kv_cache[slots // block_size, :, slots % block_size]
+    if backend == "FLASH_ATTN":
+        # (2, num_blocks, block_size, kv_heads, head_dim)
+        block_size = kv_cache.shape[2]
+        key, value = kv_cache[:, slots // block_size, slots % block_size]
+        return torch.cat((key, value), dim=-1)
+    raise NotImplementedError(f"online Gemma4 MTP does not read {backend} KV")
+
+
+class Gemma4Speculator(AutoRegressiveOnlineDraft, AutoRegressiveSpeculator):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        self._init_autoregressive_online_draft()
+
     @property
     def advance_draft_positions(self) -> bool:
         # Gemma4 MTP is Q-only and reads K/V from the target's existing cache.
@@ -44,7 +68,30 @@ class Gemma4Speculator(AutoRegressiveSpeculator):
             )
         self._setup_gemma4_kv_sharing(draft_model, target_attn_layer_names)
         self._share_embeddings(draft_model, target_model)
+        self._keep_online_target(target_model)
         return draft_model
+
+    def _online_target_features(
+        self,
+        aux_hidden_states: list[torch.Tensor] | None,
+        target_hidden_states: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        assert target_hidden_states is not None
+        return [target_hidden_states]
+
+    def _online_target_kv(
+        self, slot_mappings: dict[str, torch.Tensor] | None, num_tokens: int
+    ) -> dict[str, torch.Tensor]:
+        """The target K/V the draft layers read, for this step's rows."""
+        assert slot_mappings is not None
+        rows = {}
+        for layer in self.model.model.layers:
+            attn = layer.self_attn.attn
+            name = "sliding_kv" if layer.self_attn.is_sliding else "full_kv"
+            if name not in rows:
+                slots = slot_mappings[attn.kv_sharing_target_layer_name][:num_tokens]
+                rows[name] = _read_kv(attn, slots)
+        return rows
 
     def _create_draft_vllm_config(self) -> VllmConfig:
         """Preserve the target's forced TRITON_ATTN backend for draft layers.

@@ -123,7 +123,7 @@ def _online_config(method: str, **overrides) -> SimpleNamespace:
         **overrides,
     }
     return SimpleNamespace(
-        speculative_config=SimpleNamespace(method=method),
+        speculative_config=SimpleNamespace(method=method, use_gemma4_mtp=lambda: False),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, pipeline_parallel_size=1
         ),

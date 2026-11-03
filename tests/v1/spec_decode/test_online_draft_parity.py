@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from online_draft.models.gemma4_mtp import Gemma4MLP
 from online_draft.models.layers import (
     GatedMLP,
     RMSNorm,
@@ -31,7 +32,7 @@ from online_draft.models.qwen3_eagle3 import (
     load_qwen3_eagle3_from_vllm,
 )
 
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -51,6 +52,8 @@ LLAMA3 = {
     "high_freq_factor": 4.0,
     "original_max_position_embeddings": 64,
 }
+# Gemma4 MTP full-attention layers.
+GEMMA4_FULL = {"rope_type": "proportional", "partial_rotary_factor": 0.25}
 
 
 def _rope(head_dim: int, dtype: torch.dtype = torch.float32, **parameters):
@@ -115,7 +118,7 @@ def test_rotary_matches_vllm(default_vllm_config, dtype, rope_parameters) -> Non
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("rope_parameters", [YARN, LLAMA3])
+@pytest.mark.parametrize("rope_parameters", [YARN, LLAMA3, GEMMA4_FULL])
 def test_copied_rotary_table_matches_scaled_vllm_rope(
     default_vllm_config, dtype, rope_parameters
 ) -> None:
@@ -154,6 +157,18 @@ def test_mlp_activation_matches_vllm(default_vllm_config) -> None:
     hidden = torch.randn(5, 16)
 
     expected = mlp.down_proj(SiluAndMul.forward_native(mlp.gate_up_proj(hidden)))
+
+    torch.testing.assert_close(mlp(hidden), expected)
+
+
+def test_gemma4_mlp_activation_matches_vllm(default_vllm_config) -> None:
+    torch.manual_seed(0)
+    mlp = Gemma4MLP(16, 32)
+    hidden = torch.randn(5, 16)
+
+    expected = mlp.down_proj(
+        GeluAndMul(approximate="tanh").forward_native(mlp.gate_up_proj(hidden))
+    )
 
     torch.testing.assert_close(mlp(hidden), expected)
 

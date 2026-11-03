@@ -100,7 +100,9 @@ class _Eagle3Recipe:
     """EAGLE3 captures before its trainable FC; fields are its settings."""
 
     name: ClassVar[str] = "EAGLE3"
-    target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3", "qwen3_5"})
+    target_model_types: ClassVar[frozenset[str]] = frozenset(
+        {"qwen3", "qwen3_5", "gemma4"}
+    )
 
     attention_backend: str | None = None
     max_train_rounds: int = 0
@@ -200,7 +202,9 @@ class _DFlashRecipe:
     """DFlash captures its frozen FC output; fields are its settings."""
 
     name: ClassVar[str] = "DFlash"
-    target_model_types: ClassVar[frozenset[str]] = frozenset({"qwen3", "qwen3_5"})
+    target_model_types: ClassVar[frozenset[str]] = frozenset(
+        {"qwen3", "qwen3_5", "gemma4"}
+    )
 
     grouped_query_attention: bool = False
     selective_last_layer: bool = False
@@ -266,7 +270,74 @@ class _DFlashRecipe:
         )
 
 
-_Recipe = _Eagle3Recipe | _DFlashRecipe | _MTPRecipe
+@dataclass(frozen=True, kw_only=True)
+class _Gemma4MTPRecipe:
+    """Gemma4 MTP is Q-only over the target's K/V, so it captures that K/V."""
+
+    name: ClassVar[str] = "Gemma4 MTP"
+    target_model_types: ClassVar[frozenset[str]] = frozenset(
+        {"gemma4", "gemma4_unified"}
+    )
+
+    max_train_rounds: int = 0
+
+    def __post_init__(self) -> None:
+        _check_max_train_rounds(self.max_train_rounds)
+
+    @staticmethod
+    def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
+        assert vllm_config.speculative_config is not None
+        return vllm_config.speculative_config.use_gemma4_mtp()
+
+    def load_model(self, gpu_draft_model: nn.Module) -> nn.Module:
+        from online_draft.models.gemma4_mtp import load_gemma4_mtp_from_vllm
+
+        return load_gemma4_mtp_from_vllm(gpu_draft_model)
+
+    def check(self, trainer: DraftTrainer, speculator: Any) -> None:
+        from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
+            Gemma4Speculator,
+        )
+
+        assert isinstance(speculator, Gemma4Speculator)
+
+    def train_rounds(self) -> TrainRounds:
+        from online_draft.training.gemma4_mtp.window import train_gemma4_mtp_window
+
+        return partial(train_gemma4_mtp_window, max_train_rounds=self.max_train_rounds)
+
+    def create_adapter(
+        self,
+        vllm_config: VllmConfig,
+        cpu_model: nn.Module,
+        device: torch.device,
+        **capture: Any,
+    ) -> Eagle3CaptureAdapter:
+        from online_draft.models.gemma4_mtp import Gemma4MTPForCausalLM
+        from online_draft.runtime.capture.gemma4_mtp import (
+            Gemma4MTPCaptureAdapter,
+            Gemma4MTPCaptureBuffers,
+        )
+
+        assert isinstance(cpu_model, Gemma4MTPForCausalLM)
+        assert vllm_config.speculative_config is not None
+        model_config = vllm_config.model_config
+        config = cpu_model.config
+        return Gemma4MTPCaptureAdapter(
+            buffers=Gemma4MTPCaptureBuffers(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.speculative_config.num_speculative_tokens,
+                config.backbone_hidden_size,
+                config.vocab_size,
+                config.kv_shapes,
+                dtype=model_config.dtype,
+                teacher_dtype=model_config.head_dtype or model_config.dtype,
+            ),
+            **capture,
+        )
+
+
+_Recipe = _Eagle3Recipe | _DFlashRecipe | _MTPRecipe | _Gemma4MTPRecipe
 
 # Setting name -> TrainerConfig field.
 _TRAINER_SETTINGS = {
@@ -297,6 +368,8 @@ def _recipe_type(vllm_config: VllmConfig) -> type[_Recipe]:
     if method == "dflash":
         return _DFlashRecipe
     if method == "mtp":
+        if vllm_config.speculative_config.use_gemma4_mtp():
+            return _Gemma4MTPRecipe
         return _MTPRecipe
     return _Eagle3Recipe
 

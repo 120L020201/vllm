@@ -42,6 +42,12 @@ class AutoRegressiveOnlineDraft(OnlineDraftSpeculator):
         """Target rows the draft combines with the next token's embedding."""
         raise NotImplementedError
 
+    def _online_target_kv(
+        self, slot_mappings: dict[str, torch.Tensor] | None, num_tokens: int
+    ) -> dict[str, torch.Tensor]:
+        """Target KV rows for drafts that attend the target's cache."""
+        return {}
+
     def on_prefill_input_embeds_ready(
         self,
         num_reqs: int,
@@ -50,6 +56,7 @@ class AutoRegressiveOnlineDraft(OnlineDraftSpeculator):
         num_sampled: torch.Tensor,
         capture_enabled: bool,
         target_hidden_states: torch.Tensor | None = None,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
         if not capture_enabled or self.capture_adapter is None:
             return
@@ -68,6 +75,7 @@ class AutoRegressiveOnlineDraft(OnlineDraftSpeculator):
             aux_hidden_states=[feature[:num_tokens] for feature in features],
             confirmed_length=self.last_prefill_length,
             num_sampled=num_sampled[0],
+            **self._online_target_kv(slot_mappings, num_tokens),
         )
 
     def on_proposal_ready(

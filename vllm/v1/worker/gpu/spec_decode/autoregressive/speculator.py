@@ -139,6 +139,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_sampled: torch.Tensor,
         capture_enabled: bool,
         target_hidden_states: torch.Tensor | None = None,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None: ...
 
     def on_prefill_end(self, num_reqs: int) -> None: ...
@@ -445,6 +446,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 aux_hidden_states=aux_hidden_states,
                 num_sampled=num_sampled,
                 capture_enabled=capture_enabled,
+                slot_mappings=slot_mappings,
                 target_hidden_states=last_hidden_states,
             )
             # The install may have switched slots; replay that slot's graphs.

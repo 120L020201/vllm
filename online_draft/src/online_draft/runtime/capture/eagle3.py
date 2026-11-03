@@ -175,7 +175,8 @@ class _Eagle3BatchBuilder(
 class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
     """Capture EAGLE3 draft prefill rows and proposals."""
 
-    _packet_type = Eagle3CapturePacket
+    _packet_type: type[Eagle3CapturePacket] = Eagle3CapturePacket
+    _builder_type: type[_Eagle3BatchBuilder] = _Eagle3BatchBuilder
 
     def __init__(
         self,
@@ -193,7 +194,7 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
     ) -> None:
         super().__init__(
             buffers=buffers,
-            builder=_Eagle3BatchBuilder(
+            builder=self._builder_type(
                 on_round=on_round,
                 on_epoch_close=on_epoch_close,
                 on_finish=on_finish,
@@ -215,6 +216,7 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
         aux_hidden_states: Sequence[torch.Tensor],
         confirmed_length: torch.Tensor,
         num_sampled: torch.Tensor,
+        **features: torch.Tensor,
     ) -> None:
         """Submit one draft prefill and the pending proposal it verifies.
 
@@ -228,6 +230,7 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
             confirmed_length: Device scalar; leading rows that are prompt
                 tokens or accepted tokens.
             num_sampled: Device scalar sampled token count for this step.
+            **features: Extra owned GPU rows declared by a packet subclass.
         """
         with self._profile("online_draft.capture_target"):
             self._submit_target(
@@ -241,6 +244,7 @@ class Eagle3CaptureAdapter(CaptureAdapterBase[Eagle3Proposal]):
                     tuple(tensor.detach() for tensor in aux_hidden_states),
                     dim=-1,
                 ),
+                **features,
             )
 
     def capture_proposal(
