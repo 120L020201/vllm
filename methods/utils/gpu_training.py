@@ -4,10 +4,8 @@
 """CUDA training policies for online EAGLE3 methods."""
 
 import concurrent.futures
-import copy
 import json
 import logging
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -288,87 +286,6 @@ def _load_gpu_state(
     trainer.last_loss = None
 
 
-class GpuChunkEnsemble:
-    """Three persistent OSpec learners resident on the serving GPU."""
-
-    def __init__(
-        self,
-        trainer: DraftTrainer,
-        learning_rates: tuple[float, ...],
-        epsilon: float,
-        merged_state: dict[str, torch.Tensor] | None = None,
-    ) -> None:
-        if len(learning_rates) != 3 or any(rate <= 0 for rate in learning_rates):
-            raise ValueError("ospec requires three positive learning rates")
-        if not math.isfinite(epsilon) or epsilon < 0:
-            raise ValueError("epsilon must be finite and nonnegative")
-
-        config = trainer.config
-        self.learners = [trainer]
-        trainer.optimizer.param_groups[0]["lr"] = learning_rates[0]
-        for learning_rate in learning_rates[1:]:
-            self.learners.append(
-                DraftTrainer(
-                    copy.deepcopy(trainer.model),
-                    TrainerConfig(
-                        learning_rate=learning_rate,
-                        weight_decay=config.weight_decay,
-                        fused=config.fused,
-                        frozen_parameter_prefixes=config.frozen_parameter_prefixes,
-                        check_gradients=config.check_gradients,
-                        master_weights=config.master_weights,
-                    ),
-                )
-            )
-        device = next(trainer.model.parameters()).device
-        self.epsilon = epsilon
-        self.cumulative_losses = torch.zeros(
-            3,
-            dtype=torch.float64,
-            device=device,
-        )
-        self._merged_state = merged_state or export_gpu_state(trainer)
-        expected = set(trainer.trainable_parameter_names)
-        if set(self._merged_state) != expected:
-            raise KeyError("OSpec merge destination does not match the trainer")
-        for name, tensor in self._merged_state.items():
-            reference = trainer.model.state_dict()[name]
-            if tensor.device != reference.device or tensor.shape != reference.shape:
-                raise ValueError("OSpec merge destination must share CUDA and shape")
-        for learner in self.learners:
-            learner._initial_weights = ()
-        self.version = 0
-        self.last_update_steps = 0
-
-    def update(
-        self,
-        requests: tuple[tuple[Eagle3DistillationBatch, ...], ...],
-    ) -> GpuWeightSnapshot | None:
-        if not requests:
-            return None
-        self.last_update_steps = len(self.learners) * sum(
-            len(batches) for batches in requests
-        )
-        for index, learner in enumerate(self.learners):
-            for batches in requests:
-                _, losses = train_batches(learner, batches)
-                self.cumulative_losses[index] += sum(losses)
-
-        weights = torch.softmax(-self.epsilon * self.cumulative_losses, dim=0)
-        factors = weights.tolist()
-        states = [export_gpu_state(learner, clone=False) for learner in self.learners]
-        with torch.no_grad():
-            for name, merged in self._merged_state.items():
-                merged.copy_(states[0][name]).mul_(factors[0])
-                for factor, state in zip(factors[1:], states[1:], strict=True):
-                    merged.add_(state[name], alpha=factor)
-        self.version += 1
-        return GpuWeightSnapshot(
-            version=self.version,
-            state_dict=self._merged_state,
-        )
-
-
 class GpuPolicyBridge:
     """Run TTS updates on a CUDA side stream and retain other GPU policies."""
 
@@ -377,23 +294,21 @@ class GpuPolicyBridge:
         trainer: DraftTrainer,
         *,
         method: str,
-        merge_destination: dict[str, torch.Tensor] | None = None,
         position_decay_rho: float | None = None,
         recurrent_gradients: bool = False,
     ) -> None:
-        if method not in {"tts", "random_sampling", "ospec"}:
+        if method not in {"tts", "random_sampling"}:
             raise ValueError(f"unsupported method: {method}")
         if next(trainer.model.parameters()).device.type != "cuda":
             raise ValueError("online draft trainer must be on CUDA")
 
         self.method = method
-        # OSpec keeps its own objective; TTS and its random gate share this one.
+        # TTS and its random gate share this objective.
         self.position_decay_rho = position_decay_rho
         self.recurrent_gradients = recurrent_gradients
         self.stride = int(os.environ.get("OSD_UPDATE_STRIDE", "1"))
-        self.chunk_size = int(os.environ.get("OSD_CHUNK_SIZE", "5"))
-        if self.stride < 1 or self.chunk_size < 1:
-            raise ValueError("stride and chunk size must be positive")
+        if self.stride < 1:
+            raise ValueError("stride must be positive")
 
         self.gate = None
         if method == "random_sampling":
@@ -403,29 +318,10 @@ class GpuPolicyBridge:
                 self.stride,
             )
 
-        self.ensemble = None
-        if method == "ospec":
-            rates = tuple(
-                float(value)
-                for value in os.environ.get(
-                    "OSD_ENSEMBLE_LRS",
-                    "1e-5,2e-5,3e-5",
-                ).split(",")
-            )
-            self.ensemble = GpuChunkEnsemble(
-                trainer,
-                rates,
-                float(os.environ.get("OSD_EPSILON", "0.1")),
-                merge_destination,
-            )
         self.trainer = trainer
-        self._baseline = (
-            None
-            if self.ensemble is not None
-            else GpuWeightSnapshot(
-                version=trainer.version,
-                state_dict=_initial_gpu_state(trainer),
-            )
+        self._baseline = GpuWeightSnapshot(
+            version=trainer.version,
+            state_dict=_initial_gpu_state(trainer),
         )
         self._latest: GpuWeightSnapshot | None = None
         self._request_id: str | None = None
@@ -448,8 +344,6 @@ class GpuPolicyBridge:
             ]
             | None
         ) = None
-        self._current_request: list[Eagle3DistillationBatch] = []
-        self._chunk_requests: list[tuple[Eagle3DistillationBatch, ...]] = []
         self.stats = WorkerStats()
         self.log_updates = os.environ.get("OSD_LOG_UPDATES", "0") == "1"
 
@@ -561,10 +455,6 @@ class GpuPolicyBridge:
         self._next_step_id += 1
         self._rounds += 1
 
-        if self.ensemble is not None:
-            self._current_request.append(batch)
-            return 0
-
         should_train = self._rounds % self.stride == 0
         if self.gate is not None:
             should_train = self.gate.select(request_id)
@@ -640,24 +530,7 @@ class GpuPolicyBridge:
             self._rounds = 0
             self.stats.end_request()
             return
-        if self.ensemble is not None:
-            if self._current_request:
-                self._chunk_requests.append(tuple(self._current_request))
-            self._current_request.clear()
-            if len(self._chunk_requests) >= self.chunk_size:
-                snapshot = self.ensemble.update(tuple(self._chunk_requests))
-                if snapshot is not None:
-                    self._latest = snapshot
-                    self.stats.add_updates(self.ensemble.last_update_steps)
-                    if self.log_updates:
-                        logger.info(
-                            "ospec GPU draft merge: version=%d updates=%d",
-                            snapshot.version,
-                            self.ensemble.last_update_steps,
-                        )
-                self._chunk_requests.clear()
-        elif os.environ.get("OSD_KEEP_WEIGHTS", "0") != "1":
-            assert self._baseline is not None
+        if os.environ.get("OSD_KEEP_WEIGHTS", "0") != "1":
             _load_gpu_state(self.trainer, self._baseline.state_dict)
             self._latest = self._baseline
 
@@ -670,8 +543,6 @@ class GpuPolicyBridge:
     def shutdown(self) -> None:
         if self._tts_worker is not None:
             self._tts_worker.shutdown()
-        self._current_request.clear()
-        self._chunk_requests.clear()
 
 
 def create_gpu_policy_bridge(
@@ -697,7 +568,6 @@ def create_gpu_policy_bridge(
         model,
         learning_rate=learning_rate,
         method=method,
-        inference_model=inference_model,
         position_decay_rho=EAGLE3_POSITION_DECAY_RHO,
         recurrent_gradients=(
             os.environ.get("OSD_EAGLE3_RECURRENT_GRADIENTS", "1") == "1"
@@ -724,7 +594,6 @@ def create_mtp_gpu_policy_bridge(
         model,
         learning_rate=learning_rate,
         method=method,
-        inference_model=gpu_draft_model,
     )
 
 
@@ -733,7 +602,6 @@ def _create_gpu_policy_bridge(
     *,
     learning_rate: float,
     method: str,
-    inference_model=None,
     position_decay_rho: float | None = None,
     recurrent_gradients: bool = False,
 ) -> GpuPolicyBridge:
@@ -745,17 +613,9 @@ def _create_gpu_policy_bridge(
             master_weights=os.environ.get("OSD_MASTER_WEIGHTS", "0") == "1",
         ),
     )
-    merge_destination = None
-    if method == "ospec" and inference_model is not None:
-        inference_state = inference_model.state_dict()
-        merge_destination = {
-            name: inference_state[name].detach()
-            for name in trainer.trainable_parameter_names
-        }
     return GpuPolicyBridge(
         trainer,
         method=method,
-        merge_destination=merge_destination,
         position_decay_rho=position_decay_rho,
         recurrent_gradients=recurrent_gradients,
     )

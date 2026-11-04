@@ -3,11 +3,11 @@
 All entries use vLLM GPU target/draft inference and matching Qwen3 checkpoints.
 `dflash` and `mtp` are frozen native entries; other entries use EAGLE-3 drafts
 by default. All three `online_draft` recipes use vLLM's asynchronous CPU
-trainer. TTS and OSpec train on the GPU, and TTS supports EAGLE-3, DFlash, and
+trainer. TTS trains on the GPU and supports EAGLE-3, DFlash, and
 target-embedded MTP drafts.
 The opt-in `methods/utils/bootstrap/sitecustomize.py` installs observation and
 weight-publication callbacks in each vLLM worker process; it is enabled only by
-`methods.run`. TTS and OSpec use ordinary PyTorch eager training on CUDA.
+`methods.run`. TTS uses ordinary PyTorch eager training on CUDA.
 For `eagle`, `dflash`, and the GPU-training entries, target inference, target
 verification, and the EAGLE-3/DFlash draft run with
 `FULL_AND_PIECEWISE` CUDA Graph mode. TTS trains separate EAGLE-3 and DFlash
@@ -42,7 +42,6 @@ CPU training pipeline, while target and draft inference remain on GPU.
 .venv/bin/python -m methods.run random_sampling --port 8002 --probability 0.5
 .venv/bin/python -m methods.run random_sampling --draft-method dflash \
   --probability 0.5 --port 8007
-.venv/bin/python -m methods.run ospec --port 8003 --chunk-size 5
 ```
 
 Each command runs one server in the foreground. Use the same OpenAI-compatible
@@ -157,15 +156,11 @@ never overwritten.
 distribution captured during verification. EAGLE-3, DFlash, and MTP copy the
 updated trainable weights into the serving draft at each stride boundary.
 `random_sampling` gates complete updates using a separate seeded CPU generator
-(probability 1 matches TTS). `ospec` trains three
-GPU-resident draft learners at different learning rates after every N completed
-requests, then merges trainable weights using softmax of cumulative KL losses.
-It adapts the method policies to this repository; it does not reproduce the
-papers' full replay or offline-training pipelines. OSpec persists learners
-across request boundaries; TTS/random reset by default (`--keep-weights`
-changes this). One request at a time is required for ordering and reset
-semantics. Training data remain on CUDA, and OSpec chunk size increases GPU
-memory use. Request completion drains pending updates before the next request.
+(probability 1 matches TTS). It adapts the method policies to this repository;
+it does not reproduce the papers' full replay or offline-training pipelines.
+TTS/random reset by default (`--keep-weights` changes this). One request at a
+time is required for ordering and reset semantics. Training data remain on
+CUDA. Request completion drains pending updates before the next request.
 `--update-stride` trades adaptation frequency for lower GPU training cost.
 
 DFlash `tts` and `random_sampling` follow the same one-request,
@@ -178,7 +173,7 @@ Accepted auxiliary hidden states are cached per request and replayed each
 round, so long prompts dominate training memory. The cache reserves
 `N * auxiliary_width` at load, where `N` is `--max-model-len` unless
 `--dflash-max-context-tokens` caps training to the newest `N` context tokens.
-`ospec` remains EAGLE-3 only. See [`dflash/README.md`](dflash/README.md).
+See [`dflash/README.md`](dflash/README.md).
 
 MTP TTS trains a CUDA-resident copy of the embedded MTP layer and keeps the
 target embedding and LM head shared and frozen. It therefore needs no separate
@@ -276,7 +271,7 @@ aime2026-10: AL=2.825, weight_installs=120, cpu_rounds/train=8.25, tokens=24987,
 `AL` is `1 + accepted draft tokens / speculative rounds`, and is `1.000` for
 the base method. `weight_installs` counts newly trained weight installations into
 the GPU inference draft, excluding initial-weight restoration. It is not an
-optimizer-step count: one OSpec chunk merge counts as one installation.
+optimizer-step count.
 `cpu_rounds/train` is the total proposal rounds in successfully trained CPU
 windows divided by the number of those training calls. It excludes warmup and
 untrained trailing rounds, and is `N/A` for GPU training or no completed CPU
@@ -304,8 +299,8 @@ and gives each request the remaining context as its output limit. A positive
 left truncation. Chunked prefill can be enabled explicitly with
 `ENABLE_CHUNKED_PREFILL=1` and `MAX_NUM_BATCHED_TOKENS`.
 
-The script maps `TTS_UPDATE_STRIDE`, `TTS_LEARNING_RATE` (default `1e-5`),
-`TTS_RESET_PER_REQUEST`, and `CHUNK_SIZE` to the method launcher. Online
+The script maps `TTS_UPDATE_STRIDE`, `TTS_LEARNING_RATE` (default `1e-5`), and
+`TTS_RESET_PER_REQUEST` to the method launcher. Online
 training is intentionally single-request ordered. TTS keeps FP32 optimizer
 master weights by default; `TTS_MASTER_WEIGHTS=0` (or `--no-master-weights`)
 trains the BF16 weights directly.
@@ -336,7 +331,7 @@ method; `ONLINE_DRAFT_MASTER_WEIGHTS` (default 1),
 `ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE` (default 0, which keeps T=1).
 
 Base, EAGLE3, DFlash, and MTP support resume and default to `RESUME=1`, skipping successful
-questions individually. `online_draft`, TTS, and OSpec default to `RESUME=0` and
+questions individually. `online_draft` and TTS default to `RESUME=0` and
 reject `RESUME=1` before starting the server or changing outputs. These training
 methods always restart from the checkpoint and the beginning of the selected
 questions because complete training state is not restored. The default timestamp

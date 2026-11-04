@@ -261,7 +261,6 @@ checkpoint 内嵌的 `mtp.*` 权重。
 | TTS + EAGLE3 | `tts+eagle3`（`tts` 为简写） | `SPEC_MODEL=<EAGLE3 draft>` | 7 | GPU side stream | 0 |
 | TTS + DFlash | `tts+dflash` | `SPEC_MODEL=<DFlash draft>` | 15 | GPU side stream | 0 |
 | TTS + MTP | `tts+mtp` | `MODEL=<含内嵌 MTP 的 target>` | 3 | GPU side stream | 0 |
-| OSpec | `ospec` | `BASE_MODEL_PATH`、`EA_MODEL_PATH_1` | 7 | GPU 异步 ensemble | 0 |
 
 TTS 的训练基础模块位于 `methods/tts_common/training`，三种 TTS 入口都不会导入
 `online_draft` 包；`online_draft/src` 只会加入 `online_draft` 入口的
@@ -321,7 +320,7 @@ TTS_UPDATE_STRIDE=1 TTS_RESET_PER_REQUEST=1 TTS_LEARNING_RATE=1e-5 \
 DFlash TTS 必须关闭 chunked prefill，并保证
 `MAX_NUM_BATCHED_TOKENS >= MAX_MODEL_LEN`。Qwen3.5 多模态 target 上运行文本
 benchmark 或任一 MTP 入口时，增加 `LANGUAGE_MODEL_ONLY=1`。三种
-`online_draft+...` 和 `ospec` 的完整示例见下文相应章节。设置 `DRY_RUN=1`
+`online_draft+...` 的完整示例见下文相应章节。设置 `DRY_RUN=1`
 可以只打印最终 server 和 benchmark 命令而不启动服务。
 
 ## 5. Benchmark 通用配置
@@ -409,8 +408,8 @@ prefill 的调优可能增加启动显存峰值；此开关不影响 `WARMUP_TOK
 prompt 长度，再计算生成上限。将 `MAX_OUTPUT_TOKENS` 设为正数可额外限制输出；
 将 `MAX_PROMPT_TOKENS` 设为正数才会启用左截断。
 
-TTS/OSpec 的 draft 训练在 GPU 上使用 PyTorch eager；Base 的 target，以及
-EAGLE3/TTS/OSpec 的 target、draft proposal 和 verification 都显式使用
+TTS 的 draft 训练在 GPU 上使用 PyTorch eager；Base 的 target，以及
+EAGLE3/TTS 的 target、draft proposal 和 verification 都显式使用
 `FULL_AND_PIECEWISE` CUDA Graph 模式。`online_draft+eagle3` 仍走内置 CPU 在线训练
 路径：当前底层会强制 GPU EAGLE3 draft 的 prefill/decode 使用 eager，不能仅凭启动
 参数认定 draft 使用 CUDA Graph。`online_draft+dflash` 由 vLLM 内置 DFlash capture
@@ -423,9 +422,7 @@ ENABLE_CHUNKED_PREFILL=1 MAX_NUM_BATCHED_TOKENS=512 \
   bash experiments/run.sh tts
 ```
 
-默认 32768 context 位于 Qwen3-4B/8B 声明的 40960 token 原生范围内。8B OSpec
-需要在同一 GPU 常驻三个 learner、optimizer state 和 serving 模型；RTX 5090
-32GB、利用率 0.8 的实测中，32768 context 可能因 KV cache 空间不足而启动失败。
+默认 32768 context 位于 Qwen3-4B/8B 声明的 40960 token 原生范围内。
 这种情况下应显式降低 `MAX_MODEL_LEN`，而不是让脚本静默改变实验配置。
 
 显存规则：
@@ -602,30 +599,9 @@ DFlash TTS 额外常驻训练权重、梯度、AdamW 状态和 context feature c
 显存不足时可设置 `DFLASH_MAX_CONTEXT_TOKENS=N`，但这会把训练条件截断到最近
 `N` 个 token，不再是完整上下文复现。不要在同一张繁忙 GPU 上启动上述命令。
 
-## 9. 运行 OSpec
-
-```bash
-nohup env \
-  MONITOR=1 \
-  MAX_OUTPUT_TOKENS=0 \
-  PYTHON_BIN="$PWD/.venv/bin/python" \
-  DATA_DIR=/srv/Datasets \
-  BENCHMARKS="aime2026 gpqa_diamond mmlu-pro-computer_science livecodebench-lite LongBench-v2" \
-  BASE_MODEL_PATH=/srv/Models/Qwen3-8B \
-  EA_MODEL_PATH_1=/srv/Models/Qwen3-8B_eagle3 \
-  SPEC_TOKENS=7 \
-  CHUNK_SIZE=8 \
-  TEMPERATURE=0.6 TOP_P=0.95 TOP_K=20 \
-  RUN_LOG=qwen3_8b_ospec.log \
-  bash experiments/run.sh ospec \
-  > /dev/null 2>&1 < /dev/null &
-```
-
-当前 OSpec 在 GPU 侧常驻三个 draft learner。在线训练严格单请求有序。
-
 ## 9.1 运行 online_draft
 
-TTS 使用 side CUDA stream 上的 GPU eager trainer；OSpec 仍按请求块同步训练。
+TTS 使用 side CUDA stream 上的 GPU eager trainer。
 相关默认值为：
 
 - `TTS_LEARNING_RATE=1e-5`
@@ -674,7 +650,7 @@ confirmed embeddings 直接从 GPU draft prefill 捕获，没有 sampled token I
 CPU→GPU 回传。传输包仍包含 `num_sampled`；原生路径不计算 teacher coverage。
 
 `online_draft` 三种 drafter 都由 `vllm/v1/worker/gpu/online_draft.py` 创建共享
-异步 pipeline；bootstrap 只附加统计回调。EAGLE3 TTS/OSpec 使用 `gpu_factory.py`，
+异步 pipeline；bootstrap 只附加统计回调。EAGLE3 TTS 使用 `gpu_factory.py`，
 DFlash TTS 使用 `methods/dflash/factory.py` 的 CUDA side-stream adapter。
 
 多个冻结前缀使用逗号分隔。示例：
@@ -692,8 +668,8 @@ FUSED_OPTIMIZER=1 LOG_UPDATES=1 \
 ```
 
 `CHECK_GRADIENTS` 和 `FROZEN_PARAMETER_PREFIXES` 只配置可选的 CPU trainer；不会
-关闭或冻结 TTS/OSpec 的 GPU trainer。`VLLM_ONLINE_DRAFT_PROFILE=1` 只允许用于
-`online_draft`。`online_draft`、TTS、OSpec 均默认 `RESUME=0`，不支持续跑；
+关闭或冻结 TTS 的 GPU trainer。`VLLM_ONLINE_DRAFT_PROFILE=1` 只允许用于
+`online_draft`。`online_draft` 和 TTS 均默认 `RESUME=0`，不支持续跑；
 显式设置 `RESUME=1` 会在启动服务和改写输出前报错。
 
 ## 10. 逐题日志和结果
@@ -712,7 +688,7 @@ aime2026-10: AL=2.825, weight_installs=120, cpu_rounds/train=8.25, tokens=24987,
 - `cpu_rounds/train`：CPU 每次成功训练平均使用的 speculative proposal 轮数，
   即成功训练窗口包含的轮数之和除以训练次数。一轮不是一个生成 token；不包含
   warmup 或请求结束时未训练的尾部轮次。仅 CPU `online_draft` 适用，
-  TTS/OSpec/Base/EAGLE3 或没有完成 CPU 训练时显示 `N/A`。
+  TTS/Base/EAGLE3 或没有完成 CPU 训练时显示 `N/A`。
 - `tokens`：API 返回的 completion token 数。
 - `time`：请求端到端时间，包括 HTTP 请求、该请求后台训练/权重安装收尾等待，
   以及请求后的服务端指标读取；不包含 warmup。
@@ -726,8 +702,6 @@ JSONL 使用 `weight_installs` 和 `cpu_rounds_per_train` 保存上述训练指�
 输出含义容易混淆的 `updates` 字段。统计文件缺失、损坏或等待未完成时，
 训练指标显示 `N/A`、JSON 写为 `null`，不再误报为 0。CPU warmup 处理结束后
 才开始正式计时和计数；这些统计独立于 `LOG_UPDATES`，无需打开逐次训练日志。
-OSpec 在 chunk 边界合并并安装权重，一次合并算一次安装，不按三个 learner 的
-optimizer step 数累计；尚未到 chunk 边界的题目可以正常显示安装次数为 0。
 
 `run.sh` 会先切换到仓库根目录，并在启动时生成一次格式为
 `YYYYMMDD_HHMMSS` 的 `RUN_TIMESTAMP`。默认运行目录为：
@@ -782,7 +756,7 @@ Base、冻结 EAGLE3、冻结 DFlash 和冻结 MTP 支持恢复，默认 `RESUME
 RESUME=0 bash experiments/run.sh base
 ```
 
-`online_draft`、TTS、OSpec 默认且只允许 `RESUME=0`，每次都从原始 checkpoint
+`online_draft` 和 TTS 默认且只允许 `RESUME=0`，每次都从原始 checkpoint
 和所选题目的起点重新运行，不跳过已有结果。因为当前没有保存/恢复完整训练
 状态，不能用已有结果替代训练过程。默认时间戳会创建新目录；显式复用
 `RUN_DIR` 或 `OUTPUT_FILE` 时会覆盖对应旧输出，请自行保留需要的结果。

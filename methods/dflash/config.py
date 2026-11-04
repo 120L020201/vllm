@@ -33,7 +33,7 @@ def resolve_draft_method(method: str, requested: str | None) -> str:
         return requested or "eagle3"
     if method == "online_draft":
         return requested or "eagle3"
-    if method in {"eagle", "ospec"}:
+    if method == "eagle":
         if requested not in (None, "eagle3"):
             raise ValueError(f"{method} supports only an eagle3 draft")
         return "eagle3"

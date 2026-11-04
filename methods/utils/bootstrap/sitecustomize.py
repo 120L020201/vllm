@@ -13,7 +13,7 @@ if _DRAFT_METHOD == "mtp":
 
     install_qwen3_mtp()
 
-if _METHOD in {"tts", "random_sampling", "ospec"}:
+if _METHOD in {"tts", "random_sampling"}:
     if _DRAFT_METHOD == "dflash":
         from methods.dflash.factory import install
     else:

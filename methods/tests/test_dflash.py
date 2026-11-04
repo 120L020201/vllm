@@ -796,12 +796,8 @@ class DflashLaunchTest(unittest.TestCase):
         self.assertEqual(command[command.index("--spec-model") + 1], "/tmp/x")
 
     def test_unsupported_combinations_are_rejected(self):
-        for method in ("eagle", "ospec"):
-            with (
-                self.subTest(method=method),
-                self.assertRaisesRegex(ValueError, "eagle3"),
-            ):
-                self._command(method, "--draft-method", "dflash")
+        with self.assertRaisesRegex(ValueError, "eagle3"):
+            self._command("eagle", "--draft-method", "dflash")
         with self.assertRaisesRegex(ValueError, "requires a dflash"):
             self._command("dflash", "--draft-method", "eagle3")
 

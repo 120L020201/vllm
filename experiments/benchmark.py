@@ -59,7 +59,6 @@ def _parse_args() -> argparse.Namespace:
             "tts-eagle3",
             "tts-dflash",
             "tts-mtp",
-            "ospec",
         ),
     )
     parser.add_argument("--base-url", required=True)

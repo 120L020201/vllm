@@ -75,7 +75,6 @@ def build_parser():
             "mtp",
             "online_draft",
             "tts",
-            "ospec",
             "random_sampling",
         ),
     )
@@ -134,9 +133,6 @@ def build_parser():
     parser.add_argument("--update-stride", type=int, default=1)
     parser.add_argument("--probability", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--chunk-size", type=int, default=5)
-    parser.add_argument("--ensemble-lrs", default="1e-5,2e-5,3e-5")
-    parser.add_argument("--epsilon", type=float, default=0.1)
     parser.add_argument(
         "--dflash-max-context-tokens",
         type=int,
@@ -245,10 +241,8 @@ def configure(args):
         or args.max_num_batched_tokens < 1
     ):
         raise ValueError("context length must exceed the draft token count")
-    if args.update_stride < 1 or args.chunk_size < 1 or args.seed < 0:
-        raise ValueError(
-            "stride and chunk size must be positive; seed must be nonnegative"
-        )
+    if args.update_stride < 1 or args.seed < 0:
+        raise ValueError("stride must be positive; seed must be nonnegative")
     if args.dflash_max_context_tokens < 0:
         raise ValueError("dflash max context tokens must be nonnegative")
     if args.dflash_grad_context_tokens < 0:
@@ -272,17 +266,12 @@ def configure(args):
         raise ValueError("probability must be in [0,1]")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError("learning rate must be finite and positive")
-    if not math.isfinite(args.epsilon) or args.epsilon < 0:
-        raise ValueError("learning rate must be positive and epsilon nonnegative")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu memory utilization must be in (0,1]")
     if args.max_gpu_memory_gib is not None and (
         not math.isfinite(args.max_gpu_memory_gib) or args.max_gpu_memory_gib <= 0
     ):
         raise ValueError("max GPU memory must be finite and positive")
-    rates = [float(rate) for rate in args.ensemble_lrs.split(",")]
-    if len(rates) != 3 or any(not math.isfinite(rate) or rate <= 0 for rate in rates):
-        raise ValueError("ensemble-lrs must specify three positive values")
     prefixes = tuple(
         prefix.strip()
         for prefix in args.frozen_parameter_prefixes.split(",")
@@ -347,9 +336,6 @@ def configure(args):
             "OSD_UPDATE_STRIDE": str(args.update_stride),
             "OSD_PROBABILITY": str(args.probability),
             "OSD_SEED": str(args.seed),
-            "OSD_CHUNK_SIZE": str(args.chunk_size),
-            "OSD_ENSEMBLE_LRS": args.ensemble_lrs,
-            "OSD_EPSILON": str(args.epsilon),
             "OSD_KEEP_WEIGHTS": str(int(args.keep_weights)),
             "OSD_FUSED_OPTIMIZER": str(int(args.fused_optimizer)),
             "OSD_LOG_UPDATES": str(int(log_updates)),

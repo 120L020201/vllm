@@ -68,8 +68,6 @@ not change the stated one-step update.
 `--update-stride` controls TTS update cadence; `random_sampling` also gates
 updates with `--probability`. Weights reset after each request unless
 `--keep-weights` is set.
-`ospec` remains EAGLE-3 only: its three independent learners would require
-three drafter copies.
 
 ### Memory
 

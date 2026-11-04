@@ -152,7 +152,7 @@ RESUME=${RESUME:-}
 
 usage() {
   cat <<'EOF'
-Usage: bash experiments/run.sh {base|eagle3|dflash|mtp|online_draft|online_draft+eagle3|online_draft+dflash|online_draft+mtp|tts|tts+eagle3|tts+dflash|tts+mtp|ospec}
+Usage: bash experiments/run.sh {base|eagle3|dflash|mtp|online_draft|online_draft+eagle3|online_draft+dflash|online_draft+mtp|tts|tts+eagle3|tts+dflash|tts+mtp}
 
 The script starts one OpenAI-compatible vLLM server, waits for readiness,
 evaluates DATA_DIR/BENCHMARKS sequentially, and writes JSONL results.
@@ -171,7 +171,7 @@ LANGUAGE_MODEL_ONLY=1 loads only the language model; use it for text-only
 online MTP on multimodal Qwen3.5 targets.
 Use tts+eagle3, tts+dflash, or tts+mtp to select a TTS drafter directly.
 Only base, eagle3, dflash, and mtp support RESUME=1 (their default).
-online_draft, tts, and ospec require RESUME=0 (their default).
+online_draft and tts require RESUME=0 (their default).
 EOF
 }
 
@@ -194,7 +194,7 @@ fi
   exit 2
 }
 case "$METHOD" in
-  base|eagle3|dflash|mtp|online_draft|tts|ospec) ;;
+  base|eagle3|dflash|mtp|online_draft|tts) ;;
   -h|--help) usage; exit 0 ;;
   *) die "unknown method '$METHOD'" ;;
 esac
@@ -428,11 +428,8 @@ else
     "$flashinfer_autotune_arg"
     --learning-rate "${ONLINE_DRAFT_LR:-${TTS_LEARNING_RATE:-1e-5}}"
     --update-stride "${TTS_UPDATE_STRIDE:-1}"
-    --chunk-size "${CHUNK_SIZE:-5}"
     --probability "${UPDATE_PROBABILITY:-0.5}"
     --seed "$SEED"
-    --ensemble-lrs "${OSPEC_ENSEMBLE_LRS:-1e-5,2e-5,3e-5}"
-    --epsilon "${OSPEC_EPSILON:-0.1}"
     "$chunked_prefill_arg"
     "$trust_remote_code_arg"
     "$language_model_only_arg"

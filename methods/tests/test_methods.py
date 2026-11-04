@@ -163,7 +163,7 @@ class LauncherTest(unittest.TestCase):
 
     def test_same_inference_args_for_every_method(self):
         commands = []
-        for method in ("eagle", "online_draft", "tts", "random_sampling", "ospec"):
+        for method in ("eagle", "online_draft", "tts", "random_sampling"):
             args = build_parser().parse_args((method, "--dry-run"))
             command, env = configure(args)
             config_index = command.index("--additional-config")
@@ -196,7 +196,7 @@ class LauncherTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         online_draft_path = str(root / "online_draft" / "src")
 
-        for method in ("tts", "random_sampling", "ospec"):
+        for method in ("tts", "random_sampling"):
             with (
                 self.subTest(method=method),
                 patch.dict(os.environ, {"PYTHONPATH": ""}),
@@ -211,7 +211,7 @@ class LauncherTest(unittest.TestCase):
         self.assertIn(online_draft_path, env["PYTHONPATH"].split(os.pathsep))
 
     def test_conflicting_cpu_training_environment_is_rejected(self):
-        for method in ("eagle", "online_draft", "tts", "random_sampling", "ospec"):
+        for method in ("eagle", "online_draft", "tts", "random_sampling"):
             with (
                 self.subTest(method=method),
                 patch.dict(
@@ -329,7 +329,6 @@ class LauncherTest(unittest.TestCase):
             ("tts", (), "1"),
             ("tts", ("--no-master-weights",), "0"),
             ("random_sampling", (), "0"),
-            ("ospec", (), "0"),
         ):
             args = build_parser().parse_args((method, *flags, "--dry-run"))
             command, env = configure(args)
@@ -397,8 +396,7 @@ class LauncherTest(unittest.TestCase):
     def test_invalid_options_fail_before_start(self):
         for flags in (
             ("--probability", "1.1"),
-            ("--chunk-size", "0"),
-            ("--ensemble-lrs", "1e-5,2e-5"),
+            ("--update-stride", "0"),
         ):
             args = build_parser().parse_args(("tts", "--dry-run", *flags))
             with self.assertRaises(ValueError):
@@ -564,7 +562,6 @@ class RunScriptTest(unittest.TestCase):
             "mtp",
             "online_draft",
             "tts",
-            "ospec",
         ):
             with self.subTest(method=method):
                 result = self._run(method)
@@ -583,7 +580,7 @@ class RunScriptTest(unittest.TestCase):
                     self.assertIn("-m methods.run online_draft", result.stdout)
                     self.assertIn("--no-check-gradients", result.stdout)
                     self.assertIn("--log-updates", result.stdout)
-                elif method in ("tts", "ospec"):
+                elif method == "tts":
                     self.assertIn("--no-log-updates", result.stdout)
                 if method == "dflash":
                     self.assertIn("-m methods.run dflash", result.stdout)
@@ -692,7 +689,7 @@ class RunScriptTest(unittest.TestCase):
         self.assertEqual(kwargs["method"], "tts")
 
     def test_training_resume_is_rejected_before_creating_outputs(self):
-        for method in ("online_draft", "tts", "ospec"):
+        for method in ("online_draft", "tts"):
             with self.subTest(method=method):
                 result = self._run(method, RESUME="1")
                 self.assertEqual(result.returncode, 2)
@@ -770,7 +767,7 @@ server.serve_forever()
 
     def test_stats_path_is_exported_to_every_training_method(self):
         path = str(self.directory / "stats.json")
-        for method in ("online_draft", "tts", "ospec"):
+        for method in ("online_draft", "tts"):
             with self.subTest(method=method):
                 result = subprocess.run(
                     [
@@ -798,7 +795,7 @@ server.serve_forever()
                     self.assertIn(f"--resume-mode {mode}", result.stdout)
 
     def test_training_flag_cannot_override_method(self):
-        for method in ("base", "eagle3", "online_draft", "tts", "ospec"):
+        for method in ("base", "eagle3", "online_draft", "tts"):
             with self.subTest(method=method):
                 result = self._run(
                     method,
@@ -809,7 +806,7 @@ server.serve_forever()
                 self.assertFalse((self.directory / "results").exists())
 
     def test_profiling_requires_cpu_online_method(self):
-        for method in ("base", "eagle3", "online_draft", "tts", "ospec"):
+        for method in ("base", "eagle3", "online_draft", "tts"):
             with self.subTest(method=method):
                 result = self._run(method, VLLM_ONLINE_DRAFT_PROFILE="1")
                 if method == "online_draft":
@@ -1865,8 +1862,7 @@ class PolicyTest(unittest.TestCase):
         self.assertFalse(torch.equal(initial, trainer.model.model.fc.weight))
 
     def test_reset_drains_queue_and_restores_baseline(self):
-        from methods.ospec_common.ensemble import export_trainable_state
-        from methods.utils.bridge import PolicyBridge
+        from methods.utils.bridge import PolicyBridge, export_trainable_state
 
         trainer = _make_trainer()
         with patch.dict(os.environ, {"OSD_KEEP_WEIGHTS": "0"}):
@@ -1894,38 +1890,6 @@ class PolicyTest(unittest.TestCase):
                 bridge.observe_step("one", 0, _make_batch())
                 bridge.reset_request("one")
                 self.assertEqual(bridge.trainer.version, 0)
-            finally:
-                bridge.shutdown()
-
-    def test_ospec_merges_three_cpu_learners(self):
-        from methods.ospec_common.ensemble import (
-            ChunkEnsemble,
-            export_trainable_state,
-        )
-
-        ensemble = ChunkEnsemble(_make_trainer(), (1e-5, 2e-5, 3e-5), 0.1)
-        snapshot = ensemble.update(((_make_batch(),),))
-        self.assertIsNotNone(snapshot)
-        assert snapshot is not None
-        self.assertEqual(snapshot.version, 1)
-        self.assertEqual(len(ensemble.learners), 3)
-        self.assertEqual(
-            len(snapshot.state_dict), len(export_trainable_state(ensemble.learners[0]))
-        )
-
-    def test_ospec_publishes_only_at_chunk_boundary(self):
-        from methods.utils.bridge import PolicyBridge
-
-        with patch.dict(os.environ, {"OSD_CHUNK_SIZE": "2"}):
-            bridge = PolicyBridge(_make_trainer(), method="ospec")
-            try:
-                bridge.observe_step("first", 0, _make_batch())
-                bridge.reset_request("first")
-                self.assertIsNone(bridge.maybe_apply_pending_weights())
-                bridge.observe_step("second", 0, _make_batch())
-                bridge.reset_request("second")
-                self.assertEqual(bridge.maybe_apply_pending_weights().version, 1)
-                self.assertIsNone(bridge.maybe_apply_pending_weights())
             finally:
                 bridge.shutdown()
 
@@ -2110,34 +2074,6 @@ class GpuPolicyTest(unittest.TestCase):
         )
         self.assertTrue(
             all(not tensor.is_inference() for tensor in adapter._pending.values())
-        )
-
-    def test_ospec_keeps_three_learners_and_merge_on_cuda(self):
-        from methods.utils.gpu_training import GpuPolicyBridge
-
-        with patch.dict(os.environ, {"OSD_CHUNK_SIZE": "1"}):
-            bridge = GpuPolicyBridge(_make_trainer(device="cuda"), method="ospec")
-            assert bridge.ensemble is not None
-            bridge.observe_step("request", 0, _make_batch(device="cuda"))
-            bridge.reset_request("request")
-            snapshot = bridge.maybe_apply_pending_weights()
-
-        self.assertIsNotNone(snapshot)
-        assert snapshot is not None
-        self.assertEqual(len(bridge.ensemble.learners), 3)
-        self.assertTrue(
-            all(not learner.config.fused for learner in bridge.ensemble.learners)
-        )
-        self.assertEqual(bridge.stats.updates, 3)
-        self.assertTrue(
-            all(
-                parameter.device.type == "cuda"
-                for learner in bridge.ensemble.learners
-                for parameter in learner.model.parameters()
-            )
-        )
-        self.assertTrue(
-            all(tensor.device.type == "cuda" for tensor in snapshot.state_dict.values())
         )
 
 

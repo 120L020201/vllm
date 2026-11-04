@@ -184,7 +184,7 @@ EAGLE3 与 MTP 在线时同样为每个 slot 捕获一套 prefill/decode FULL gr
 各方法有各自的 loss、query 布局与 context 构建方式。
 
 仓库根目录的 [`methods/`](../methods/README.md) 是另一组 EAGLE3 实验策略入口，
-包含 TTS、随机采样和 OSpec 等策略，复用部分训练组件。它不由这里的
+包含 TTS 和随机采样等策略，复用部分训练组件。它不由这里的
 `create_online_draft` 装配，与这里的在线训练路径相互独立。
 
 ## 运行

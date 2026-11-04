@@ -22,11 +22,6 @@ from online_draft.training.eagle3.window import (
 )
 from online_draft.training.trainer import DraftTrainer
 
-from methods.ospec_common.ensemble import (
-    ChunkEnsemble,
-    WeightSnapshot,
-    export_trainable_state,
-)
 from methods.random_sampling.gating import BernoulliGate
 from methods.tts_common.batch import Eagle3DistillationBatch
 from methods.tts_common.step import train_batches
@@ -39,6 +34,20 @@ _DEFAULT_TORCH_THREADS = min(
     if hasattr(os, "sched_getaffinity")
     else os.cpu_count() or 1,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class WeightSnapshot:
+    version: int
+    state_dict: dict[str, torch.Tensor]
+
+
+def export_trainable_state(trainer: DraftTrainer) -> dict[str, torch.Tensor]:
+    state = trainer.model.state_dict()
+    return {
+        name: state[name].detach().cpu().clone()
+        for name in trainer.trainable_parameter_names
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +80,7 @@ def _load_trainable_state(
 
 class PolicyBridge:
     def __init__(self, trainer: DraftTrainer, *, method: str) -> None:
-        if method not in {"tts", "random_sampling", "ospec"}:
+        if method not in {"tts", "random_sampling"}:
             raise ValueError(f"unsupported method: {method}")
         self.trainer = trainer
         self.method = method
@@ -79,28 +88,14 @@ class PolicyBridge:
             os.environ.get("OSD_TORCH_THREADS", str(_DEFAULT_TORCH_THREADS))
         )
         self.stride = int(os.environ.get("OSD_UPDATE_STRIDE", "1"))
-        self.chunk_size = int(os.environ.get("OSD_CHUNK_SIZE", "5"))
-        if self.stride < 1 or self.chunk_size < 1:
-            raise ValueError("stride and chunk size must be positive")
+        if self.stride < 1:
+            raise ValueError("stride must be positive")
         self.gate = None
         if method == "random_sampling":
             self.gate = BernoulliGate(
                 float(os.environ.get("OSD_PROBABILITY", "0.5")),
                 int(os.environ.get("OSD_SEED", "0")),
                 self.stride,
-            )
-        self.ensemble = None
-        if method == "ospec":
-            rates = tuple(
-                float(value)
-                for value in os.environ.get("OSD_ENSEMBLE_LRS", "1e-5,2e-5,3e-5").split(
-                    ","
-                )
-            )
-            self.ensemble = ChunkEnsemble(
-                trainer,
-                rates,
-                float(os.environ.get("OSD_EPSILON", "0.1")),
             )
         self._baseline = WeightSnapshot(
             version=trainer.version,
@@ -115,8 +110,6 @@ class PolicyBridge:
         self._next_step_id = 0
         self._rounds = 0
         self._persistent_cache: Eagle3KVCache | None = None
-        self._current_request: list[Eagle3DistillationBatch] = []
-        self._chunk_requests: list[tuple[Eagle3DistillationBatch, ...]] = []
         self.stats = WorkerStats()
         self._thread = threading.Thread(
             target=self._work,
@@ -197,10 +190,6 @@ class PolicyBridge:
         self._next_step_id += 1
         self._rounds += 1
 
-        if self.ensemble is not None:
-            self._current_request.append(observation.batch)
-            return 0
-
         should_train = self._rounds % self.stride == 0
         if self.gate is not None:
             should_train = self.gate.select(observation.request_id)
@@ -231,17 +220,7 @@ class PolicyBridge:
             return
         if self.gate is not None:
             self.gate.reset(request_id)
-        if self.ensemble is not None:
-            if self._current_request:
-                self._chunk_requests.append(tuple(self._current_request))
-            self._current_request.clear()
-            if len(self._chunk_requests) >= self.chunk_size:
-                snapshot = self.ensemble.update(tuple(self._chunk_requests))
-                if snapshot is not None:
-                    self._publish(snapshot)
-                    self.stats.add_updates(self.ensemble.last_update_steps)
-                self._chunk_requests.clear()
-        elif os.environ.get("OSD_KEEP_WEIGHTS", "0") != "1":
+        if os.environ.get("OSD_KEEP_WEIGHTS", "0") != "1":
             _load_trainable_state(
                 self.trainer,
                 self._baseline.state_dict,
