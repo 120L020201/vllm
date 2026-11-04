@@ -24,3 +24,8 @@ elif _METHOD == "online_draft":
     from methods.utils.cpu_stats import install
 
     install()
+
+if os.environ.get("OSD_STEP_METRICS_FILE"):
+    from methods.utils.step_metrics import install as install_step_metrics
+
+    install_step_metrics()

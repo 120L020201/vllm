@@ -144,6 +144,13 @@ def build_parser():
         help="DFlash TTS replays only the newest N context tokens; "
         "0 keeps the full context",
     )
+    parser.add_argument(
+        "--dflash-grad-context-tokens",
+        type=int,
+        default=0,
+        help="DFlash TTS caches detached context K/V and recomputes only the "
+        "newest N context tokens with gradients; 0 replays the full context",
+    )
     parser.add_argument("--dflash-max-train-rounds", type=int, default=16)
     parser.add_argument(
         "--dflash-loss-gamma",
@@ -227,7 +234,13 @@ def build_parser():
         "--master-weights",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="keep FP32 optimizer master weights for online CPU training",
+        help="keep FP32 optimizer master weights (default: on for tts only)",
+    )
+    parser.add_argument(
+        "--eagle3-recurrent-gradients",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="backpropagate GPU EAGLE3 losses through the draft recurrence",
     )
     parser.add_argument(
         "--persistent-grads",
@@ -277,7 +290,9 @@ def configure(args):
     log_updates = args.log_updates
     if log_updates is None:
         log_updates = args.method == "online_draft"
-    master_weights = bool(args.master_weights)
+    master_weights = (
+        args.method == "tts" if args.master_weights is None else args.master_weights
+    )
     persistent_grads = bool(args.persistent_grads)
     continuous_training = bool(args.continuous_training)
     train_schedule = tuple(
@@ -312,6 +327,13 @@ def configure(args):
         )
     if args.dflash_max_context_tokens < 0:
         raise ValueError("dflash max context tokens must be nonnegative")
+    if args.dflash_grad_context_tokens < 0:
+        raise ValueError("dflash grad context tokens must be nonnegative")
+    if args.dflash_grad_context_tokens and args.dflash_max_context_tokens:
+        raise ValueError(
+            "--dflash-grad-context-tokens cannot be combined with "
+            "--dflash-max-context-tokens"
+        )
     if args.dflash_max_train_rounds < 0:
         raise ValueError("DFlash max train rounds must be nonnegative")
     if draft_method == "dflash" and args.method in {"tts", "random_sampling"}:
@@ -396,6 +418,7 @@ def configure(args):
             "OSD_DRAFT_METHOD": draft_method,
             "OSD_DRAFT_MODEL": draft or "",
             "OSD_DFLASH_MAX_CONTEXT_TOKENS": str(args.dflash_max_context_tokens),
+            "OSD_DFLASH_GRAD_CONTEXT_TOKENS": str(args.dflash_grad_context_tokens),
             "OSD_LEARNING_RATE": str(args.learning_rate),
             "OSD_UPDATE_STRIDE": str(args.update_stride),
             "OSD_PROBABILITY": str(args.probability),
@@ -407,6 +430,7 @@ def configure(args):
             "OSD_FUSED_OPTIMIZER": str(int(args.fused_optimizer)),
             "OSD_LOG_UPDATES": str(int(log_updates)),
             "OSD_MASTER_WEIGHTS": str(int(master_weights)),
+            "OSD_EAGLE3_RECURRENT_GRADIENTS": str(int(args.eagle3_recurrent_gradients)),
             "OSD_PERSISTENT_GRADS": str(int(persistent_grads)),
             "OSD_CONTINUOUS_TRAINING": str(int(continuous_training)),
             "OSD_FROZEN_PARAMETER_PREFIXES": ",".join(prefixes),
@@ -423,7 +447,7 @@ def configure(args):
     # The vLLM online runtime rejects unknown keys; send extensions only on use.
     if args.method == "online_draft" and args.online_draft_loss != "uniform":
         online_draft_config["loss_mode"] = args.online_draft_loss
-    if master_weights:
+    if master_weights and args.method == "online_draft":
         online_draft_config["master_weights"] = True
     if persistent_grads:
         online_draft_config["persistent_grads"] = True

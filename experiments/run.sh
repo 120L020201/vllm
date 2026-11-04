@@ -80,7 +80,7 @@ if [[ -z "${SPEC_TOKENS:-}" ]]; then
   elif [[ "$DRAFT_METHOD" == mtp ]]; then
     SPEC_TOKENS=3
   else
-    SPEC_TOKENS=7
+    SPEC_TOKENS=8
   fi
 fi
 TEMPERATURE=${TEMPERATURE:-0.6}
@@ -105,6 +105,7 @@ WARMUP_TOKENS=${WARMUP_TOKENS:-16}
 CHECK_GRADIENTS=${CHECK_GRADIENTS:-0}
 FROZEN_PARAMETER_PREFIXES=${FROZEN_PARAMETER_PREFIXES:-}
 DFLASH_MAX_CONTEXT_TOKENS=${DFLASH_MAX_CONTEXT_TOKENS:-0}
+DFLASH_GRAD_CONTEXT_TOKENS=${DFLASH_GRAD_CONTEXT_TOKENS:-0}
 FUSED_OPTIMIZER=${FUSED_OPTIMIZER:-1}
 if [[ "$METHOD" == online_draft ]]; then
   LOG_UPDATES=${LOG_UPDATES:-1}
@@ -139,6 +140,7 @@ SERVER_LOG=${SERVER_LOG:-$RUN_DIR/server.log}
 MONITOR_FILE=${MONITOR_FILE:-$RUN_DIR/monitor.csv}
 RUN_LOG=${RUN_LOG:-}
 STATS_FILE=${STATS_FILE:-$RUN_DIR/stats.json}
+STEP_METRICS_FILE=${STEP_METRICS_FILE:-$RUN_DIR/steps.jsonl}
 if [[ "$METHOD" == online_draft ]]; then
   ONLINE_DRAFT_LOSS=${ONLINE_DRAFT_LOSS:-uniform}
   ONLINE_DRAFT_MASTER_WEIGHTS=${ONLINE_DRAFT_MASTER_WEIGHTS:-0}
@@ -301,6 +303,7 @@ fi
 [[ "$MAX_NUM_BATCHED_TOKENS" =~ ^[0-9]+$ ]] && ((MAX_NUM_BATCHED_TOKENS > 0)) || die "MAX_NUM_BATCHED_TOKENS must be a positive integer"
 [[ "$SPEC_TOKENS" =~ ^[0-9]+$ ]] && ((SPEC_TOKENS > 0)) || die "SPEC_TOKENS must be a positive integer"
 [[ "$DFLASH_MAX_CONTEXT_TOKENS" =~ ^[0-9]+$ ]] || die "DFLASH_MAX_CONTEXT_TOKENS must be a nonnegative integer"
+[[ "$DFLASH_GRAD_CONTEXT_TOKENS" =~ ^[0-9]+$ ]] || die "DFLASH_GRAD_CONTEXT_TOKENS must be a nonnegative integer"
 [[ "$MAX_OUTPUT_TOKENS" =~ ^[0-9]+$ ]] || die "MAX_OUTPUT_TOKENS must be a nonnegative integer"
 [[ "$MAX_PROMPT_TOKENS" =~ ^[0-9]+$ ]] || die "MAX_PROMPT_TOKENS must be a nonnegative integer"
 ((MAX_PROMPT_TOKENS == 0 || MAX_PROMPT_TOKENS < MAX_MODEL_LEN)) || die "MAX_PROMPT_TOKENS must be zero or less than MAX_MODEL_LEN"
@@ -382,6 +385,7 @@ fi
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$(dirname "$OUTPUT_FILE")" "$(dirname "$SERVER_LOG")" "$(dirname "$MONITOR_FILE")"
 rm -f "$STATS_FILE"
+[[ "$RESUME" == 1 ]] || rm -f "$STEP_METRICS_FILE"
 
 gpu_utilization=$GPU_MEMORY_UTILIZATION
 gpu_budget_gib=
@@ -421,6 +425,7 @@ if [[ "$LANGUAGE_MODEL_ONLY" == 1 ]]; then
 fi
 
 export OSD_STATS_FILE="$STATS_FILE"
+export OSD_STEP_METRICS_FILE="$STEP_METRICS_FILE"
 
 if [[ "$METHOD" == base ]]; then
   server_command=(
@@ -498,6 +503,7 @@ else
     "$log_updates_arg"
     --frozen-parameter-prefixes "$FROZEN_PARAMETER_PREFIXES"
     --dflash-max-context-tokens "$DFLASH_MAX_CONTEXT_TOKENS"
+    --dflash-grad-context-tokens "$DFLASH_GRAD_CONTEXT_TOKENS"
     --dflash-max-train-rounds "${DFLASH_MAX_TRAIN_ROUNDS:-16}"
     "${online_draft_args[@]}"
     --cpu-training-attention-backend "$CPU_TRAINING_ATTENTION_BACKEND"
@@ -507,6 +513,12 @@ else
   fi
   if [[ "${TTS_RESET_PER_REQUEST:-1}" == 0 || "${OSD_KEEP_WEIGHTS:-0}" == 1 ]]; then
     server_command+=(--keep-weights)
+  fi
+  if [[ "$METHOD" == tts && "${TTS_MASTER_WEIGHTS:-1}" == 0 ]]; then
+    server_command+=(--no-master-weights)
+  fi
+  if [[ "${TTS_EAGLE3_RECURRENT_GRADIENTS:-1}" == 0 ]]; then
+    server_command+=(--no-eagle3-recurrent-gradients)
   fi
 fi
 

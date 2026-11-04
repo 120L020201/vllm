@@ -175,6 +175,7 @@ def _create_adapter(speculator) -> DflashOnlineAdapter:
     method = os.environ["OSD_METHOD"]
     learning_rate = float(os.environ.get("OSD_LEARNING_RATE", "1e-5"))
     max_context_tokens = int(os.environ.get("OSD_DFLASH_MAX_CONTEXT_TOKENS", "0"))
+    grad_context_tokens = int(os.environ.get("OSD_DFLASH_GRAD_CONTEXT_TOKENS", "0"))
     training_model = model
     if method == "tts":
         training_model = _clone_training_model(model)
@@ -184,6 +185,8 @@ def _create_adapter(speculator) -> DflashOnlineAdapter:
         model,
         method=method,
         max_context_tokens=max_context_tokens,
+        grad_context_tokens=grad_context_tokens,
+        context_capacity=vllm_config.model_config.max_model_len,
     )
     return DflashOnlineAdapter(
         bridge,

@@ -304,6 +304,81 @@ def _mlp(hidden_states: torch.Tensor, mlp: torch.nn.Module) -> torch.Tensor:
     return _linear(F.silu(gate) * up, mlp.down_proj)
 
 
+def _context_states(
+    draft_model: torch.nn.Module, features: torch.Tensor
+) -> torch.Tensor:
+    model = draft_model.model
+    states = _linear(features, model.fc) if model.use_aux_hidden_state else features
+    return _rms_norm(states, model.hidden_norm.weight, model.config.rms_norm_eps)
+
+
+class DflashContextKVCache:
+    """Detached per-layer context K/V for the oldest accepted rows.
+
+    Rows enter the cache under the training weights of the update that
+    appends them and are never recomputed, so they contribute neither
+    gradients nor later weight changes, like the EAGLE3 TTS spine.
+    """
+
+    def __init__(
+        self,
+        draft_model: torch.nn.Module,
+        capacity: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if capacity < 1:
+            raise ValueError("context KV cache capacity must be positive")
+        attention = draft_model.model.layers[0].self_attn
+        shape = (
+            len(draft_model.model.layers),
+            capacity,
+            attention.num_kv_heads,
+            attention.head_dim,
+        )
+        self.keys = torch.empty(shape, dtype=dtype, device=device)
+        self.values = torch.empty(shape, dtype=dtype, device=device)
+        self.positions = torch.empty(capacity, dtype=torch.long, device=device)
+        self.length = 0
+
+    def clear(self) -> None:
+        self.length = 0
+
+    def layer(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.keys[index, : self.length], self.values[index, : self.length]
+
+    @property
+    def cached_positions(self) -> torch.Tensor:
+        return self.positions[: self.length]
+
+    def append(
+        self,
+        draft_model: torch.nn.Module,
+        features: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        count = features.shape[0]
+        if count == 0:
+            return
+        end = self.length + count
+        if end > self.positions.numel():
+            raise ValueError("DFlash context KV cache is full")
+        if (
+            self.length
+            and int(positions[0]) != int(self.positions[self.length - 1]) + 1
+        ):
+            raise ValueError("cached context positions must be contiguous")
+        with torch.no_grad():
+            states = _context_states(draft_model, features)
+            for index, layer in enumerate(draft_model.model.layers):
+                key, value = _context_key_value(states, layer.self_attn, positions)
+                self.keys[index, self.length : end].copy_(key)
+                self.values[index, self.length : end].copy_(value)
+        self.positions[self.length : end].copy_(positions)
+        self.length = end
+
+
 def validate_dflash_drafter(draft_model: torch.nn.Module) -> None:
     """Fail fast when the resident drafter lacks the expected block structure."""
     model = getattr(draft_model, "model", None)
@@ -351,6 +426,7 @@ def draft_logits(
     context_positions: torch.Tensor,
     query_input_ids: torch.Tensor,
     query_positions: torch.Tensor,
+    context_cache: DflashContextKVCache | None = None,
 ) -> torch.Tensor:
     """Replay one DFlash block forward from the drafter's live weights.
 
@@ -360,6 +436,8 @@ def draft_logits(
         context_positions: Absolute positions of the context rows.
         query_input_ids: Bonus token followed by mask tokens.
         query_positions: Absolute positions of the query block.
+        context_cache: Detached K/V of the context rows that precede
+            ``context_features``.
 
     Returns:
         Draft-vocabulary logits for the query block, shaped
@@ -372,11 +450,10 @@ def draft_logits(
         raise ValueError("query input ids and positions must match")
 
     eps = model.config.rms_norm_eps
-    if model.use_aux_hidden_state:
-        context_states = _linear(context_features, model.fc)
-    else:
-        context_states = context_features
-    context_states = _rms_norm(context_states, model.hidden_norm.weight, eps)
+    context_states = _context_states(draft_model, context_features)
+    key_positions = context_positions
+    if context_cache is not None:
+        key_positions = torch.cat((context_cache.cached_positions, context_positions))
 
     with torch.no_grad():
         if query_input_ids.device.type == "cpu":
@@ -396,10 +473,10 @@ def draft_logits(
                 )
         else:
             hidden_states = draft_model.embed_input_ids(query_input_ids)
-    for layer in model.layers:
+    for layer_index, layer in enumerate(model.layers):
         attention = layer.self_attn
         mask = _attention_mask(
-            context_positions,
+            key_positions,
             query_positions,
             causal=attention.causal,
             sliding_window=attention.sliding_window,
@@ -414,6 +491,10 @@ def draft_logits(
             attention,
             context_positions,
         )
+        if context_cache is not None:
+            cached_key, cached_value = context_cache.layer(layer_index)
+            context_key = torch.cat((cached_key, context_key))
+            context_value = torch.cat((cached_value, context_value))
         key = torch.cat((context_key, query_key))
         value = torch.cat((context_value, query_value))
         attended = _scaled_attention(query, key, value, attention, mask)
@@ -535,6 +616,8 @@ def train_dflash_round(
     batch: DflashTrainingBatch,
     *,
     max_context_tokens: int = 0,
+    context_cache: DflashContextKVCache | None = None,
+    grad_context_tokens: int = 0,
 ) -> float:
     """Run one in-place forward-KL update and refresh inference buffers.
 
@@ -543,6 +626,12 @@ def train_dflash_round(
         draft_model: Model receiving the optimizer update.
         batch: Verified proposal data for this training step.
         max_context_tokens: Optional cap on the most recent context rows.
+        context_cache: Detached K/V of the context before the batch rows.
+            The batch rows older than the newest ``grad_context_tokens`` are
+            appended to it with the pre-update weights; only the newest rows
+            are recomputed with gradients.
+        grad_context_tokens: Context rows recomputed with gradients when a
+            cache is given.
 
     Returns:
         The scalar forward-KL loss before the optimizer update.
@@ -551,7 +640,18 @@ def train_dflash_round(
         raise ValueError("max_context_tokens must be nonnegative")
     context_features = batch.context_hidden_states
     context_positions = batch.context_positions
-    if max_context_tokens and context_features.shape[0] > max_context_tokens:
+    if context_cache is not None:
+        if max_context_tokens:
+            raise ValueError("context caching does not support max_context_tokens")
+        if grad_context_tokens < 1:
+            raise ValueError("grad_context_tokens must be positive with a cache")
+        split = max(0, context_features.shape[0] - grad_context_tokens)
+        context_cache.append(
+            draft_model, context_features[:split], context_positions[:split]
+        )
+        context_features = context_features[split:]
+        context_positions = context_positions[split:]
+    elif max_context_tokens and context_features.shape[0] > max_context_tokens:
         context_features = context_features[-max_context_tokens:]
         context_positions = context_positions[-max_context_tokens:]
 
@@ -562,6 +662,7 @@ def train_dflash_round(
             context_positions,
             batch.query_input_ids,
             batch.query_positions,
+            context_cache=context_cache,
         )
         student = logits[1 : batch.target_count + 1]
         teacher = batch.teacher_probabilities

@@ -9,7 +9,7 @@ BASELINE_METHOD = "dflash"
 DRAFT_METHODS = ("eagle3", "dflash", "mtp")
 TTS_METHODS = frozenset({"tts", "random_sampling"})
 DEFAULT_SPEC_TOKENS = 15
-DEFAULT_EAGLE3_SPEC_TOKENS = 7
+DEFAULT_EAGLE3_SPEC_TOKENS = 8
 DEFAULT_MTP_SPEC_TOKENS = 3
 _DEFAULT_DRAFT_DIRECTORIES = {
     "eagle3": "qwen3-{size}-eagle3",

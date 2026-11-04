@@ -27,6 +27,7 @@ from methods.dflash.config import (
 )
 from methods.dflash.factory import _clone_training_model
 from methods.dflash.training import (
+    DflashContextKVCache,
     DflashTrainingBatch,
     create_dflash_trainer,
     draft_logits,
@@ -428,6 +429,39 @@ class DFlashTrainingTest(unittest.TestCase):
         self.assertEqual(model.rebuild_calls, 0)
         self.assertFalse(torch.equal(before, model.fc.weight.detach()))
 
+    def test_cached_context_matches_full_replay_but_detaches_old_rows(self):
+        """Old rows keep their values and lose only their gradient path."""
+        draft = _Draft(_DFlashModel())
+        context = torch.randn(6, 12)
+        positions = torch.arange(6, dtype=torch.long)
+        ids = torch.tensor([3, 4, 5, 6], dtype=torch.long)
+        query_positions = torch.arange(6, 10, dtype=torch.long)
+        full = draft_logits(draft, context, positions, ids, query_positions)
+        full_grad = torch.autograd.grad(full.square().sum(), draft.model.fc.weight)
+
+        def cached_grad(grad_rows):
+            cache = DflashContextKVCache(
+                draft, 8, dtype=torch.float32, device=torch.device("cpu")
+            )
+            split = 6 - grad_rows
+            cache.append(draft, context[:split], positions[:split])
+            logits = draft_logits(
+                draft,
+                context[split:],
+                positions[split:],
+                ids,
+                query_positions,
+                context_cache=cache,
+            )
+            grad = torch.autograd.grad(logits.square().sum(), draft.model.fc.weight)
+            return logits, grad[0]
+
+        partial, partial_grad = cached_grad(2)
+        torch.testing.assert_close(partial, full)
+        self.assertFalse(torch.allclose(partial_grad, full_grad[0]))
+        _, all_rows_grad = cached_grad(6)
+        torch.testing.assert_close(all_rows_grad, full_grad[0])
+
     def test_trainer_freezes_shared_embedding_and_lm_head(self):
         draft = _Draft(_DFlashModel())
         with patch.dict(
@@ -680,6 +714,35 @@ class DflashBridgeTest(unittest.TestCase):
             trainer.reset.assert_called_once()
             rebuild.assert_called_once_with(model)
 
+    def test_cached_context_sends_only_uncached_rows_and_resets(self):
+        draft = _Draft(_DFlashModel())
+        features = torch.randn(9, 12)
+        with patch.dict(
+            "os.environ",
+            {"OSD_UPDATE_STRIDE": "1", "OSD_FUSED_OPTIMIZER": "0"},
+        ):
+            trainer = create_dflash_trainer(draft, learning_rate=1e-3)
+            bridge = DflashPolicyBridge(
+                trainer,
+                draft,
+                method="tts",
+                grad_context_tokens=2,
+                context_capacity=16,
+            )
+            cache = bridge._context_cache
+            assert cache is not None
+            for step, length in enumerate((4, 7)):
+                batch = _make_batch(context_length=length)
+                batch.context_hidden_states = features[:length]
+                self.assertEqual(bridge.observe("req", step, batch), 1)
+                self.assertEqual(cache.length, length - 2)
+                torch.testing.assert_close(
+                    cache.cached_positions, torch.arange(length - 2)
+                )
+            bridge.reset_request("req")
+        self.assertEqual(cache.length, 0)
+        self.assertEqual(bridge._cached_rows, 0)
+
     def test_random_sampling_gate_can_skip_updates(self):
         with (
             patch.dict(
@@ -721,7 +784,7 @@ class DflashLaunchTest(unittest.TestCase):
     def test_tts_keeps_eagle3_defaults(self):
         command, env = self._command("tts")
         self.assertEqual(command[command.index("--spec-method") + 1], "eagle3")
-        self.assertEqual(command[command.index("--spec-tokens") + 1], "7")
+        self.assertEqual(command[command.index("--spec-tokens") + 1], "8")
         self.assertEqual(env["OSD_DRAFT_METHOD"], "eagle3")
         self.assertTrue(command[command.index("--spec-model") + 1].endswith("-eagle3"))
 
@@ -762,13 +825,38 @@ class DflashLaunchTest(unittest.TestCase):
                 "tts", "--draft-method", "dflash", "--dflash-max-context-tokens", "-1"
             )
 
+    def test_grad_context_tokens_are_forwarded_and_validated(self):
+        _, env = configure(
+            build_parser().parse_args(
+                (
+                    "tts",
+                    "--draft-method",
+                    "dflash",
+                    "--dflash-grad-context-tokens",
+                    "32",
+                    "--dry-run",
+                )
+            )
+        )
+        self.assertEqual(env["OSD_DFLASH_GRAD_CONTEXT_TOKENS"], "32")
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            self._command(
+                "tts",
+                "--draft-method",
+                "dflash",
+                "--dflash-grad-context-tokens",
+                "32",
+                "--dflash-max-context-tokens",
+                "1024",
+            )
+
     def test_resolvers_and_default_directory(self):
         self.assertEqual(resolve_draft_method("dflash", None), "dflash")
         self.assertEqual(resolve_draft_method("tts", None), "eagle3")
         self.assertEqual(resolve_draft_method("tts", "dflash"), "dflash")
         self.assertEqual(resolve_draft_method("tts", "mtp"), "mtp")
         self.assertEqual(resolve_speculative_tokens("dflash", None), 15)
-        self.assertEqual(resolve_speculative_tokens("eagle3", None), 7)
+        self.assertEqual(resolve_speculative_tokens("eagle3", None), 8)
         self.assertEqual(resolve_speculative_tokens("mtp", None), 3)
         self.assertEqual(
             default_draft_directory(Path("/root"), "4b", "dflash"),

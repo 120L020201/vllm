@@ -22,6 +22,8 @@ def train_batches(
     *,
     persistent_cache: PersistentEagle3KVCache = None,
     mode: Eagle3WindowMode = Eagle3WindowMode.CONFIRMED_PATH,
+    position_decay_rho: float | None = None,
+    recurrent_gradients: bool = False,
 ) -> tuple[Eagle3KVCache | None, tuple[float, ...]]:
     """Train each batch with one update and return its final cache and losses."""
     cache = persistent_cache
@@ -32,6 +34,8 @@ def train_batches(
             window=Eagle3TrainingWindow(rounds=(batch,)),
             persistent_cache=cache,
             mode=mode,
+            position_decay_rho=position_decay_rho,
+            recurrent_gradients=recurrent_gradients,
         )
         losses.append(result.loss)
     return cache, tuple(losses)

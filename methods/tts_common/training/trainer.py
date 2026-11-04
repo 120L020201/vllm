@@ -95,6 +95,18 @@ class DraftTrainer:
         if self.config.master_weights:
             self.model.zero_grad(set_to_none=True)
 
+    @torch.no_grad()
+    def sync_master_weights(self) -> None:
+        """Copy the model parameters into the FP32 optimizer master weights."""
+        if not self.config.master_weights:
+            return
+        for master, (_, parameter) in zip(
+            self._optimizer_parameters,
+            self._trainable_named_parameters,
+            strict=True,
+        ):
+            master.copy_(parameter)
+
     def clear_optimizer_state(self) -> None:
         self.optimizer.state.clear()
         self.zero_grad()

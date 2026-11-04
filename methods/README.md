@@ -52,7 +52,7 @@ Use `--model-size 4b` or `--model-size 8b` to select a prepared target/draft
 pair. `--target` and `--draft` override either checkpoint location. Defaults
 are the 8B pair under `methods/artifacts`, BF16, context length 32768, chunked
 prefill disabled, 0.8 GPU memory utilization, and one concurrent request.
-EAGLE-3 uses seven draft tokens; DFlash drafts use 15 (`b16` blocks). Select a
+EAGLE-3 uses eight draft tokens (the TTS paper's generation depth); DFlash drafts use 15 (`b16` blocks). Select a
 DFlash draft explicitly with `--draft-method dflash`, or implicitly with the
 `dflash` entry; `--spec-tokens` overrides either default. Remote model code is
 trusted by default to match the artifact scripts. There is no model-size-based
@@ -306,7 +306,9 @@ left truncation. Chunked prefill can be enabled explicitly with
 
 The script maps `TTS_UPDATE_STRIDE`, `TTS_LEARNING_RATE` (default `1e-5`),
 `TTS_RESET_PER_REQUEST`, and `CHUNK_SIZE` to the method launcher. Online
-training is intentionally single-request ordered.
+training is intentionally single-request ordered. TTS keeps FP32 optimizer
+master weights by default; `TTS_MASTER_WEIGHTS=0` (or `--no-master-weights`)
+trains the BF16 weights directly.
 
 Every `experiments/run.sh` mode defaults to `GPU_MEMORY_UTILIZATION=0.9` without
 a model-size-based hard cap. `GPU_ATTENTION_BACKEND=FLASHINFER` explicitly sets

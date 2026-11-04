@@ -36,6 +36,7 @@ from methods.tts_common.training.qwen3_eagle3 import (
     load_qwen3_eagle3_from_vllm,
 )
 from methods.tts_common.training.trainer import DraftTrainer, TrainerConfig
+from methods.tts_common.window import EAGLE3_POSITION_DECAY_RHO
 from methods.utils.cuda_worker import CudaStreamResult, CudaStreamWorker
 from methods.utils.stats import WorkerStats
 
@@ -282,6 +283,7 @@ def _load_gpu_state(
             if source.device != target.device:
                 raise ValueError("training weights must not leave CUDA")
             target.copy_(source)
+    trainer.sync_master_weights()
     trainer.clear_optimizer_state()
     trainer.last_loss = None
 
@@ -314,6 +316,7 @@ class GpuChunkEnsemble:
                         fused=config.fused,
                         frozen_parameter_prefixes=config.frozen_parameter_prefixes,
                         check_gradients=config.check_gradients,
+                        master_weights=config.master_weights,
                     ),
                 )
             )
@@ -375,6 +378,8 @@ class GpuPolicyBridge:
         *,
         method: str,
         merge_destination: dict[str, torch.Tensor] | None = None,
+        position_decay_rho: float | None = None,
+        recurrent_gradients: bool = False,
     ) -> None:
         if method not in {"tts", "random_sampling", "ospec"}:
             raise ValueError(f"unsupported method: {method}")
@@ -382,6 +387,9 @@ class GpuPolicyBridge:
             raise ValueError("online draft trainer must be on CUDA")
 
         self.method = method
+        # OSpec keeps its own objective; TTS and its random gate share this one.
+        self.position_decay_rho = position_decay_rho
+        self.recurrent_gradients = recurrent_gradients
         self.stride = int(os.environ.get("OSD_UPDATE_STRIDE", "1"))
         self.chunk_size = int(os.environ.get("OSD_CHUNK_SIZE", "5"))
         if self.stride < 1 or self.chunk_size < 1:
@@ -505,6 +513,8 @@ class GpuPolicyBridge:
                         (batch,),
                         persistent_cache=self._async_persistent_cache,
                         mode=Eagle3WindowMode.PROPOSAL_CANVAS,
+                        position_decay_rho=self.position_decay_rho,
+                        recurrent_gradients=self.recurrent_gradients,
                     )
                     updates = 1
                     return GpuWeightSnapshot(
@@ -564,6 +574,8 @@ class GpuPolicyBridge:
                 (batch,),
                 persistent_cache=self._persistent_cache,
                 mode=Eagle3WindowMode.PROPOSAL_CANVAS,
+                position_decay_rho=self.position_decay_rho,
+                recurrent_gradients=self.recurrent_gradients,
             )
             self._latest = GpuWeightSnapshot(
                 version=self.trainer.version,
@@ -686,6 +698,10 @@ def create_gpu_policy_bridge(
         learning_rate=learning_rate,
         method=method,
         inference_model=inference_model,
+        position_decay_rho=EAGLE3_POSITION_DECAY_RHO,
+        recurrent_gradients=(
+            os.environ.get("OSD_EAGLE3_RECURRENT_GRADIENTS", "1") == "1"
+        ),
     )
 
 
@@ -718,12 +734,15 @@ def _create_gpu_policy_bridge(
     learning_rate: float,
     method: str,
     inference_model=None,
+    position_decay_rho: float | None = None,
+    recurrent_gradients: bool = False,
 ) -> GpuPolicyBridge:
     trainer = DraftTrainer(
         model,
         TrainerConfig(
             learning_rate=learning_rate,
             fused=os.environ.get("OSD_FUSED_OPTIMIZER", "1") == "1",
+            master_weights=os.environ.get("OSD_MASTER_WEIGHTS", "0") == "1",
         ),
     )
     merge_destination = None
@@ -737,4 +756,6 @@ def _create_gpu_policy_bridge(
         trainer,
         method=method,
         merge_destination=merge_destination,
+        position_decay_rho=position_decay_rho,
+        recurrent_gradients=recurrent_gradients,
     )

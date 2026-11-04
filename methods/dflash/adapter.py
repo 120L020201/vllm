@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 
 from methods.dflash.training import (
+    DflashContextKVCache,
     DflashTrainingBatch,
     rebuild_fused_context_buffers,
     target_token_ids,
@@ -142,11 +143,17 @@ class DflashPolicyBridge:
         *,
         method: str,
         max_context_tokens: int = 0,
+        grad_context_tokens: int = 0,
+        context_capacity: int = 0,
     ) -> None:
         if method not in {"tts", "random_sampling"}:
             raise ValueError(f"unsupported DFlash method: {method}")
-        if max_context_tokens < 0:
-            raise ValueError("max_context_tokens must be nonnegative")
+        if max_context_tokens < 0 or grad_context_tokens < 0:
+            raise ValueError("DFlash context limits must be nonnegative")
+        if grad_context_tokens and max_context_tokens:
+            raise ValueError(
+                "grad_context_tokens cannot be combined with max_context_tokens"
+            )
         self.trainer = trainer
         self.draft_model = draft_model
         self.method = method
@@ -154,6 +161,19 @@ class DflashPolicyBridge:
         if self.stride < 1:
             raise ValueError("update stride must be positive")
         self.max_context_tokens = max_context_tokens
+        self.grad_context_tokens = grad_context_tokens
+        # With a cache, older context rows keep detached K/V; only rows that
+        # the side stream has not cached yet are sent to training.
+        self._context_cache: DflashContextKVCache | None = None
+        self._cached_rows = 0
+        if grad_context_tokens:
+            parameter = next(trainer.model.parameters())
+            self._context_cache = DflashContextKVCache(
+                trainer.model,
+                context_capacity,
+                dtype=parameter.dtype,
+                device=parameter.device,
+            )
         self.gate = None
         if method == "random_sampling":
             self.gate = BernoulliGate(
@@ -225,8 +245,7 @@ class DflashPolicyBridge:
                 "the prior DFlash TTS update has not reached its boundary"
             )
 
-        context_hidden_states = batch.context_hidden_states
-        context_positions = batch.context_positions
+        context_hidden_states, context_positions = self._uncached_context(batch)
         if self.max_context_tokens and (
             context_hidden_states.shape[0] > self.max_context_tokens
         ):
@@ -252,6 +271,8 @@ class DflashPolicyBridge:
                     self.trainer.model,
                     training_batch,
                     max_context_tokens=self.max_context_tokens,
+                    context_cache=self._context_cache,
+                    grad_context_tokens=self.grad_context_tokens,
                 )
                 updates = 1
                 if self.log_updates:
@@ -277,6 +298,20 @@ class DflashPolicyBridge:
         )
         self._pending_update = (self._rounds, future)
         return 1
+
+    def _uncached_context(
+        self, batch: DflashTrainingBatch
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the context rows not cached once queued updates have run."""
+        features = batch.context_hidden_states
+        positions = batch.context_positions
+        if self._context_cache is None:
+            return features, positions
+        if int(positions[0]) != 0:
+            raise ValueError("cached DFlash training requires the full context")
+        start = self._cached_rows
+        self._cached_rows = max(start, features.shape[0] - self.grad_context_tokens)
+        return features[start:], positions[start:]
 
     def maybe_apply_pending_weights(
         self,
@@ -318,11 +353,24 @@ class DflashPolicyBridge:
         if not should_train:
             return 0
 
+        if self._context_cache is not None:
+            features, positions = self._uncached_context(batch)
+            batch = DflashTrainingBatch(
+                context_hidden_states=features,
+                context_positions=positions,
+                query_input_ids=batch.query_input_ids,
+                query_positions=batch.query_positions,
+                teacher_probabilities=batch.teacher_probabilities,
+                teacher_coverage=batch.teacher_coverage,
+                rejection_position=batch.rejection_position,
+            )
         loss = train_dflash_round(
             self.trainer,
             self.draft_model,
             batch,
             max_context_tokens=self.max_context_tokens,
+            context_cache=self._context_cache,
+            grad_context_tokens=self.grad_context_tokens,
         )
         self.stats.record_weight_install()
         if self.log_updates:
@@ -345,6 +393,8 @@ class DflashPolicyBridge:
             keep_weights = os.environ.get("OSD_KEEP_WEIGHTS", "0") == "1"
 
             def reset_tts() -> _DflashWeightSnapshot | None:
+                if self._context_cache is not None:
+                    self._context_cache.clear()
                 if keep_weights:
                     if self._pending_update is None:
                         return None
@@ -362,6 +412,7 @@ class DflashPolicyBridge:
             reset_result.completed.synchronize()
             self._reset_snapshot = reset_result.value
             self._pending_update = None
+            self._cached_rows = 0
             self._request_id = None
             self._next_step_id = 0
             self._rounds = 0
@@ -370,6 +421,9 @@ class DflashPolicyBridge:
         if os.environ.get("OSD_KEEP_WEIGHTS", "0") != "1" and self.trainer.version > 0:
             self.trainer.reset()
             rebuild_fused_context_buffers(self.draft_model)
+        if self._context_cache is not None:
+            self._context_cache.clear()
+        self._cached_rows = 0
         self._request_id = None
         self._next_step_id = 0
         self._rounds = 0

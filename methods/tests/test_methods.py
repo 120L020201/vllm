@@ -327,6 +327,24 @@ class LauncherTest(unittest.TestCase):
         enabled_command, _ = configure(enabled)
         self.assertTrue(self._online_draft_config(enabled_command)["master_weights"])
 
+    def test_tts_defaults_to_fp32_master_weights(self):
+        for method, flags, expected in (
+            ("tts", (), "1"),
+            ("tts", ("--no-master-weights",), "0"),
+            ("random_sampling", (), "0"),
+            ("ospec", (), "0"),
+        ):
+            args = build_parser().parse_args((method, *flags, "--dry-run"))
+            command, env = configure(args)
+            self.assertEqual(env["OSD_MASTER_WEIGHTS"], expected, method)
+            self.assertNotIn("master_weights", self._online_draft_config(command))
+
+    def test_eagle3_recurrent_gradients_default_on(self):
+        for flags, expected in (((), "1"), (("--no-eagle3-recurrent-gradients",), "0")):
+            args = build_parser().parse_args(("tts", *flags, "--dry-run"))
+            _, env = configure(args)
+            self.assertEqual(env["OSD_EAGLE3_RECURRENT_GRADIENTS"], expected)
+
     def test_cpu_training_optimizations_are_forwarded(self):
         args = build_parser().parse_args(
             (
@@ -616,7 +634,7 @@ class RunScriptTest(unittest.TestCase):
 
     def test_tts_aliases_select_gpu_training_with_the_requested_draft(self):
         for method, draft, spec_tokens in (
-            ("tts+eagle3", "eagle3", 7),
+            ("tts+eagle3", "eagle3", 8),
             ("tts+dflash", "dflash", 15),
             ("tts+mtp", "mtp", 3),
         ):
@@ -1474,6 +1492,124 @@ vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 7
         )
 
 
+class Eagle3TtsObjectiveTest(unittest.TestCase):
+    def test_unrolled_canvas_matches_packed_values_but_crosses_recurrence(self):
+        """Redrafting reproduces the captured canvas, so only gradients change."""
+        from methods.tts_common.training import qwen3_eagle3
+        from methods.tts_common.training.eagle3.cache import (
+            _append_confirmed_window,
+            persistent_cache_length,
+        )
+        from methods.tts_common.training.eagle3.inputs import (
+            prepare_eagle3_proposal_window_inputs,
+        )
+        from methods.tts_common.training.eagle3.window import Eagle3TrainingWindow
+        from methods.tts_common.window import _unrolled_proposal_logits
+
+        torch.manual_seed(0)
+        model = qwen3_eagle3.Qwen3Eagle3ForCausalLM(
+            qwen3_eagle3.Qwen3Eagle3Config(
+                hidden_size=4,
+                intermediate_size=8,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=2,
+                num_hidden_layers=1,
+                target_vocab_size=8,
+                draft_vocab_size=5,
+                rms_norm_eps=1e-6,
+                rope_theta=10000.0,
+                num_aux_hidden_states=2,
+            )
+        ).double()
+        batch = _make_batch()
+        for name in (
+            "prefix_input_embeds",
+            "prefix_aux_hidden_states",
+            "draft_token_input_embeds",
+            "confirmed_input_embeds",
+            "confirmed_aux_hidden_states",
+        ):
+            setattr(batch, name, getattr(batch, name).double())
+        window = Eagle3TrainingWindow(rounds=(batch,))
+        with torch.no_grad():
+            prefix = _append_confirmed_window(model, window, None)
+            anchor = batch.prefix_aux_hidden_states[-1:]
+            first = model(
+                positions=batch.proposal_positions[:1],
+                input_embeds=batch.prefix_input_embeds[-1:],
+                hidden_states=model.combine_hidden_states(anchor),
+                past_key_values=prefix,
+                attention_mask=torch.tensor(
+                    [
+                        [False] * 2
+                        + [True] * (persistent_cache_length(prefix) - 2)
+                        + [False]
+                    ]
+                ),
+            )
+        batch.draft_input_hidden_states = first.recurrent_hidden_states.clone()
+
+        packed_inputs = prepare_eagle3_proposal_window_inputs(
+            model, window, spine_length=persistent_cache_length(prefix)
+        )
+        packed = model.compute_draft_logits(
+            model(
+                positions=packed_inputs.positions,
+                input_embeds=packed_inputs.input_embeds,
+                hidden_states=packed_inputs.hidden_states,
+                past_key_values=prefix,
+                attention_mask=packed_inputs.attention_mask,
+            ).hidden_states
+        )
+        unrolled, teacher = _unrolled_proposal_logits(model, window, prefix)
+
+        torch.testing.assert_close(unrolled, packed)
+        torch.testing.assert_close(teacher, batch.teacher_probabilities)
+        weight = model.model.layers[0].self_attn.o_proj.weight
+        packed_grad = torch.autograd.grad(packed[1].square().sum(), weight)[0]
+        unrolled_grad = torch.autograd.grad(unrolled[1].square().sum(), weight)[0]
+        self.assertFalse(torch.allclose(packed_grad, unrolled_grad))
+
+    def test_step_metrics_write_one_line_per_finished_request(self):
+        import numpy as np
+
+        from methods.utils.step_metrics import StepMetricsRecorder
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "steps.jsonl"
+            recorder = StepMetricsRecorder(str(path))
+            for request_id, drafts, sampled in (
+                ("_warmup_0", [7], [3]),
+                ("request", [0], [1]),
+                ("request", [7], [3]),
+                ("request", [7], [8]),
+            ):
+                recorder.observe(
+                    SimpleNamespace(
+                        req_ids=[request_id],
+                        num_reqs=1,
+                        num_draft_tokens_per_req=np.array(drafts),
+                        prefill_len_np=np.array([12]),
+                    ),
+                    torch.tensor(sampled),
+                )
+            recorder.finish(["request", "_warmup_0"])
+
+            lines = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                {
+                    "request_id": "request",
+                    "prompt_tokens": 12,
+                    "draft_tokens": [7, 7],
+                    "accepted_tokens": [2, 7],
+                }
+            ],
+        )
+
+
 class PolicyTest(unittest.TestCase):
     def test_cpu_stats_count_training_windows_and_installs_separately(self):
         trainer = SimpleNamespace(version=0)
@@ -1816,6 +1952,36 @@ class GpuPolicyTest(unittest.TestCase):
                     for tensor in snapshot.state_dict.values()
                 )
             )
+        finally:
+            bridge.shutdown()
+
+    def test_tts_reset_restores_fp32_master_weights(self):
+        from methods.tts_common.training import trainer as tts_trainer
+        from methods.utils.gpu_training import GpuPolicyBridge
+
+        model = _make_trainer(device="cuda").model
+        trainer = tts_trainer.DraftTrainer(
+            model,
+            tts_trainer.TrainerConfig(learning_rate=1e-2, master_weights=True),
+        )
+        initial = model.model.fc.weight.detach().clone()
+        bridge = GpuPolicyBridge(trainer, method="tts")
+        try:
+            bridge.observe_step("request", 0, _make_batch(device="cuda"))
+            bridge.maybe_apply_pending_weights()
+            self.assertFalse(torch.equal(initial, model.model.fc.weight))
+
+            bridge.reset_request("request")
+            bridge.maybe_apply_pending_weights()
+            self.assertTrue(torch.equal(initial, model.model.fc.weight))
+            # A stale master would overwrite the reset on the next step.
+            for master, (_, parameter) in zip(
+                trainer._optimizer_parameters,
+                trainer._trainable_named_parameters,
+                strict=True,
+            ):
+                self.assertIsNot(master, parameter)
+                self.assertTrue(torch.equal(master, parameter))
         finally:
             bridge.shutdown()
 
