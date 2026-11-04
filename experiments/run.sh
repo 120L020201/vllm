@@ -141,12 +141,22 @@ MONITOR_FILE=${MONITOR_FILE:-$RUN_DIR/monitor.csv}
 RUN_LOG=${RUN_LOG:-}
 STATS_FILE=${STATS_FILE:-$RUN_DIR/stats.json}
 STEP_METRICS_FILE=${STEP_METRICS_FILE:-$RUN_DIR/steps.jsonl}
+ONLINE_DRAFT_UPDATE_METRICS=${ONLINE_DRAFT_UPDATE_METRICS:-0}
+UPDATE_METRICS_FILE=${UPDATE_METRICS_FILE:-$RUN_DIR/updates.jsonl}
 if [[ "$METHOD" == online_draft ]]; then
   ONLINE_DRAFT_MASTER_WEIGHTS=${ONLINE_DRAFT_MASTER_WEIGHTS:-1}
   ONLINE_DRAFT_CONTINUOUS_TRAINING=${ONLINE_DRAFT_CONTINUOUS_TRAINING:-0}
   ONLINE_DRAFT_LR_REFERENCE_ROWS=${ONLINE_DRAFT_LR_REFERENCE_ROWS:-0}
   ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=${ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE:-0}
+  ONLINE_DRAFT_GROUPED_QUERY_ATTENTION=${ONLINE_DRAFT_GROUPED_QUERY_ATTENTION:-0}
+  ONLINE_DRAFT_SELECTIVE_LAST_LAYER=${ONLINE_DRAFT_SELECTIVE_LAST_LAYER:-0}
+  ONLINE_DRAFT_CPU_THREADS=${ONLINE_DRAFT_CPU_THREADS:-}
+  ONLINE_DRAFT_CPU_AFFINITY=${ONLINE_DRAFT_CPU_AFFINITY:-}
 fi
+if [[ -z "${MAX_TRAIN_ROUNDS:-}" && "$DRAFT_METHOD" == dflash ]]; then
+  MAX_TRAIN_ROUNDS=${DFLASH_MAX_TRAIN_ROUNDS:-}
+fi
+MAX_TRAIN_ROUNDS=${MAX_TRAIN_ROUNDS:-}
 DRY_RUN=${DRY_RUN:-0}
 RESUME=${RESUME:-}
 
@@ -164,7 +174,14 @@ which keeps T=1) sharpens both DFlash distributions to that temperature.
 ONLINE_DRAFT_MASTER_WEIGHTS defaults to 1; ONLINE_DRAFT_CONTINUOUS_TRAINING
 defaults to 0. ONLINE_DRAFT_LR_REFERENCE_ROWS (default 0, which disables it)
 scales the learning rate by min(1, rows / N). ONLINE_DRAFT_LR sets the
-learning rate.
+learning rate. MAX_TRAIN_ROUNDS trains only the newest N rounds per update
+(0 trains every round; default 16 for DFlash, set by DFLASH_MAX_TRAIN_ROUNDS
+for compatibility, and 0 otherwise). ONLINE_DRAFT_GROUPED_QUERY_ATTENTION and
+ONLINE_DRAFT_SELECTIVE_LAST_LAYER (DFlash only, default 0) enable the CPU
+training shortcuts. ONLINE_DRAFT_CPU_THREADS and ONLINE_DRAFT_CPU_AFFINITY take
+JSON objects keyed by inference, capture, and training; unset leaves threads
+to OMP_NUM_THREADS and does not pin CPUs. ONLINE_DRAFT_UPDATE_METRICS=1
+(default 0) appends each request's CPU updates to UPDATE_METRICS_FILE.
 eagle3, dflash, and mtp never train the draft. MTP uses target-embedded weights.
 DFlash defaults SPEC_TOKENS to 15 and MTP defaults it to 3.
 LANGUAGE_MODEL_ONLY=1 loads only the language model; use it for text-only
@@ -253,6 +270,16 @@ if [[ "$METHOD" == online_draft ]]; then
   [[ "$ONLINE_DRAFT_CONTINUOUS_TRAINING" == 0 || "$ONLINE_DRAFT_CONTINUOUS_TRAINING" == 1 ]] || die "ONLINE_DRAFT_CONTINUOUS_TRAINING must be 0 or 1"
   awk -v rows="$ONLINE_DRAFT_LR_REFERENCE_ROWS" 'BEGIN { if (rows !~ /^[0-9]+([.][0-9]+)?$/) exit 1 }' || die "ONLINE_DRAFT_LR_REFERENCE_ROWS must be a nonnegative number"
   awk -v temperature="$ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE" 'BEGIN { if (temperature !~ /^[0-9]+([.][0-9]+)?$/) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE must be a nonnegative number"
+  [[ "$ONLINE_DRAFT_GROUPED_QUERY_ATTENTION" == 0 || "$ONLINE_DRAFT_GROUPED_QUERY_ATTENTION" == 1 ]] || die "ONLINE_DRAFT_GROUPED_QUERY_ATTENTION must be 0 or 1"
+  [[ "$ONLINE_DRAFT_SELECTIVE_LAST_LAYER" == 0 || "$ONLINE_DRAFT_SELECTIVE_LAST_LAYER" == 1 ]] || die "ONLINE_DRAFT_SELECTIVE_LAST_LAYER must be 0 or 1"
+  if [[ "$DRAFT_METHOD" != dflash && ( "$ONLINE_DRAFT_GROUPED_QUERY_ATTENTION" == 1 || "$ONLINE_DRAFT_SELECTIVE_LAST_LAYER" == 1 ) ]]; then
+    die "ONLINE_DRAFT_GROUPED_QUERY_ATTENTION and ONLINE_DRAFT_SELECTIVE_LAST_LAYER require DFlash"
+  fi
+fi
+[[ -z "$MAX_TRAIN_ROUNDS" || "$MAX_TRAIN_ROUNDS" =~ ^[0-9]+$ ]] || die "MAX_TRAIN_ROUNDS must be a nonnegative integer"
+[[ "$ONLINE_DRAFT_UPDATE_METRICS" == 0 || "$ONLINE_DRAFT_UPDATE_METRICS" == 1 ]] || die "ONLINE_DRAFT_UPDATE_METRICS must be 0 or 1"
+if [[ "$ONLINE_DRAFT_UPDATE_METRICS" == 1 && "$METHOD" != online_draft ]]; then
+  die "ONLINE_DRAFT_UPDATE_METRICS requires an online_draft method"
 fi
 [[ "$SEED" =~ ^[0-9]+$ ]] || die "SEED must be a nonnegative integer"
 [[ "$WARMUP_TOKENS" =~ ^[0-9]+$ ]] || die "WARMUP_TOKENS must be a nonnegative integer"
@@ -343,6 +370,9 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$(dirname "$OUTPUT_FILE")" "$(dirname "$SERVER_LOG")" "$(dirname "$MONITOR_FILE")"
 rm -f "$STATS_FILE"
 [[ "$RESUME" == 1 ]] || rm -f "$STEP_METRICS_FILE"
+if [[ "$ONLINE_DRAFT_UPDATE_METRICS" == 1 ]]; then
+  rm -f "$UPDATE_METRICS_FILE"
+fi
 
 gpu_utilization=$GPU_MEMORY_UTILIZATION
 gpu_budget_gib=
@@ -383,6 +413,11 @@ fi
 
 export OSD_STATS_FILE="$STATS_FILE"
 export OSD_STEP_METRICS_FILE="$STEP_METRICS_FILE"
+if [[ "$ONLINE_DRAFT_UPDATE_METRICS" == 1 ]]; then
+  export OSD_UPDATE_METRICS_FILE="$UPDATE_METRICS_FILE"
+else
+  unset OSD_UPDATE_METRICS_FILE
+fi
 
 if [[ "$METHOD" == base ]]; then
   server_command=(
@@ -412,6 +447,27 @@ else
         online_draft_args+=("--no-${option%=*}")
       fi
     done
+    if [[ "$DRAFT_METHOD" == dflash ]]; then
+      for option in \
+        "grouped-query-attention=$ONLINE_DRAFT_GROUPED_QUERY_ATTENTION" \
+        "selective-last-layer=$ONLINE_DRAFT_SELECTIVE_LAST_LAYER"; do
+        if [[ "${option#*=}" == 1 ]]; then
+          online_draft_args+=("--${option%=*}")
+        else
+          online_draft_args+=("--no-${option%=*}")
+        fi
+      done
+    fi
+    if [[ -n "$ONLINE_DRAFT_CPU_THREADS" ]]; then
+      online_draft_args+=(--cpu-threads "$ONLINE_DRAFT_CPU_THREADS")
+    fi
+    if [[ -n "$ONLINE_DRAFT_CPU_AFFINITY" ]]; then
+      online_draft_args+=(--cpu-affinity "$ONLINE_DRAFT_CPU_AFFINITY")
+    fi
+  fi
+  max_train_rounds_args=()
+  if [[ -n "$MAX_TRAIN_ROUNDS" ]]; then
+    max_train_rounds_args=(--max-train-rounds "$MAX_TRAIN_ROUNDS")
   fi
   server_command=(
     "$PYTHON_BIN" -m methods.run "$methods_method"
@@ -439,7 +495,7 @@ else
     --frozen-parameter-prefixes "$FROZEN_PARAMETER_PREFIXES"
     --dflash-max-context-tokens "$DFLASH_MAX_CONTEXT_TOKENS"
     --dflash-grad-context-tokens "$DFLASH_GRAD_CONTEXT_TOKENS"
-    --dflash-max-train-rounds "${DFLASH_MAX_TRAIN_ROUNDS:-16}"
+    "${max_train_rounds_args[@]}"
     "${online_draft_args[@]}"
     --cpu-training-attention-backend "$CPU_TRAINING_ATTENTION_BACKEND"
   )
@@ -481,6 +537,7 @@ if [[ "$DRY_RUN" == 1 ]]; then
   printf 'files: run_dir=%q output=%q server_log=%q stats=%q monitor=%q run_log=%q\n' \
     "$RUN_DIR" "$OUTPUT_FILE" "$SERVER_LOG" "$STATS_FILE" "$MONITOR_FILE" \
     "${RUN_LOG:-<terminal>}"
+  printf 'update_metrics: %q\n' "${OSD_UPDATE_METRICS_FILE:-<off>}"
   exit 0
 fi
 

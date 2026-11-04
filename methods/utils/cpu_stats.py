@@ -3,8 +3,11 @@
 
 """Opt-in statistics for the built-in asynchronous CPU draft trainer."""
 
+import json
+import os
 import time
 from functools import wraps
+from pathlib import Path
 
 from methods.utils.stats import WorkerStats
 
@@ -12,7 +15,15 @@ _INSTALLED = False
 _INTERNAL_REQUEST_PREFIXES = ("_dummy_req_", "_warmup_", "chatcmpl-_warmup_")
 
 
-def attach_cpu_stats(speculator, pipeline) -> WorkerStats:
+def _write_update_metrics(path: Path, finished: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(finished, separators=(",", ":")) + "\n")
+
+
+def attach_cpu_stats(
+    speculator, pipeline, update_metrics_path: Path | None = None
+) -> WorkerStats:
     stats = WorkerStats()
     recording = False
     original_propose = speculator.propose
@@ -72,9 +83,13 @@ def attach_cpu_stats(speculator, pipeline) -> WorkerStats:
         return result
 
     @wraps(original_finish)
-    def finish_request(*args, **kwargs):
+    def finish_request(request_id, *args, **kwargs):
         nonlocal recording, published_at
-        result = original_finish(*args, **kwargs)
+        result = original_finish(request_id, *args, **kwargs)
+        if update_metrics_path is not None and recording:
+            finished = pipeline.finished_request
+            if finished is not None and finished["request_id"] == request_id:
+                _write_update_metrics(update_metrics_path, finished)
         if stats.active_requests:
             stats.end_request()
         recording = False
@@ -105,7 +120,10 @@ def install() -> None:
     def load_online_draft_model(self):
         result = original_load(self)
         runtime = self._online_draft
-        attach_cpu_stats(runtime.speculator, runtime.pipeline)
+        path = os.environ.get("OSD_UPDATE_METRICS_FILE")
+        attach_cpu_stats(
+            runtime.speculator, runtime.pipeline, Path(path) if path else None
+        )
         return result
 
     Worker._load_online_draft_model = load_online_draft_model

@@ -41,7 +41,17 @@ ONLINE_DRAFT_CONTINUOUS_TRAINING=0      # 队列排空即训练，安装槽空�
 ONLINE_DRAFT_LR_REFERENCE_ROWS=0        # N>0 时每步 lr 乘 min(1, 监督行数 / N)；0 关闭
 ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=0  # DFlash KL 温度；0 保持 T=1
 ONLINE_DRAFT_LR=1e-5                    # 学习率
+MAX_TRAIN_ROUNDS=                       # 每次更新只训练最近 N 个 round；空时 DFlash 16，其余 0
+ONLINE_DRAFT_GROUPED_QUERY_ATTENTION=0  # 仅 DFlash：CPU attention 按 GQA 重排
+ONLINE_DRAFT_SELECTIVE_LAST_LAYER=0     # 仅 DFlash：最后一层只算监督行
+ONLINE_DRAFT_CPU_THREADS=               # JSON，例如 '{"inference":1,"capture":1,"training":16}'
+ONLINE_DRAFT_UPDATE_METRICS=0           # 1 时每个请求结束后把每次 CPU 更新的明细追加到 UPDATE_METRICS_FILE
+ONLINE_DRAFT_CPU_AFFINITY=              # JSON，例如 '{"inference":[18],"capture":[19],"training":[0,1,2,3]}'
 ```
+
+`DFLASH_MAX_TRAIN_ROUNDS` 是 DFlash 的旧名，`MAX_TRAIN_ROUNDS` 未设置时生效。`ONLINE_DRAFT_CPU_*` 都不设时不绑核，线程数由 `OMP_NUM_THREADS`（默认 20）决定。
+
+`UPDATE_METRICS_FILE` 默认是 `$RUN_DIR/updates.jsonl`，每个请求一行：`request_id`、`cpu_version` 和 `updates` 列表。列表每项对应一次 CPU 训练，含 `rounds`、`trained_rounds`、`target_count`、`train_seconds`、`loss`、`start_step`/`end_step` 和 `source_versions`。warmup 请求不写入。
 
 以下两项是 trainer 的固定行为，没有开关：
 

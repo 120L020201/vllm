@@ -283,6 +283,7 @@ class LauncherTest(unittest.TestCase):
                 "master_weights": True,
                 "lr_reference_rows": None,
                 "continuous_training": False,
+                "max_train_rounds": 0,
             },
         )
         self.assertEqual(env["OMP_NUM_THREADS"], "20")
@@ -392,6 +393,66 @@ class LauncherTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "dflash loss temperature"):
             configure(negative)
+
+    def test_max_train_rounds_reaches_every_online_draft_method(self):
+        for draft, flags, expected in (
+            ("eagle3", (), 0),
+            ("dflash", (), 16),
+            ("eagle3", ("--max-train-rounds", "8"), 8),
+            ("dflash", ("--dflash-max-train-rounds", "0"), 0),
+        ):
+            with self.subTest(draft=draft, flags=flags):
+                args = build_parser().parse_args(
+                    ("online_draft", "--draft-method", draft, *flags, "--dry-run")
+                )
+                config = self._online_draft_config(configure(args)[0])
+                self.assertEqual(config["max_train_rounds"], expected)
+
+    def test_dflash_cpu_shortcuts_are_dflash_only(self):
+        args = build_parser().parse_args(
+            (
+                "online_draft",
+                "--draft-method",
+                "dflash",
+                "--grouped-query-attention",
+                "--selective-last-layer",
+                "--dry-run",
+            )
+        )
+        config = self._online_draft_config(configure(args)[0])
+        self.assertTrue(config["grouped_query_attention"])
+        self.assertTrue(config["selective_last_layer"])
+        eagle3 = build_parser().parse_args(
+            ("online_draft", "--grouped-query-attention", "--dry-run")
+        )
+        with self.assertRaisesRegex(ValueError, "require DFlash"):
+            configure(eagle3)
+
+    def test_cpu_threads_and_affinity_are_passed_to_online_draft(self):
+        threads = {"inference": 1, "capture": 1, "training": 16}
+        affinity = {"inference": [18], "capture": [19], "training": [0, 1]}
+        args = build_parser().parse_args(
+            (
+                "online_draft",
+                "--cpu-threads",
+                json.dumps(threads),
+                "--cpu-affinity",
+                json.dumps(affinity),
+                "--dry-run",
+            )
+        )
+        config = self._online_draft_config(configure(args)[0])
+        self.assertEqual(config["cpu_threads"], threads)
+        self.assertEqual(config["cpu_affinity"], affinity)
+        unpinned = build_parser().parse_args(("online_draft", "--dry-run"))
+        config = self._online_draft_config(configure(unpinned)[0])
+        self.assertNotIn("cpu_threads", config)
+        self.assertNotIn("cpu_affinity", config)
+        tts = build_parser().parse_args(
+            ("tts", "--cpu-threads", json.dumps(threads), "--dry-run")
+        )
+        with self.assertRaisesRegex(ValueError, "requires online_draft"):
+            configure(tts)
 
     def test_invalid_options_fail_before_start(self):
         for flags in (
@@ -625,6 +686,49 @@ class RunScriptTest(unittest.TestCase):
             "--no-master-weights --continuous-training",
             result.stdout,
         )
+
+    def test_new_cpu_training_switches_follow_run_script_env(self):
+        result = self._run(
+            "online_draft+dflash",
+            MAX_TRAIN_ROUNDS="4",
+            ONLINE_DRAFT_GROUPED_QUERY_ATTENTION="1",
+            ONLINE_DRAFT_SELECTIVE_LAST_LAYER="1",
+            ONLINE_DRAFT_CPU_THREADS='{"training":16}',
+            ONLINE_DRAFT_CPU_AFFINITY='{"training":[0,1]}',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--max-train-rounds 4", result.stdout)
+        self.assertIn(
+            "--grouped-query-attention --selective-last-layer "
+            '--cpu-threads \\{\\"training\\":16\\} '
+            '--cpu-affinity \\{\\"training\\":\\[0\\,1\\]\\}',
+            result.stdout,
+        )
+        legacy = self._run("online_draft+dflash", DFLASH_MAX_TRAIN_ROUNDS="0")
+        self.assertIn("--max-train-rounds 0", legacy.stdout)
+        eagle3 = self._run("online_draft+eagle3", DFLASH_MAX_TRAIN_ROUNDS="0")
+        self.assertEqual(eagle3.returncode, 0, eagle3.stderr)
+        self.assertNotIn("--max-train-rounds", eagle3.stdout)
+        self.assertNotIn("--grouped-query-attention", eagle3.stdout)
+        rejected = self._run(
+            "online_draft+eagle3", ONLINE_DRAFT_SELECTIVE_LAST_LAYER="1"
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+
+    def test_update_metrics_are_opt_in_for_online_draft(self):
+        result = self._run("online_draft+dflash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("update_metrics: \\<off\\>", result.stdout)
+        path = self.directory / "updates.jsonl"
+        result = self._run(
+            "online_draft+eagle3",
+            ONLINE_DRAFT_UPDATE_METRICS="1",
+            UPDATE_METRICS_FILE=str(path),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"update_metrics: {path}", result.stdout)
+        rejected = self._run("tts", ONLINE_DRAFT_UPDATE_METRICS="1")
+        self.assertNotEqual(rejected.returncode, 0)
 
     def test_mtp_methods_do_not_require_a_separate_draft(self):
         for method in ("mtp", "online_draft+mtp", "tts+mtp"):
@@ -1679,6 +1783,42 @@ class PolicyTest(unittest.TestCase):
         speculator.finish_request(request_id)
         self.assertEqual((stats.cpu_train_calls, stats.weight_installs), (0, 0))
         self.assertEqual(stats.active_requests, 0)
+
+    def test_update_metrics_file_records_each_request_but_not_warmup(self):
+        pipeline = SimpleNamespace(
+            _trainer=SimpleNamespace(version=0),
+            update_stats=[],
+            finished_request=None,
+            _train=MagicMock(),
+            _publish_snapshot=MagicMock(),
+            _handle_close_epoch=MagicMock(),
+        )
+        updates = [{"rounds": 3, "trained_rounds": 3, "loss": 0.5}]
+
+        def finish(request_id, initial_weights):
+            pipeline.finished_request = {
+                "request_id": request_id,
+                "cpu_version": 1,
+                "updates": updates,
+            }
+
+        speculator = SimpleNamespace(
+            propose=MagicMock(),
+            draft_weight_installer=SimpleNamespace(advance=MagicMock()),
+            finish_request=finish,
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "updates.jsonl"
+            attach_cpu_stats(speculator, pipeline, path)
+            for request_id in ("chatcmpl-_warmup_run_sh", "question"):
+                speculator.propose(SimpleNamespace(req_ids=[request_id]))
+                speculator.finish_request(request_id, ())
+            lines = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(
+            lines,
+            [{"request_id": "question", "cpu_version": 1, "updates": updates}],
+        )
 
     def test_failed_cpu_training_or_install_is_not_counted(self):
         trainer = SimpleNamespace(version=0)

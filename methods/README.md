@@ -327,7 +327,14 @@ Other entries set it to `0`. `CHECK_GRADIENTS`, `FROZEN_PARAMETER_PREFIXES`,
 `VLLM_ONLINE_DRAFT_PROFILE` applies to all recipes. The losses are fixed per
 method; `ONLINE_DRAFT_MASTER_WEIGHTS` (default 1),
 `ONLINE_DRAFT_CONTINUOUS_TRAINING` and `ONLINE_DRAFT_LR_REFERENCE_ROWS` (default
-0) control CPU training. DFlash also accepts `DFLASH_MAX_TRAIN_ROUNDS` and
+0) control CPU training. `MAX_TRAIN_ROUNDS` applies to every method (default 16
+for DFlash, 0 otherwise; DFlash also reads `DFLASH_MAX_TRAIN_ROUNDS`).
+`ONLINE_DRAFT_CPU_THREADS` and `ONLINE_DRAFT_CPU_AFFINITY` take JSON objects
+keyed by `inference`, `capture`, and `training`; unset, no CPU is pinned.
+`ONLINE_DRAFT_UPDATE_METRICS=1` (default 0) appends one line per request with
+every CPU update to `UPDATE_METRICS_FILE` (default `$RUN_DIR/updates.jsonl`). DFlash
+also accepts `ONLINE_DRAFT_GROUPED_QUERY_ATTENTION`,
+`ONLINE_DRAFT_SELECTIVE_LAST_LAYER` (default 0), and
 `ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE` (default 0, which keeps T=1).
 
 Base, EAGLE3, DFlash, and MTP support resume and default to `RESUME=1`, skipping successful

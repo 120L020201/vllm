@@ -147,7 +147,14 @@ def build_parser():
         help="DFlash TTS caches detached context K/V and recomputes only the "
         "newest N context tokens with gradients; 0 replays the full context",
     )
-    parser.add_argument("--dflash-max-train-rounds", type=int, default=16)
+    parser.add_argument(
+        "--max-train-rounds",
+        "--dflash-max-train-rounds",
+        type=int,
+        default=None,
+        help="online draft trains only the newest N rounds per update; 0 trains "
+        "every round (default: 16 for DFlash, 0 otherwise)",
+    )
     parser.add_argument(
         "--dflash-loss-temperature",
         type=float,
@@ -189,6 +196,32 @@ def build_parser():
         type=float,
         default=0.0,
         help="scale the online learning rate by min(1, rows / N); 0 disables",
+    )
+    parser.add_argument(
+        "--grouped-query-attention",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="online DFlash CPU attention keeps grouped K/V heads",
+    )
+    parser.add_argument(
+        "--selective-last-layer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="online DFlash computes its last layer only on supervised rows",
+    )
+    parser.add_argument(
+        "--cpu-threads",
+        type=json.loads,
+        default={},
+        help="online draft per-role CPU threads as JSON, e.g. "
+        '\'{"inference":1,"capture":1,"training":16}\'',
+    )
+    parser.add_argument(
+        "--cpu-affinity",
+        type=json.loads,
+        default={},
+        help="online draft per-role CPU lists as JSON, e.g. "
+        '\'{"inference":[18],"capture":[19],"training":[0,1]}\'',
     )
     parser.add_argument(
         "--log-updates",
@@ -252,8 +285,25 @@ def configure(args):
             "--dflash-grad-context-tokens cannot be combined with "
             "--dflash-max-context-tokens"
         )
-    if args.dflash_max_train_rounds < 0:
-        raise ValueError("DFlash max train rounds must be nonnegative")
+    max_train_rounds = args.max_train_rounds
+    if max_train_rounds is None:
+        max_train_rounds = 16 if draft_method == "dflash" else 0
+    if max_train_rounds < 0:
+        raise ValueError("max train rounds must be nonnegative")
+    if draft_method != "dflash" and (
+        args.grouped_query_attention or args.selective_last_layer
+    ):
+        raise ValueError(
+            "--grouped-query-attention and --selective-last-layer require DFlash"
+        )
+    for name, value in (
+        ("cpu threads", args.cpu_threads),
+        ("cpu affinity", args.cpu_affinity),
+    ):
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} must be a JSON object keyed by CPU role")
+        if value and args.method != "online_draft":
+            raise ValueError(f"{name} requires online_draft")
     if draft_method == "dflash" and args.method in {"tts", "random_sampling"}:
         if args.enable_chunked_prefill:
             raise ValueError("DFlash TTS requires chunked prefill to be off")
@@ -358,9 +408,15 @@ def configure(args):
             lr_reference_rows=args.lr_reference_rows or None,
             continuous_training=args.continuous_training,
         )
+        if args.cpu_threads:
+            online_draft_config["cpu_threads"] = args.cpu_threads
+        if args.cpu_affinity:
+            online_draft_config["cpu_affinity"] = args.cpu_affinity
+    online_draft_config["max_train_rounds"] = max_train_rounds
     if draft_method == "dflash":
-        online_draft_config["max_train_rounds"] = args.dflash_max_train_rounds
         online_draft_config["loss_temperature"] = args.dflash_loss_temperature
+        online_draft_config["grouped_query_attention"] = args.grouped_query_attention
+        online_draft_config["selective_last_layer"] = args.selective_last_layer
     else:
         online_draft_config["attention_backend"] = args.cpu_training_attention_backend
 
