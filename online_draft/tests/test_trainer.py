@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
+
+import online_draft.training.trainer as trainer_module
 import pytest
 import torch
 import torch.nn as nn
+from online_draft.training.master_adamw import MasterWeightAdamW
+from online_draft.training.persistent_grads import (
+    PersistentGradLinear,
+    install_persistent_weight_grads,
+)
 from online_draft.training.trainer import (
     DraftTrainer,
     TrainerConfig,
@@ -273,3 +281,151 @@ def test_reset_restores_initial_training_state() -> None:
 
     for name, parameter in model.named_parameters():
         assert torch.equal(parameter, initial_parameters[name])
+
+
+@pytest.mark.parametrize("weight_decay", [0.0, 0.1])
+def test_master_adamw_tracks_fp32_adamw(weight_decay: float) -> None:
+    """FP32 masters follow FP32 AdamW on the same BF16 gradients."""
+    torch.manual_seed(6)
+    reference = nn.Linear(64, 33)
+    model = nn.Linear(64, 33).to(dtype=torch.bfloat16)
+    reference.load_state_dict(
+        {name: value.float() for name, value in model.state_dict().items()}
+    )
+    reference_optimizer = torch.optim.AdamW(
+        reference.parameters(), lr=1e-2, weight_decay=weight_decay
+    )
+    optimizer = MasterWeightAdamW(
+        model.parameters(), lr=1e-2, weight_decay=weight_decay
+    )
+
+    for _ in range(3):
+        for parameter in model.parameters():
+            parameter.grad = torch.randn_like(parameter)
+        for expected, parameter in zip(reference.parameters(), model.parameters()):
+            expected.grad = parameter.grad.float()
+        reference_optimizer.step()
+        optimizer.step()
+
+    for expected, parameter in zip(reference.parameters(), model.parameters()):
+        master = optimizer.state[parameter]["master"]
+        torch.testing.assert_close(master, expected, rtol=1e-5, atol=1e-6)
+        assert torch.equal(parameter.detach(), master.to(torch.bfloat16))
+        assert optimizer.state[parameter]["step"] == 3
+
+
+def test_master_adamw_rejects_non_bf16_parameters() -> None:
+    with pytest.raises(ValueError, match="contiguous CPU BF16"):
+        MasterWeightAdamW(nn.Linear(2, 2).parameters(), lr=1e-3)
+
+
+def test_master_weights_fall_back_to_fp32_copies_without_native_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both master-weight implementations take the same FP32 AdamW steps."""
+    torch.manual_seed(10)
+    model = nn.Linear(64, 33, dtype=torch.bfloat16)
+    fallback_model = copy.deepcopy(model)
+    config = TrainerConfig(
+        learning_rate=1e-3, master_weights=True, check_gradients=False
+    )
+    trainer = DraftTrainer(model, config)
+    monkeypatch.setattr(
+        trainer_module, "supports_master_weight_adamw", lambda parameters: False
+    )
+    fallback = DraftTrainer(fallback_model, config)
+    assert isinstance(trainer.optimizer, MasterWeightAdamW)
+    assert type(fallback.optimizer) is torch.optim.AdamW
+
+    for _ in range(3):
+        inputs = torch.randn(8, 64, dtype=torch.bfloat16)
+        trainer.backward_and_step(model(inputs).float().square().mean())
+        fallback.backward_and_step(fallback_model(inputs).float().square().mean())
+
+    for actual, expected in zip(model.parameters(), fallback_model.parameters()):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_persistent_weight_grads_match_autograd_and_reuse_storage() -> None:
+    """Buffers allocate on first backward, so installing in inference mode works."""
+    torch.manual_seed(8)
+    reference = nn.Sequential(
+        nn.Linear(4, 4, bias=False),
+        nn.ReLU(),
+        nn.Linear(4, 2, bias=False),
+    )
+    model = copy.deepcopy(reference)
+    with torch.inference_mode():
+        patched = install_persistent_weight_grads(
+            model, (name for name, _ in model.named_parameters())
+        )
+    assert patched == ("0.weight", "2.weight")
+
+    storage = None
+    for _ in range(2):
+        inputs = torch.randn(5, 4, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        model(inputs).square().sum().backward()
+        reference(reference_inputs).square().sum().backward()
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+        for (name, actual), expected in zip(
+            model.named_parameters(), reference.parameters()
+        ):
+            torch.testing.assert_close(actual.grad, expected.grad, msg=name)
+        pointers = model[2].weight.grad.data_ptr()
+        assert storage in (None, pointers)
+        storage = pointers
+        for module in (model, reference):
+            module.zero_grad(set_to_none=True)
+
+
+def test_trainer_step_matches_plain_adamw_with_persistent_grads() -> None:
+    torch.manual_seed(9)
+    reference_model = nn.Sequential(
+        nn.Linear(3, 4, bias=False), nn.ReLU(), nn.Linear(4, 2, bias=False)
+    )
+    model = copy.deepcopy(reference_model)
+    reference_optimizer = torch.optim.AdamW(
+        reference_model.parameters(), lr=1e-2, weight_decay=0.0
+    )
+    trainer = DraftTrainer(
+        model, TrainerConfig(check_gradients=False, learning_rate=1e-2)
+    )
+    assert isinstance(model[0], PersistentGradLinear)
+
+    for _ in range(2):
+        inputs = torch.randn(4, 3)
+        trainer.backward_and_step(model(inputs).square().mean())
+        reference_optimizer.zero_grad(set_to_none=True)
+        reference_model(inputs).square().mean().backward()
+        reference_optimizer.step()
+    for actual, expected in zip(model.parameters(), reference_model.parameters()):
+        torch.testing.assert_close(actual, expected)
+        assert actual.grad is None
+
+
+@pytest.mark.parametrize(
+    ("reference_rows", "rows", "expected_scale"),
+    [(None, 2, 1.0), (4.0, 2, 0.5), (4.0, 8, 1.0), (4.0, None, 1.0)],
+)
+def test_lr_reference_rows_scale_small_windows(
+    reference_rows: float | None, rows: int | None, expected_scale: float
+) -> None:
+    """Adam's first step moves each weight by lr, so the move shows the scale."""
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1)
+    trainer = DraftTrainer(
+        model,
+        TrainerConfig(
+            learning_rate=1e-2,
+            check_gradients=False,
+            lr_reference_rows=reference_rows,
+        ),
+    )
+
+    trainer.backward_and_step(model.weight.sum(), supervised_rows=rows)
+
+    torch.testing.assert_close(
+        model.weight.detach(), torch.full((1, 1), 1 - 1e-2 * expected_scale)
+    )

@@ -90,7 +90,9 @@ def train_gemma4_mtp_window(
             logits = model.lm_head(draft_hidden)
         with profile_range("online_draft.loss", profile_timeline):
             loss = window_forward_kl_loss(logits, teacher, rejected)
-        loss_value = trainer.backward_and_step(loss, profile_timeline=profile_timeline)
+        loss_value = trainer.backward_and_step(
+            loss, supervised_rows=teacher.shape[0], profile_timeline=profile_timeline
+        )
         del loss, logits, draft_hidden
 
     return history, Gemma4MTPWindowResult(

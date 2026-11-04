@@ -219,6 +219,7 @@ def train_eagle3_window(
         target_count = training_inputs.target_count
         loss_value = trainer.backward_and_step(
             loss,
+            supervised_rows=target_count,
             profile_timeline=profile_timeline,
         )
 

@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from online_draft.runtime import profile_range
+from online_draft.training.master_adamw import (
+    MasterWeightAdamW,
+    supports_master_weight_adamw,
+)
+from online_draft.training.persistent_grads import install_persistent_weight_grads
 
 
 @torch.compile(fullgraph=True)
@@ -24,6 +29,7 @@ class TrainerConfig:
     frozen_parameter_prefixes: tuple[str, ...] = ()
     check_gradients: bool = False
     master_weights: bool = False
+    lr_reference_rows: float | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
@@ -32,6 +38,10 @@ class TrainerConfig:
             raise ValueError("weight_decay must be finite and nonnegative")
         if any(not prefix for prefix in self.frozen_parameter_prefixes):
             raise ValueError("frozen parameter prefixes must not be empty")
+        if self.lr_reference_rows is not None and (
+            not math.isfinite(self.lr_reference_rows) or self.lr_reference_rows <= 0
+        ):
+            raise ValueError("lr_reference_rows must be finite and positive")
 
 
 class DraftTrainer:
@@ -60,18 +70,38 @@ class DraftTrainer:
             for name, parameter in self._trainable_named_parameters
         )
 
+        install_persistent_weight_grads(self.model, self.trainable_parameter_names)
+
+        # The native optimizer keeps its FP32 masters in its own state; without
+        # it, the optimizer updates FP32 copies of the parameters.
+        native_master_weights = self.config.master_weights and (
+            supports_master_weight_adamw(
+                parameter for _, parameter in self._trainable_named_parameters
+            )
+        )
+        self._copies_master_weights = (
+            self.config.master_weights and not native_master_weights
+        )
         self._optimizer_parameters = [
             parameter.detach().float().clone().requires_grad_()
-            if self.config.master_weights
+            if self._copies_master_weights
             else parameter
             for _, parameter in self._trainable_named_parameters
         ]
-        self.optimizer = torch.optim.AdamW(
-            self._optimizer_parameters,
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            fused=self.config.fused,
-        )
+        self.optimizer: torch.optim.Optimizer
+        if native_master_weights:
+            self.optimizer = MasterWeightAdamW(
+                self._optimizer_parameters,
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+            )
+        else:
+            self.optimizer = torch.optim.AdamW(
+                self._optimizer_parameters,
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+                fused=self.config.fused,
+            )
 
         self._version = 0
         self.last_loss: float | None = None
@@ -91,7 +121,7 @@ class DraftTrainer:
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
-        if self.config.master_weights:
+        if self._copies_master_weights:
             self.model.zero_grad(set_to_none=True)
 
     def clear_optimizer_state(self) -> None:
@@ -106,7 +136,7 @@ class DraftTrainer:
             strict=True,
         ):
             parameter.copy_(initial_weight)
-        if self.config.master_weights:
+        if self._copies_master_weights:
             for master, (_, initial) in zip(
                 self._optimizer_parameters, self._initial_weights, strict=True
             ):
@@ -120,12 +150,15 @@ class DraftTrainer:
         self,
         loss: torch.Tensor,
         *,
+        supervised_rows: int | None = None,
         profile_timeline: bool = False,
     ) -> float:
         """Backpropagate a finite scalar loss and update the model.
 
         Args:
             loss: Scalar loss connected to the trainer's model.
+            supervised_rows: Rows behind the loss. With ``lr_reference_rows``
+                set, the step uses ``lr * min(1, rows / lr_reference_rows)``.
             profile_timeline: Whether to annotate backward and optimizer.
 
         Returns:
@@ -162,7 +195,10 @@ class DraftTrainer:
                     raise ValueError("nonfinite gradients")
 
             with profile_range("online_draft.optimizer", profile_timeline):
-                if self.config.master_weights:
+                lr_scale = self._lr_scale(supervised_rows)
+                for group in self.optimizer.param_groups:
+                    group["lr"] = self.config.learning_rate * lr_scale
+                if self._copies_master_weights:
                     for master, (_, parameter) in zip(
                         self._optimizer_parameters,
                         self._trainable_named_parameters,
@@ -172,7 +208,7 @@ class DraftTrainer:
                             None if parameter.grad is None else parameter.grad.float()
                         )
                 self.optimizer.step()
-                if self.config.master_weights:
+                if self._copies_master_weights:
                     with torch.no_grad():
                         for master, (_, parameter) in zip(
                             self._optimizer_parameters,
@@ -190,6 +226,12 @@ class DraftTrainer:
         self.zero_grad()
 
         return loss_value
+
+    def _lr_scale(self, supervised_rows: int | None) -> float:
+        reference_rows = self.config.lr_reference_rows
+        if reference_rows is None or supervised_rows is None:
+            return 1.0
+        return min(1.0, supervised_rows / reference_rows)
 
     def _freeze_configured_parameters(
         self,

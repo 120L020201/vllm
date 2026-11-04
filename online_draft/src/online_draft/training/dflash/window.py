@@ -127,6 +127,7 @@ def train_dflash_window(
     model = cast(Qwen3DFlashForCausalLM, trainer.model)
     old_length = 0 if cache is None else cache.length
     selected = rounds[_first_query_round(rounds, max_train_rounds) :]
+    target_count = sum(batch.target_count for batch in selected)
     source_context_version = trainer.version
     prepared_context = None
     if not rebuild_kv:
@@ -151,7 +152,9 @@ def train_dflash_window(
             )
         with profile_range("online_draft.loss", profile_timeline):
             loss = dflash_kl_loss(logits, teacher, position_weights(selected))
-        loss_value = trainer.backward_and_step(loss, profile_timeline=profile_timeline)
+        loss_value = trainer.backward_and_step(
+            loss, supervised_rows=target_count, profile_timeline=profile_timeline
+        )
         del loss, logits, teacher
 
     if rebuild_kv:
@@ -181,6 +184,6 @@ def train_dflash_window(
         model_version=trainer.version,
         loss=loss_value,
         round_count=len(selected),
-        target_count=sum(batch.target_count for batch in selected),
+        target_count=target_count,
         persistent_cache_length=end,
     )

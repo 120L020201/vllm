@@ -36,7 +36,13 @@ class _FinishRequestEvent:
 
 
 class AsyncDraftPipeline:
-    """Train draft weights behind an ordered round queue."""
+    """Train draft weights behind an ordered round queue.
+
+    By default each update trains the rounds queued since the previous
+    snapshot was installed. With ``continuous_training`` the worker trains
+    whenever its queue drains and publishes the newest weights as soon as the
+    install slot is free.
+    """
 
     def __init__(
         self,
@@ -46,12 +52,14 @@ class AsyncDraftPipeline:
         train_rounds: TrainRounds,
         profile_timeline: bool = False,
         cpu_config: CPUWorkerConfig | None = None,
+        continuous_training: bool = False,
     ) -> None:
         self._trainer = trainer
         self._on_queue_size = on_queue_size
         self._train_rounds = train_rounds
         self._profile_timeline = profile_timeline
         self._cpu_config = cpu_config
+        self._continuous = continuous_training
 
         self._queue: Queue[object] = Queue()
         self._stop = object()
@@ -64,6 +72,7 @@ class AsyncDraftPipeline:
         self._epoch_rounds: list[PreparedRound] = []
         self._persistent_cache: Any = None
         self._snapshot_pending = False
+        self._published_version = 0
         self._ready_snapshot: DraftWeightSnapshot | None = None
         self.update_stats: list[dict] = []
         self.finished_request: dict | None = None
@@ -164,6 +173,11 @@ class AsyncDraftPipeline:
                     self._handle_close_epoch(event.request_id)
                 else:
                     raise RuntimeError("unknown draft pipeline event")
+
+                if self._continuous and self._epoch_rounds and self._queue.empty():
+                    rounds = tuple(self._epoch_rounds)
+                    self._epoch_rounds.clear()
+                    self._train(rounds)
             except Exception as error:
                 self._set_failure(error)
             finally:
@@ -174,7 +188,7 @@ class AsyncDraftPipeline:
     def _handle_round(self, prepared_round: PreparedRound) -> None:
         self._set_request(prepared_round.request_id)
 
-        if not self._bootstrap_done:
+        if not self._continuous and not self._bootstrap_done:
             self._train((prepared_round,))
             self._bootstrap_done = True
             return
@@ -188,6 +202,11 @@ class AsyncDraftPipeline:
             raise RuntimeError("closed epoch has no pending snapshot")
 
         self._snapshot_pending = False
+        if self._continuous:
+            if self._trainer.version > self._published_version:
+                self._publish_snapshot(self._trainer.version)
+            return
+
         rounds = tuple(self._epoch_rounds)
         self._epoch_rounds.clear()
 
@@ -208,6 +227,7 @@ class AsyncDraftPipeline:
         self._bootstrap_done = False
         self._epoch_rounds.clear()
         self._persistent_cache = None
+        self._published_version = 0
         self.update_stats = []
 
         with self._lock:
@@ -246,7 +266,9 @@ class AsyncDraftPipeline:
                 "loss": self._trainer.last_loss,
             }
         )
-        self._publish_snapshot(result.model_version)
+        # Only continuous training can finish an update while a snapshot waits.
+        if not self._snapshot_pending:
+            self._publish_snapshot(result.model_version)
 
     def _publish_snapshot(self, version: int) -> None:
         name = f"online_draft.cpu_snapshot[version={version}]"
@@ -262,6 +284,7 @@ class AsyncDraftPipeline:
                 raise RuntimeError("a snapshot is already ready")
             self._ready_snapshot = snapshot
             self._snapshot_pending = True
+        self._published_version = version
 
     def _set_request(self, request_id: str) -> None:
         if self._request_id is None:

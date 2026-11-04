@@ -238,3 +238,48 @@ def test_training_failure_stops_pipeline_and_rejects_new_rounds() -> None:
         assert trainer.reset_count == 1
     finally:
         pipeline.close()
+
+
+def test_continuous_training_does_not_wait_for_epoch_close() -> None:
+    """Rounds train while a snapshot is in flight; close publishes the latest."""
+    trainer = _FakeTrainer(nn.Linear(1, 1))
+    calls: list[tuple[tuple[int, ...], object]] = []
+    trained = Event()
+
+    def train_rounds(trainer, rounds, persistent_cache, profile_timeline):
+        assert not profile_timeline
+        calls.append((rounds, persistent_cache))
+        trainer.version += 1
+        trained.set()
+        return f"cache-{trainer.version}", SimpleNamespace(
+            model_version=trainer.version,
+            round_count=len(rounds),
+            target_count=1,
+        )
+
+    pipeline = AsyncDraftPipeline(
+        trainer=trainer,
+        train_rounds=train_rounds,
+        continuous_training=True,
+    )
+
+    try:
+        pipeline.submit_round(_make_round(0))
+        assert trained.wait(timeout=5)
+        first_snapshot = _wait_for_snapshot(pipeline)
+        assert first_snapshot is not None
+        assert first_snapshot.version == 1
+
+        trained.clear()
+        pipeline.submit_round(_make_round(1))
+        assert trained.wait(timeout=5)
+        assert trainer.version == 2
+        assert pipeline.poll_snapshot() is None
+
+        pipeline.close_epoch("request-0")
+        second_snapshot = _wait_for_snapshot(pipeline)
+        assert second_snapshot is not None
+        assert second_snapshot.version == 2
+        assert calls == [((0,), None), ((1,), "cache-1")]
+    finally:
+        pipeline.close()
