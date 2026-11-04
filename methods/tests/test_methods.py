@@ -280,6 +280,9 @@ class LauncherTest(unittest.TestCase):
                 "frozen_parameter_prefixes": [],
                 "check_gradients": False,
                 "log_updates": True,
+                "master_weights": True,
+                "lr_reference_rows": None,
+                "continuous_training": False,
             },
         )
         self.assertEqual(env["OMP_NUM_THREADS"], "20")
@@ -315,17 +318,11 @@ class LauncherTest(unittest.TestCase):
         args = build_parser().parse_args(("online_draft", "--dry-run"))
         with patch.dict(os.environ):
             os.environ.pop("OSD_CHECK_GRADIENTS", None)
-            os.environ["VLLM_ONLINE_DRAFT_FP32_MASTER_WEIGHTS"] = "1"
+            os.environ["VLLM_ONLINE_DRAFT_FP32_MASTER_WEIGHTS"] = "0"
             command, env = configure(args)
 
-        self.assertNotIn("master_weights", self._online_draft_config(command))
+        self.assertTrue(self._online_draft_config(command)["master_weights"])
         self.assertNotIn("OSD_CHECK_GRADIENTS", env)
-
-        enabled = build_parser().parse_args(
-            ("online_draft", "--master-weights", "--dry-run")
-        )
-        enabled_command, _ = configure(enabled)
-        self.assertTrue(self._online_draft_config(enabled_command)["master_weights"])
 
     def test_tts_defaults_to_fp32_master_weights(self):
         for method, flags, expected in (
@@ -345,24 +342,57 @@ class LauncherTest(unittest.TestCase):
             _, env = configure(args)
             self.assertEqual(env["OSD_EAGLE3_RECURRENT_GRADIENTS"], expected)
 
-    def test_cpu_training_optimizations_are_forwarded(self):
+    def test_cpu_training_optimizations_can_be_disabled(self):
         args = build_parser().parse_args(
             (
                 "online_draft",
-                "--master-weights",
-                "--persistent-grads",
-                "--continuous-training",
+                "--no-master-weights",
                 "--dry-run",
             )
         )
         command, env = configure(args)
-        config = self._online_draft_config(command)
 
-        self.assertTrue(config["master_weights"])
-        self.assertTrue(config["persistent_grads"])
+        self.assertFalse(self._online_draft_config(command)["master_weights"])
+        self.assertEqual(env["OSD_MASTER_WEIGHTS"], "0")
+
+    def test_opt_in_cpu_training_switches_can_be_enabled(self):
+        args = build_parser().parse_args(
+            (
+                "online_draft",
+                "--continuous-training",
+                "--lr-reference-rows",
+                "60",
+                "--dry-run",
+            )
+        )
+        config = self._online_draft_config(configure(args)[0])
+
         self.assertTrue(config["continuous_training"])
-        self.assertEqual(env["OSD_PERSISTENT_GRADS"], "1")
-        self.assertEqual(env["OSD_CONTINUOUS_TRAINING"], "1")
+        self.assertEqual(config["lr_reference_rows"], 60.0)
+
+    def test_dflash_loss_temperature_is_sent_only_to_dflash(self):
+        args = build_parser().parse_args(
+            (
+                "online_draft",
+                "--draft-method",
+                "dflash",
+                "--dflash-loss-temperature",
+                "0.6",
+                "--dry-run",
+            )
+        )
+        self.assertEqual(
+            self._online_draft_config(configure(args)[0])["loss_temperature"], 0.6
+        )
+        eagle3 = build_parser().parse_args(("online_draft", "--dry-run"))
+        self.assertNotIn(
+            "loss_temperature", self._online_draft_config(configure(eagle3)[0])
+        )
+        negative = build_parser().parse_args(
+            ("online_draft", "--dflash-loss-temperature", "-1", "--dry-run")
+        )
+        with self.assertRaisesRegex(ValueError, "dflash loss temperature"):
+            configure(negative)
 
     def test_invalid_options_fail_before_start(self):
         for flags in (
@@ -565,57 +595,39 @@ class RunScriptTest(unittest.TestCase):
                     self.assertIn("--spec-tokens 3", result.stdout)
                     self.assertNotIn("--draft ", result.stdout)
 
-    def test_online_draft_aliases_select_cpu_training_and_loss(self):
+    def test_online_draft_aliases_select_cpu_training_and_optimizations(self):
         for method, draft in (
             ("online_draft+eagle3", "eagle3"),
             ("online_draft+dflash", "dflash"),
             ("online_draft+mtp", "mtp"),
         ):
             with self.subTest(method=method):
-                result = self._run(method, ONLINE_DRAFT_LOSS="position")
+                result = self._run(method)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("training: cpu_online=1", result.stdout)
                 self.assertIn(f"--draft-method {draft}", result.stdout)
-                self.assertIn("--online-draft-loss position", result.stdout)
+                self.assertIn(
+                    "--lr-reference-rows 0 --dflash-loss-temperature 0 "
+                    "--master-weights --no-continuous-training",
+                    result.stdout,
+                )
                 if draft == "mtp":
                     self.assertNotIn("--draft ", result.stdout)
 
-    def test_dflash_loss_controls_are_passed_only_to_dflash(self):
-        for method, draft in (
-            ("online_draft+eagle3", "eagle3"),
-            ("online_draft+dflash", "dflash"),
-        ):
-            with self.subTest(method=method):
-                result = self._run(
-                    method,
-                    ONLINE_DRAFT_LOSS="position",
-                    ONLINE_DRAFT_DFLASH_LOSS_GAMMA="7",
-                    ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION="block",
-                    ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT="2",
-                    ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE="overlap",
-                    ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT="0.5",
-                    ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE="0.6",
-                    ONLINE_DRAFT_DFLASH_LOSS_TOP_K="20",
-                    ONLINE_DRAFT_DFLASH_LOSS_TOP_P="0.95",
-                    ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT="0.25",
-                    ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS="4096",
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                if draft == "dflash":
-                    self.assertIn("--dflash-loss-gamma 7", result.stdout)
-                    self.assertIn("--dflash-loss-normalization block", result.stdout)
-                    self.assertIn("--dflash-loss-rejection-weight 2", result.stdout)
-                    self.assertIn("--dflash-loss-objective overlap", result.stdout)
-                    self.assertIn("--dflash-loss-overlap-weight 0.5", result.stdout)
-                    self.assertIn("--dflash-loss-temperature 0.6", result.stdout)
-                    self.assertIn("--dflash-loss-top-k 20", result.stdout)
-                    self.assertIn("--dflash-loss-top-p 0.95", result.stdout)
-                    self.assertIn("--dflash-loss-reference-weight 0.25", result.stdout)
-                    self.assertIn(
-                        "--dflash-loss-reference-decay-tokens 4096", result.stdout
-                    )
-                else:
-                    self.assertNotIn("--dflash-loss-gamma", result.stdout)
+    def test_cpu_training_switches_follow_run_script_env(self):
+        result = self._run(
+            "online_draft+dflash",
+            ONLINE_DRAFT_MASTER_WEIGHTS="0",
+            ONLINE_DRAFT_CONTINUOUS_TRAINING="1",
+            ONLINE_DRAFT_LR_REFERENCE_ROWS="60",
+            ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE="0.6",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--lr-reference-rows 60 --dflash-loss-temperature 0.6 "
+            "--no-master-weights --continuous-training",
+            result.stdout,
+        )
 
     def test_mtp_methods_do_not_require_a_separate_draft(self):
         for method in ("mtp", "online_draft+mtp", "tts+mtp"):

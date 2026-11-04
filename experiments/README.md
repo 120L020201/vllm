@@ -635,108 +635,38 @@ TTS 使用 side CUDA stream 上的 GPU eager trainer；OSpec 仍按请求块同�
 `bash experiments/run.sh online_draft` 等价于 `online_draft+eagle3`，并启用 vLLM
 内置的异步 CPU trainer。脚本自动设置 `VLLM_ONLINE_DRAFT_TRAIN=1`。
 `online_draft+dflash` 和 `online_draft+mtp` 分别选择远程 DFlash/MTP recipe；
-三者仍使用同一异步 CPU pipeline。MTP 不设置 `SPEC_MODEL`，且 target 必须包含
-内置 `mtp.*` 权重（Qwen3-8B-MTP 或 Qwen3.5）。与所选方法不匹配的
-`VLLM_ONLINE_DRAFT_TRAIN` 环境变量会报错。
+三者仍使用同一异步 CPU pipeline。MTP 不设置 `SPEC_MODEL`，且 target 必须是含
+内置 MTP 权重的 Qwen3.5。与所选方法不匹配的 `VLLM_ONLINE_DRAFT_TRAIN` 环境变量
+会报错。
 
-EAGLE3 CPU trainer 的默认配置为：
+CPU trainer 的默认配置为：
 
 - `CHECK_GRADIENTS=0`
 - `FROZEN_PARAMETER_PREFIXES=`（空，即不冻结）
 - `FUSED_OPTIMIZER=1`
-- `ONLINE_DRAFT_MASTER_WEIGHTS=0`
-- `ONLINE_DRAFT_PERSISTENT_GRADS=0`
+- `ONLINE_DRAFT_LR=1e-5`
+- `ONLINE_DRAFT_MASTER_WEIGHTS=1`
 - `ONLINE_DRAFT_CONTINUOUS_TRAINING=0`
-- `ONLINE_DRAFT_TRAIN_SCHEDULE=`（空；设置后按累计 round 数固定训练边界）
+- `ONLINE_DRAFT_LR_REFERENCE_ROWS=0`（关闭）
+- `ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=0`（仅 DFlash；`0` 保持 T=1）
+- `DFLASH_MAX_TRAIN_ROUNDS=16`（仅 DFlash）
 - `LOG_UPDATES=1`
-- `CPU_TRAINING_ATTENTION_BACKEND=flash_attention`
+- `CPU_TRAINING_ATTENTION_BACKEND=flash_attention`（仅 EAGLE3/MTP）
 - `VLLM_ONLINE_DRAFT_PROFILE=0`
 - `OMP_NUM_THREADS=20`，`MKL_NUM_THREADS` 默认跟随 `OMP_NUM_THREADS`
 
-三种 draft 共用 `CHECK_GRADIENTS`、`FUSED_OPTIMIZER`、
-`FROZEN_PARAMETER_PREFIXES`、`LOG_UPDATES` 和 `VLLM_ONLINE_DRAFT_PROFILE`；
-`CPU_TRAINING_ATTENTION_BACKEND` 只用于 EAGLE3/MTP。通过 launcher 的
-`--master-weights` 可启用 FP32 master weights 与原生 AdamW；对应的 run.sh
-开关是 `ONLINE_DRAFT_MASTER_WEIGHTS=1`。`ONLINE_DRAFT_PERSISTENT_GRADS=1`
-复用 linear weight 梯度缓冲，`ONLINE_DRAFT_CONTINUOUS_TRAINING=1` 让 CPU
-在已有快照等待安装时继续训练，并在 epoch 关闭时发布最新版本。
-
-复现 10-26 的 `position09` 行为时使用：
+EAGLE3 与 MTP 的 loss 固定，DFlash 只有温度可配置；配方、CPU 训练开关和证据见
+`experiments/README_online_draft.md`。DFlash 示例：
 
 ```bash
 MODEL=./methods/artifacts/models/Qwen3-8B \
-SPEC_MODEL=./methods/artifacts/models/Qwen3-8B-eagle3 \
-ONLINE_DRAFT_LOSS=position \
-ONLINE_DRAFT_MASTER_WEIGHTS=1 \
-ONLINE_DRAFT_PERSISTENT_GRADS=1 \
-ONLINE_DRAFT_CONTINUOUS_TRAINING=1 \
-ONLINE_DRAFT_LR_REFERENCE_ROWS=60 \
-  bash experiments/run.sh online_draft+eagle3
-```
-
-DFlash 在线更新可以使用相同的 `BENCHMARKS` 数据集选择，例如：
-
-```bash
-MODEL=./methods/artifacts/models/Qwen3-8B \
-SPEC_MODEL=./methods/artifacts/models/qwen3-8b-dflash \
+SPEC_MODEL=./methods/artifacts/models/Qwen3-8B_dflash \
 DATA_DIR=./methods/artifacts/datasets \
 BENCHMARKS="aime2026 gpqa_diamond livecodebench-lite" \
   bash experiments/run.sh online_draft+dflash
 ```
 
-该路径默认使用 15 个 draft token。设置 `ONLINE_DRAFT_LOSS=uniform|position|entropy`
-选择全 1、固定位置衰减（ρ=0.9）或 teacher entropy（γ=2）loss。
-
-DFlash 还可以覆盖共用 loss 的深度曲线和归一化方式：
-
-- `ONLINE_DRAFT_DFLASH_LOSS_GAMMA=7`：每个 block 内使用
-  `exp(-depth / 7)`，不设置时保持共用的 `0.9 ** depth`。
-- `ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION=mean|weights|block`：分别按 token
-  数、权重和或每个 block 等权归一化；默认 `mean`。
-- `ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT=2`：提高每个 block 首个拒绝位置
-  （即 correction token）的权重；默认 `1.0`。
-- `ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE=kl|overlap|ce|kl_overlap`：`overlap`
-  直接优化 `1 - sum(min(p_teacher, p_draft))`，即 rejection sampling 的单步接受率。
-- `ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE/TOP_K/TOP_P`：按实际 sampler 的
-  temperature、top-k 和 top-p 截断 teacher。student 仍在全词表归一化，因此会
-  惩罚落在 teacher 支持集之外、只能被拒绝的 draft 概率。
-- `ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT=0.5`：加入对冻结初始 DFlash draft
-  的 trust-region KL，抑制短上下文频繁更新造成的漂移。
-- `ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS=4096`：按当前序列长度线性
-  释放上述锚定；短序列保留约束，长序列恢复自由适应。
-
-历史 DFlash 配方对应：
-
-```bash
-ONLINE_DRAFT_LOSS=position \
-ONLINE_DRAFT_DFLASH_LOSS_GAMMA=7 \
-ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION=weights \
-  bash experiments/run.sh online_draft+dflash
-```
-
-单条短上下文（`aime2026[1]`，5 个 seed）上，任何在线更新都只能接近冻结
-draft，不能稳定超过它：冻结 AL 为 `4.577`，历史配方为 `4.438`，
-full-vocabulary temperature KL 为 `4.562`，sampler-aligned overlap 加
-`reference_weight=0.5` 为 `4.557`。短序列只有一条轨迹可供学习，更新次数多
-并不等于信息多；如果必须在线更新，优先使用 full-vocabulary temperature KL：
-
-```bash
-ONLINE_DRAFT_LOSS=position \
-ONLINE_DRAFT_DFLASH_LOSS_GAMMA=7 \
-ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION=weights \
-ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE=kl \
-ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=0.6 \
-ONLINE_DRAFT_DFLASH_LOSS_TOP_K=0 \
-  bash experiments/run.sh online_draft+dflash
-```
-
-`TOP_K=0` 的 dense teacher 会给每个 token 提供梯度，避免约 20 次短窗口更新
-过度拟合少量 top-k 候选。`REFERENCE_WEIGHT=0.5` 可作为更强的抗漂移选项，但
-多 seed 结果波动较大，不作为默认。多请求或较长序列仍应从历史配方开始，因为
-此时在线训练可以跨请求积累信息（固定 5 题：在线 `3.602`，冻结 `3.485`）。
-
-这些 CPU 训练默认值与 `methods/artifacts/scripts/benchmark_aime_2026_online.py`
-一致，可通过环境变量覆盖。两者共用 `online_draft.runtime` 的捕获、传输和训练
+两种入口共用 `online_draft.runtime` 的捕获、传输和训练
 实现：后台独立 D2H stream 将投影后的 teacher logits 复制到 pinned CPU buffer，
 再由 CPU 构造 FP32 teacher probabilities。默认 BF16 logits 在 `D=7`、
 `V_d=32000` 时占 448,000 字节（约 0.448 MB），不包含 hidden states 等其他数据。

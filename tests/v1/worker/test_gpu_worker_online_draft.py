@@ -194,6 +194,30 @@ def test_online_draft_settings_map_to_trainer_and_method() -> None:
     assert settings.recipe == _DFlashRecipe(max_train_rounds=4)
     assert settings.cpu["training"].threads == 2
     assert settings.cpu["capture"].threads is None
+    assert settings.trainer.lr_reference_rows is None
+    assert settings.continuous_training is False
+    assert settings.recipe.loss_temperature == 0.0
+
+
+def test_online_draft_cpu_training_settings_reach_trainer_and_pipeline() -> None:
+    settings = _parse_online_draft_settings(
+        {
+            "lr_reference_rows": 60,
+            "continuous_training": True,
+            "loss_temperature": 0.6,
+        },
+        _DFlashRecipe,
+    )
+
+    assert settings.trainer.lr_reference_rows == 60
+    assert settings.continuous_training is True
+    assert settings.recipe.loss_temperature == 0.6
+    assert settings.recipe.train_rounds().keywords["loss_temperature"] == 0.6
+
+
+def test_dflash_loss_temperature_rejects_negative_values() -> None:
+    with pytest.raises(ValueError, match="loss_temperature must be finite"):
+        _parse_online_draft_settings({"loss_temperature": -0.1}, _DFlashRecipe)
 
 
 @pytest.mark.parametrize(
@@ -202,6 +226,7 @@ def test_online_draft_settings_map_to_trainer_and_method() -> None:
         (_Eagle3Recipe, {"selective_last_layer": True}, "online EAGLE3 settings"),
         (_DFlashRecipe, {"attention_backend": "eager"}, "online DFlash settings"),
         (_DFlashRecipe, {"loss_decay_gamma": 7.0}, "settings: loss_decay_gamma"),
+        (_Eagle3Recipe, {"loss_temperature": 0.6}, "settings: loss_temperature"),
         (_Eagle3Recipe, {"cpu_threads": {"train": 2}}, "CPU roles: train"),
     ],
 )

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from functools import partial
@@ -220,9 +221,13 @@ class _DFlashRecipe:
     selective_last_layer: bool = False
     max_train_rounds: int = 0
     rebuild_kv: bool = True
+    # 0 keeps the T=1 KL; a positive value sharpens teacher and draft to it.
+    loss_temperature: float = 0.0
 
     def __post_init__(self) -> None:
         _check_max_train_rounds(self.max_train_rounds)
+        if not math.isfinite(self.loss_temperature) or self.loss_temperature < 0:
+            raise ValueError("loss_temperature must be finite and nonnegative")
 
     @staticmethod
     def supports(vllm_config: VllmConfig, speculator: Any) -> bool:
@@ -254,6 +259,7 @@ class _DFlashRecipe:
             train_dflash_window,
             max_train_rounds=self.max_train_rounds,
             rebuild_kv=self.rebuild_kv,
+            loss_temperature=self.loss_temperature,
         )
 
     def create_adapter(
@@ -361,8 +367,15 @@ _TRAINER_SETTINGS = {
     "check_gradients": "check_gradients",
     "master_weights": "master_weights",
     "frozen_parameter_prefixes": "frozen_parameter_prefixes",
+    "lr_reference_rows": "lr_reference_rows",
 }
-_RUNTIME_SETTINGS = {"cpu_threads", "cpu_affinity", "log_queue_sizes", "log_updates"}
+_RUNTIME_SETTINGS = {
+    "cpu_threads",
+    "cpu_affinity",
+    "log_queue_sizes",
+    "log_updates",
+    "continuous_training",
+}
 _CPU_ROLES = ("inference", "capture", "training")
 
 
@@ -375,6 +388,7 @@ class _OnlineDraftSettings:
     cpu: dict[str, CPUWorkerConfig]
     log_queue_sizes: bool
     log_updates: bool
+    continuous_training: bool
 
 
 def _recipe_type(vllm_config: VllmConfig) -> type[_Recipe]:
@@ -432,6 +446,7 @@ def _parse_online_draft_settings(
         },
         log_queue_sizes=values.get("log_queue_sizes", False),
         log_updates=values.get("log_updates", False),
+        continuous_training=values.get("continuous_training", False),
     )
 
 
@@ -504,6 +519,7 @@ def create_online_draft(
         on_queue_size=queue_logger("train"),
         profile_timeline=profile_online_draft,
         cpu_config=settings.cpu["training"],
+        continuous_training=settings.continuous_training,
     )
     adapter = recipe.create_adapter(
         vllm_config,

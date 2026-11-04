@@ -13,7 +13,7 @@ from online_draft.training.eagle3.cache import (
     persistent_cache_length,
 )
 from online_draft.training.eagle3.distill import (
-    window_forward_kl_loss,
+    position_forward_kl_loss,
 )
 from online_draft.training.eagle3.inputs import (
     prepare_eagle3_confirmed_path_inputs,
@@ -193,6 +193,7 @@ def test_confirmed_path_packs_only_confirmed_queries() -> None:
         False,
         True,
     ]
+    assert inputs.proposal_depths.tolist() == [0, 1, 2, 0, 1]
     assert inputs.input_length == 5
     assert inputs.target_count == 5
     assert fc_input_shapes == [torch.Size((2, 12))]
@@ -300,10 +301,10 @@ def test_confirmed_path_forwards_only_loss_rows() -> None:
         attention_mask=inputs.attention_mask,
     )
     student_logits = model.compute_draft_logits(output.hidden_states)
-    loss = window_forward_kl_loss(
+    loss = position_forward_kl_loss(
         student_logits=student_logits,
         teacher_probabilities=inputs.teacher_probabilities,
-        rejection_target_mask=inputs.rejection_target_mask,
+        proposal_depths=inputs.proposal_depths,
     )
 
     loss.backward()

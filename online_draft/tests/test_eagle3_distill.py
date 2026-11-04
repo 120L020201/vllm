@@ -3,8 +3,8 @@
 import torch
 import torch.nn.functional as F
 from online_draft.training.eagle3.distill import (
+    position_forward_kl_loss,
     project_teacher_distribution,
-    window_forward_kl_loss,
 )
 
 
@@ -42,47 +42,17 @@ def test_project_teacher_distribution() -> None:
     assert not coverage.requires_grad
 
 
-def test_window_rejection_mask_weights_multiple_rounds() -> None:
-    torch.manual_seed(2)
+def test_position_loss_restarts_depth_per_round_and_averages_rows() -> None:
+    """Two rounds of depths 0-2 and 0-1 share weights 1, 0.9, 0.81 by depth."""
+    torch.manual_seed(3)
+    student_logits = torch.randn(5, 4, requires_grad=True)
+    teacher = torch.randn(5, 4).softmax(dim=-1)
+    depths = torch.tensor([0, 1, 2, 0, 1])
 
-    student_logits = torch.randn(
-        5,
-        3,
-        requires_grad=True,
-    )
-    teacher_logits = torch.randn(
-        5,
-        3,
-        requires_grad=True,
-    )
-    teacher = teacher_logits.softmax(dim=-1)
-    rejection_target_mask = torch.tensor([False, True, False, False, True])
-
-    actual = window_forward_kl_loss(
-        student_logits=student_logits,
-        teacher_probabilities=teacher,
-        rejection_target_mask=rejection_target_mask,
-    )
+    actual = position_forward_kl_loss(student_logits, teacher, depths)
 
     per_position_kl = F.kl_div(
-        F.log_softmax(student_logits.float(), dim=-1),
-        teacher.detach().float(),
-        reduction="none",
+        F.log_softmax(student_logits, dim=-1), teacher, reduction="none"
     ).sum(dim=-1)
-    weights = torch.tensor([1.0, 2.0, 1.0, 1.0, 2.0])
-    expected = (per_position_kl * weights).sum() / weights.sum()
-
-    torch.testing.assert_close(actual, expected)
-
-    actual.backward()
-
-    expected_gradient = student_logits.detach().softmax(dim=-1) - teacher.detach()
-    expected_gradient *= weights[:, None] / weights.sum()
-
-    torch.testing.assert_close(
-        student_logits.grad,
-        expected_gradient,
-        rtol=1e-5,
-        atol=1e-6,
-    )
-    assert teacher_logits.grad is None
+    weights = torch.tensor([1.0, 0.9, 0.81, 1.0, 0.9])
+    torch.testing.assert_close(actual, (per_position_kl * weights).sum() / 5)

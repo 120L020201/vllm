@@ -3,6 +3,7 @@
 
 from threading import Event
 
+import online_draft.training.gemma4_mtp.window as gemma4_mtp_window
 import torch
 from online_draft.models.gemma4_mtp import (
     Gemma4MTPConfig,
@@ -14,6 +15,7 @@ from online_draft.runtime.capture.gemma4_mtp import (
     Gemma4MTPCaptureBuffers,
 )
 from online_draft.training.eagle3.batch import Eagle3DistillationBatch
+from online_draft.training.eagle3.distill import position_forward_kl_loss
 from online_draft.training.gemma4_mtp.window import (
     Gemma4MTPBatch,
     train_gemma4_mtp_window,
@@ -110,6 +112,26 @@ def test_window_appends_target_kv_and_trains_only_query_weights() -> None:
     assert result.model_version == 2
     assert result.target_count == 3
     assert [layer.shape[0] for layer in cache] == [9, 9]
+
+
+def test_window_loss_restarts_depth_on_every_round(monkeypatch) -> None:
+    """Gemma4 MTP shares the EAGLE3 depth-decayed loss."""
+    depths: list[list[int]] = []
+
+    def record(logits, teacher, proposal_depths):
+        depths.append(proposal_depths.tolist())
+        return position_forward_kl_loss(logits, teacher, proposal_depths)
+
+    monkeypatch.setattr(gemma4_mtp_window, "position_forward_kl_loss", record)
+    trainer = DraftTrainer(_model(), TrainerConfig(learning_rate=1e-2))
+    rounds = (
+        Gemma4MTPBatch(_round(2, 2), _history(5)),
+        Gemma4MTPBatch(_round(4, 4), _history(4)),
+    )
+
+    train_gemma4_mtp_window(trainer, rounds, None)
+
+    assert depths == [[0, 1, 0, 1, 2]]
 
 
 def test_adapter_rounds_carry_prompt_then_confirmed_target_kv() -> None:

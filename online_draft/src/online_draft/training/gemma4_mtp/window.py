@@ -15,7 +15,7 @@ import torch
 from online_draft.models.gemma4_mtp import Gemma4MTPForCausalLM, TargetKV
 from online_draft.runtime import profile_range
 from online_draft.training.eagle3.batch import Eagle3DistillationBatch
-from online_draft.training.eagle3.distill import window_forward_kl_loss
+from online_draft.training.eagle3.distill import position_forward_kl_loss
 from online_draft.training.trainer import DraftTrainer
 
 
@@ -41,7 +41,7 @@ class Gemma4MTPWindowResult:
 
 
 def _query_rows(batch: Eagle3DistillationBatch):
-    """Anchor row plus draft rows whose targets are confirmed."""
+    """Anchor row plus confirmed draft rows, with each row's draft depth."""
     count = (
         batch.draft_length
         if batch.rejection_position is None
@@ -51,16 +51,13 @@ def _query_rows(batch: Eagle3DistillationBatch):
     hidden = torch.cat(
         (batch.prefix_aux_hidden_states[-1:], batch.draft_input_hidden_states)
     )
-    rejected = torch.zeros(count, dtype=torch.bool)
-    if batch.rejection_position is not None:
-        rejected[batch.rejection_position] = True
     positions = batch.prefix_positions[-1:].expand(count)
     return (
         positions,
         embeds[:count],
         hidden[:count],
         batch.teacher_probabilities[:count],
-        rejected,
+        torch.arange(count),
     )
 
 
@@ -80,7 +77,7 @@ def train_gemma4_mtp_window(
     history = tuple(torch.cat(layer) for layer in zip(*parts, strict=True))
 
     selected = rounds[-max_train_rounds:] if max_train_rounds else rounds
-    positions, embeds, hidden, teacher, rejected = (
+    positions, embeds, hidden, teacher, depths = (
         torch.cat(column)
         for column in zip(*(_query_rows(batch.round) for batch in selected))
     )
@@ -89,7 +86,7 @@ def train_gemma4_mtp_window(
             draft_hidden, _ = model(positions, embeds, hidden, history)
             logits = model.lm_head(draft_hidden)
         with profile_range("online_draft.loss", profile_timeline):
-            loss = window_forward_kl_loss(logits, teacher, rejected)
+            loss = position_forward_kl_loss(logits, teacher, depths)
         loss_value = trainer.backward_and_step(
             loss, supervised_rows=teacher.shape[0], profile_timeline=profile_timeline
         )

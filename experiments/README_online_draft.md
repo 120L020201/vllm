@@ -5,10 +5,10 @@
 CPU worker 训练独立副本，再异步安装权重。它们不使用 TTS 的 CUDA side-stream
 trainer。
 
-MTP 没有独立 draft checkpoint，权重必须内置在 target 中。CPU recipe 支持含
-`num_nextn_predict_layers` 的 Qwen3（如 `Qwen3-8B-MTP`），以及含
-`mtp_num_hidden_layers` 的 Qwen3.5。标准 `Qwen/Qwen3-8B` 不含 MTP 权重，
-只能运行 EAGLE3 或 DFlash。
+MTP 没有独立 draft checkpoint，权重必须内置在 target 中。在线 MTP 只支持含
+`mtp_num_hidden_layers` 的 Qwen3.5；含 `num_nextn_predict_layers` 的 Qwen3
+（如 `Qwen3-8B-MTP`）只能走 `tts+mtp`（`methods/tts_common/vllm_ext`）。标准
+`Qwen/Qwen3-8B` 不含 MTP 权重，只能运行 EAGLE3 或 DFlash。
 
 ```bash
 bash experiments/prepare.sh \
@@ -17,90 +17,64 @@ bash experiments/prepare.sh \
   --model-size qwen3.5-4b --draft-method mtp
 ```
 
-## Loss 预设
+## 默认配方
 
-只保留一个入口变量：
+loss 形式是方法定义的一部分；DFlash 只有温度可配置。CPU 训练开关的默认值见下文
+“CPU 训练优化”。
 
-```bash
-ONLINE_DRAFT_LOSS=uniform  # 默认，KL+Uni，所有位置权重为 1
-ONLINE_DRAFT_LOSS=position # 每轮深度权重 0.9**depth
-ONLINE_DRAFT_LOSS=entropy  # exp(-2 * normalized_teacher_entropy) * KL
-```
+| 方法 | loss | 证据（旧 32 GB GPU） |
+| --- | --- | --- |
+| EAGLE3 | 每轮深度 d 权重 `0.9**d` 的 forward KL，除以监督行数 | Qwen3.5-4B 30 题三次同批配对 +0.46 / +0.63 / +0.64 AL（每次 28/30 题更高）；Qwen3-8B 30 题 frozen 2.284 → 2.657 |
+| MTP（Qwen3.5、Gemma4） | 与 EAGLE3 相同 | Qwen3.5-4B 仍低于冻结：30 题三次同批 −0.07 到 −0.16 AL；全参数 loss 中最好。Gemma4 未测 |
+| DFlash | forward KL，权重 `exp(-d/7)`，除以权重和；`DFLASH_MAX_TRAIN_ROUNDS=16` | 默认 T=1。`ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=0.6` 把 teacher 与 draft 都锐化到 T=0.6（teacher 不截断）：Qwen3.5-4B 30 题三次同批 +0.10 / −0.25 / −0.16 AL |
 
-三种损失都按监督行数归一化，并适用于 EAGLE3、DFlash 和 MTP 的共享 CPU
-pipeline。旧的 coverage、rank、rejection、sampling、LoRA、replay 等实验变量已
-移除；传入未知 `additional_config["online_draft"]` 字段会 fail closed。
-
-DFlash 另有 sampler-aligned 配方：teacher 按实际 `temperature -> top-k -> top-p`
-截断，student 保持全词表归一化，从而惩罚只能被 rejection sampling 拒绝的尾部
-概率。`objective=overlap` 直接优化 expected acceptance。也可用
-`ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT` 对冻结初始 draft 做 trust-region
-KL；`..._REFERENCE_DECAY_TOKENS` 可按长度释放，但多 seed 下稳定性不如 dense
-temperature KL，建议只在明确调参后使用。
-
-单条 `aime2026[1]` 的 5-seed 平均 AL：冻结 `4.577`，历史配方 `4.438`，
-`T=0.6` 全词表 KL `4.562`，overlap 加 anchor `0.5` 为 `4.557`。短单请求
-没有足够的新信息，在线训练不应期待超过冻结；若必须更新，使用下面的 dense
-temperature KL 以减小漂移：
-
-```bash
-ONLINE_DRAFT_LOSS=position \
-ONLINE_DRAFT_DFLASH_LOSS_GAMMA=7 \
-ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION=weights \
-ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE=kl \
-ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=0.6 \
-ONLINE_DRAFT_DFLASH_LOSS_TOP_K=0 \
-  bash experiments/run.sh online_draft+dflash
-```
-
-多请求场景可保留历史配方或 overlap + anchor；固定 5 题上它们与历史配方接近，
-且都优于冻结。
+EAGLE3 的证据只覆盖 Qwen3.5-4B 与 Qwen3-8B target；Llama3.1、Gemma4 target 与
+Gemma4 MTP 换用此 loss 后尚未重测。
 
 ## CPU 训练优化
 
-以下三个开关可以独立启用，默认关闭：
+`experiments/run.sh` 的开关和默认值（0 关闭，1 开启）：
 
 ```bash
-ONLINE_DRAFT_MASTER_WEIGHTS=1       # FP32 master weights + native AdamW
-ONLINE_DRAFT_PERSISTENT_GRADS=1     # 复用 linear weight 梯度缓冲
-ONLINE_DRAFT_CONTINUOUS_TRAINING=1  # 队列排空即训练，不等待下次权重安装
+ONLINE_DRAFT_MASTER_WEIGHTS=1           # FP32 master weights
+ONLINE_DRAFT_CONTINUOUS_TRAINING=0      # 队列排空即训练，安装槽空出时发布最新权重
+ONLINE_DRAFT_LR_REFERENCE_ROWS=0        # N>0 时每步 lr 乘 min(1, 监督行数 / N)；0 关闭
+ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=0  # DFlash KL 温度；0 保持 T=1
+ONLINE_DRAFT_LR=1e-5                    # 学习率
 ```
 
-`ONLINE_DRAFT_MASTER_WEIGHTS` 保持 BF16 参数供 forward/backward 使用，同时在
-FP32 master weights/moments 上更新并回写 BF16；原生 C++ kernel 释放 GIL，
-构建失败时自动回退到 ATen。`ONLINE_DRAFT_PERSISTENT_GRADS` 只替换无 bias 的
-`nn.Linear`，将权重梯度直接写入持续复用的缓冲区。`ONLINE_DRAFT_CONTINUOUS_TRAINING`
-允许 CPU 在已有权重快照等待 H2D 安装时继续训练，epoch 关闭时只发布最新版本。
+以下两项是 trainer 的固定行为，没有开关：
 
-如需按监督行数缩放学习率，可额外设置 `ONLINE_DRAFT_LR_REFERENCE_ROWS`（正数）；
-不设置时保持配置的完整学习率。
+- 无 bias 的可训练 linear 把权重梯度写入常驻缓冲，缓冲在第一次 backward 时分配。
+- `master_weights` 开启且可训练参数都是连续的 CPU BF16 张量时，用释放 GIL 的单遍
+  原生 AdamW；原生 kernel 编译失败时退回 FP32 副本 + torch AdamW。
 
-需要复现某次运行的更新节奏时，用 `ONLINE_DRAFT_TRAIN_SCHEDULE` 固定训练边界：
-值是累计已验证 round 数（严格递增），到达边界立即训练并发布快照，最后一项之后
-该请求停止训练。例如 `63,111,151,197,241,287,330,376,419,459,501,543,587,634`
-复现 10-29 22:18 那次第 1 题的 14 次更新。
+BF16 原地 AdamW 在 lr=1e-5 时约 82% 的元素更新被舍入丢弃，RMSNorm 权重从不变化；
+FP32 master weights 是 AL 收益的主要来源（Qwen3-8B 5 题 AL@2000：2.377 → 2.564，
+去掉它降到 2.202）。其余几项主要增加更新次数（约 1.5 倍）和 decode 速度，单独对
+AL 的影响在重复噪声内。
+
+原生 AdamW 一遍读 BF16 梯度、写回 FP32 master、两个矩和 BF16 参数。243M 参数、
+20 线程（Xeon w7-3445）单步 70 ms，FP32 副本 + fused AdamW 为 120 ms。原生 kernel
+首次使用时以 `-march=native` 编译（需要 g++ 与 ninja），失败时日志出现
+`native master AdamW unavailable, using FP32 master copies`。
 
 ## 启动示例
 
 ```bash
 MODEL=./methods/artifacts/models/Qwen3-8B \
 SPEC_MODEL=./methods/artifacts/models/Qwen3-8B_eagle3 \
-ONLINE_DRAFT_LOSS=uniform \
-ONLINE_DRAFT_MASTER_WEIGHTS=1 \
-ONLINE_DRAFT_PERSISTENT_GRADS=1 \
-ONLINE_DRAFT_CONTINUOUS_TRAINING=1 \
 bash experiments/run.sh online_draft+eagle3
 
 MODEL=./methods/artifacts/models/Qwen3-8B \
 SPEC_MODEL=./methods/artifacts/models/Qwen3-8B_dflash \
-ONLINE_DRAFT_LOSS=position \
 bash experiments/run.sh online_draft+dflash
 
-# MODEL 必须是含内置 mtp.* 权重的 Qwen3/Qwen3.5 checkpoint；不要设置 SPEC_MODEL。
-MODEL=./methods/artifacts/models/Qwen3-8B-MTP \
-ONLINE_DRAFT_LOSS=entropy \
+# MTP 权重内置在 target 中，不要设置 SPEC_MODEL；多模态 Qwen3.5 需 LANGUAGE_MODEL_ONLY=1。
+MODEL=./methods/artifacts/models/Qwen3.5-4B LANGUAGE_MODEL_ONLY=1 \
 bash experiments/run.sh online_draft+mtp
 ```
 
 `online_draft` 是 `online_draft+eagle3` 的兼容简写。三种 online 方法都要求
-`RESUME=0`，并在每个请求结束时恢复初始 draft 权重。
+`RESUME=0`，并在每个请求结束时恢复初始 draft 权重。Qwen3.5-4B EAGLE3 的 draft
+head_dim 为 160，FlashInfer 不支持，需 `GPU_ATTENTION_BACKEND=FLASH_ATTN`。

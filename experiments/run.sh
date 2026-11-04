@@ -142,22 +142,10 @@ RUN_LOG=${RUN_LOG:-}
 STATS_FILE=${STATS_FILE:-$RUN_DIR/stats.json}
 STEP_METRICS_FILE=${STEP_METRICS_FILE:-$RUN_DIR/steps.jsonl}
 if [[ "$METHOD" == online_draft ]]; then
-  ONLINE_DRAFT_LOSS=${ONLINE_DRAFT_LOSS:-uniform}
-  ONLINE_DRAFT_MASTER_WEIGHTS=${ONLINE_DRAFT_MASTER_WEIGHTS:-0}
-  ONLINE_DRAFT_PERSISTENT_GRADS=${ONLINE_DRAFT_PERSISTENT_GRADS:-0}
+  ONLINE_DRAFT_MASTER_WEIGHTS=${ONLINE_DRAFT_MASTER_WEIGHTS:-1}
   ONLINE_DRAFT_CONTINUOUS_TRAINING=${ONLINE_DRAFT_CONTINUOUS_TRAINING:-0}
-  ONLINE_DRAFT_TRAIN_SCHEDULE=${ONLINE_DRAFT_TRAIN_SCHEDULE:-}
-  ONLINE_DRAFT_LR_REFERENCE_ROWS=${ONLINE_DRAFT_LR_REFERENCE_ROWS:-}
-  ONLINE_DRAFT_DFLASH_LOSS_GAMMA=${ONLINE_DRAFT_DFLASH_LOSS_GAMMA:-}
-  ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION=${ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION:-mean}
-  ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT=${ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT:-1.0}
-  ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE=${ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE:-kl}
-  ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT=${ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT:-1.0}
-  ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=${ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE:-1.0}
-  ONLINE_DRAFT_DFLASH_LOSS_TOP_K=${ONLINE_DRAFT_DFLASH_LOSS_TOP_K:-0}
-  ONLINE_DRAFT_DFLASH_LOSS_TOP_P=${ONLINE_DRAFT_DFLASH_LOSS_TOP_P:-1.0}
-  ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT=${ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT:-0.0}
-  ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS=${ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS:-0}
+  ONLINE_DRAFT_LR_REFERENCE_ROWS=${ONLINE_DRAFT_LR_REFERENCE_ROWS:-0}
+  ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=${ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE:-0}
 fi
 DRY_RUN=${DRY_RUN:-0}
 RESUME=${RESUME:-}
@@ -169,22 +157,14 @@ Usage: bash experiments/run.sh {base|eagle3|dflash|mtp|online_draft|online_draft
 The script starts one OpenAI-compatible vLLM server, waits for readiness,
 evaluates DATA_DIR/BENCHMARKS sequentially, and writes JSONL results.
 In BENCHMARKS, name(N) samples N questions and name[N,M,...] selects questions.
-All online_draft entries use the built-in asynchronous CPU trainer. Select
-ONLINE_DRAFT_LOSS=uniform, position (rho=0.9), or entropy (gamma=2).
-CPU optimizations: ONLINE_DRAFT_MASTER_WEIGHTS, ONLINE_DRAFT_PERSISTENT_GRADS,
-and ONLINE_DRAFT_CONTINUOUS_TRAINING (all default to 0).
-ONLINE_DRAFT_TRAIN_SCHEDULE pins updates to cumulative completed rounds,
-e.g. 63,111,151; training stops for a request after the last entry.
-DFlash loss: ONLINE_DRAFT_DFLASH_LOSS_GAMMA (default keeps rho=0.9),
-ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION=mean|weights, and
-ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT (default 1.0).
-ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE=kl|overlap|ce|kl_overlap selects the
-DFlash objective; ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT tunes kl_overlap.
-ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE, ..._TOP_K, and ..._TOP_P match
-sampler-space loss; the draft remains normalized over the full vocabulary.
-ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT adds a trust-region KL toward the
-frozen initial DFlash draft (default 0); ..._REFERENCE_DECAY_TOKENS linearly
-releases it so short contexts are anchored and long contexts can adapt.
+All online_draft entries use the built-in asynchronous CPU trainer.
+EAGLE3 and MTP use forward KL weighted by 0.9**depth; DFlash uses forward KL
+with exp(-depth/7) weights. ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE (default 0,
+which keeps T=1) sharpens both DFlash distributions to that temperature.
+ONLINE_DRAFT_MASTER_WEIGHTS defaults to 1; ONLINE_DRAFT_CONTINUOUS_TRAINING
+defaults to 0. ONLINE_DRAFT_LR_REFERENCE_ROWS (default 0, which disables it)
+scales the learning rate by min(1, rows / N). ONLINE_DRAFT_LR sets the
+learning rate.
 eagle3, dflash, and mtp never train the draft. MTP uses target-embedded weights.
 DFlash defaults SPEC_TOKENS to 15 and MTP defaults it to 3.
 LANGUAGE_MODEL_ONLY=1 loads only the language model; use it for text-only
@@ -269,33 +249,10 @@ awk -v interval="$MONITOR_INTERVAL" 'BEGIN { if (interval <= 0) exit 1 }' || die
 [[ "$VLLM_ONLINE_DRAFT_TRAIN" == 0 || "$VLLM_ONLINE_DRAFT_TRAIN" == 1 ]] || die "VLLM_ONLINE_DRAFT_TRAIN must be 0 or 1"
 [[ "$VLLM_ONLINE_DRAFT_PROFILE" == 0 || "$VLLM_ONLINE_DRAFT_PROFILE" == 1 ]] || die "VLLM_ONLINE_DRAFT_PROFILE must be 0 or 1"
 if [[ "$METHOD" == online_draft ]]; then
-  case "$ONLINE_DRAFT_LOSS" in
-    uniform|position|entropy) ;;
-    *) die "ONLINE_DRAFT_LOSS must be uniform, position, or entropy" ;;
-  esac
   [[ "$ONLINE_DRAFT_MASTER_WEIGHTS" == 0 || "$ONLINE_DRAFT_MASTER_WEIGHTS" == 1 ]] || die "ONLINE_DRAFT_MASTER_WEIGHTS must be 0 or 1"
-  [[ "$ONLINE_DRAFT_PERSISTENT_GRADS" == 0 || "$ONLINE_DRAFT_PERSISTENT_GRADS" == 1 ]] || die "ONLINE_DRAFT_PERSISTENT_GRADS must be 0 or 1"
   [[ "$ONLINE_DRAFT_CONTINUOUS_TRAINING" == 0 || "$ONLINE_DRAFT_CONTINUOUS_TRAINING" == 1 ]] || die "ONLINE_DRAFT_CONTINUOUS_TRAINING must be 0 or 1"
-  if [[ -n "$ONLINE_DRAFT_TRAIN_SCHEDULE" ]]; then
-    awk -v schedule="$ONLINE_DRAFT_TRAIN_SCHEDULE" 'BEGIN {
-      count = split(schedule, rounds, ",")
-      previous = 0
-      for (i = 1; i <= count; i++) {
-        if (rounds[i] !~ /^[0-9]+$/ || rounds[i] + 0 <= previous) exit 1
-        previous = rounds[i] + 0
-      }
-    }' || die "ONLINE_DRAFT_TRAIN_SCHEDULE must be strictly increasing rounds"
-  fi
-  [[ "$ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION" == mean || "$ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION" == weights || "$ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION" == block ]] || die "ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION must be mean, weights, or block"
-  [[ "$ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE" == kl || "$ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE" == overlap || "$ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE" == ce || "$ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE" == kl_overlap ]] || die "ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE must be kl, overlap, ce, or kl_overlap"
-  [[ -z "$ONLINE_DRAFT_DFLASH_LOSS_GAMMA" ]] || awk -v gamma="$ONLINE_DRAFT_DFLASH_LOSS_GAMMA" 'BEGIN { if (gamma <= 0) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_GAMMA must be positive"
-  awk -v weight="$ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT" 'BEGIN { if (weight <= 0) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT must be positive"
-  awk -v weight="$ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT" 'BEGIN { if (weight <= 0) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT must be positive"
-  awk -v temperature="$ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE" 'BEGIN { if (temperature <= 0) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE must be positive"
-  [[ "$ONLINE_DRAFT_DFLASH_LOSS_TOP_K" =~ ^[0-9]+$ ]] || die "ONLINE_DRAFT_DFLASH_LOSS_TOP_K must be a nonnegative integer"
-  awk -v top_p="$ONLINE_DRAFT_DFLASH_LOSS_TOP_P" 'BEGIN { if (top_p <= 0 || top_p > 1) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_TOP_P must be in (0, 1]"
-  awk -v weight="$ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT" 'BEGIN { if (weight < 0) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT must be nonnegative"
-  [[ "$ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS" =~ ^[0-9]+$ ]] || die "ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS must be a nonnegative integer"
+  awk -v rows="$ONLINE_DRAFT_LR_REFERENCE_ROWS" 'BEGIN { if (rows !~ /^[0-9]+([.][0-9]+)?$/) exit 1 }' || die "ONLINE_DRAFT_LR_REFERENCE_ROWS must be a nonnegative number"
+  awk -v temperature="$ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE" 'BEGIN { if (temperature !~ /^[0-9]+([.][0-9]+)?$/) exit 1 }' || die "ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE must be a nonnegative number"
 fi
 [[ "$SEED" =~ ^[0-9]+$ ]] || die "SEED must be a nonnegative integer"
 [[ "$WARMUP_TOKENS" =~ ^[0-9]+$ ]] || die "WARMUP_TOKENS must be a nonnegative integer"
@@ -442,38 +399,19 @@ else
   fi
   online_draft_args=()
   if [[ "$METHOD" == online_draft ]]; then
-    online_draft_args=(--online-draft-loss "$ONLINE_DRAFT_LOSS")
-    if [[ "$ONLINE_DRAFT_MASTER_WEIGHTS" == 1 ]]; then
-      online_draft_args+=(--master-weights)
-    fi
-    if [[ "$ONLINE_DRAFT_PERSISTENT_GRADS" == 1 ]]; then
-      online_draft_args+=(--persistent-grads)
-    fi
-    if [[ "$ONLINE_DRAFT_CONTINUOUS_TRAINING" == 1 ]]; then
-      online_draft_args+=(--continuous-training)
-    fi
-    if [[ -n "$ONLINE_DRAFT_TRAIN_SCHEDULE" ]]; then
-      online_draft_args+=(--online-draft-train-schedule "$ONLINE_DRAFT_TRAIN_SCHEDULE")
-    fi
-    if [[ -n "$ONLINE_DRAFT_LR_REFERENCE_ROWS" ]]; then
-      online_draft_args+=(--lr-reference-rows "$ONLINE_DRAFT_LR_REFERENCE_ROWS")
-    fi
-    if [[ "$DRAFT_METHOD" == dflash && -n "$ONLINE_DRAFT_DFLASH_LOSS_GAMMA" ]]; then
-      online_draft_args+=(--dflash-loss-gamma "$ONLINE_DRAFT_DFLASH_LOSS_GAMMA")
-    fi
-    if [[ "$DRAFT_METHOD" == dflash ]]; then
-      online_draft_args+=(
-        --dflash-loss-normalization "$ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION"
-        --dflash-loss-rejection-weight "$ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT"
-        --dflash-loss-objective "$ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE"
-        --dflash-loss-overlap-weight "$ONLINE_DRAFT_DFLASH_LOSS_OVERLAP_WEIGHT"
-        --dflash-loss-temperature "$ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE"
-        --dflash-loss-top-k "$ONLINE_DRAFT_DFLASH_LOSS_TOP_K"
-        --dflash-loss-top-p "$ONLINE_DRAFT_DFLASH_LOSS_TOP_P"
-        --dflash-loss-reference-weight "$ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_WEIGHT"
-        --dflash-loss-reference-decay-tokens "$ONLINE_DRAFT_DFLASH_LOSS_REFERENCE_DECAY_TOKENS"
-      )
-    fi
+    online_draft_args=(
+      --lr-reference-rows "$ONLINE_DRAFT_LR_REFERENCE_ROWS"
+      --dflash-loss-temperature "$ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE"
+    )
+    for option in \
+      "master-weights=$ONLINE_DRAFT_MASTER_WEIGHTS" \
+      "continuous-training=$ONLINE_DRAFT_CONTINUOUS_TRAINING"; do
+      if [[ "${option#*=}" == 1 ]]; then
+        online_draft_args+=("--${option%=*}")
+      else
+        online_draft_args+=("--no-${option%=*}")
+      fi
+    done
   fi
   server_command=(
     "$PYTHON_BIN" -m methods.run "$methods_method"
@@ -488,7 +426,7 @@ else
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
     --gpu-attention-backend "$GPU_ATTENTION_BACKEND"
     "$flashinfer_autotune_arg"
-    --learning-rate "${TTS_LEARNING_RATE:-1e-5}"
+    --learning-rate "${ONLINE_DRAFT_LR:-${TTS_LEARNING_RATE:-1e-5}}"
     --update-stride "${TTS_UPDATE_STRIDE:-1}"
     --chunk-size "${CHUNK_SIZE:-5}"
     --probability "${UPDATE_PROBABILITY:-0.5}"

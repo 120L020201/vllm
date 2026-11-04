@@ -29,6 +29,7 @@ class Eagle3WindowInputs:
     attention_mask: torch.Tensor
     teacher_probabilities: torch.Tensor
     rejection_target_mask: torch.Tensor
+    proposal_depths: torch.Tensor
 
     @property
     def input_length(self) -> int:
@@ -125,6 +126,7 @@ def _pack_window_inputs(
     input_embed_parts: list[torch.Tensor] = []
     hidden_state_parts: list[torch.Tensor] = []
     teacher_parts: list[torch.Tensor] = []
+    depth_parts: list[torch.Tensor] = []
     for index, (round_batch, target_count) in enumerate(
         zip(window.rounds, target_counts, strict=True)
     ):
@@ -148,6 +150,7 @@ def _pack_window_inputs(
         input_embed_parts.append(input_embeds[:target_count])
         hidden_state_parts.append(hidden_states[:target_count])
         teacher_parts.append(round_batch.teacher_probabilities[:target_count])
+        depth_parts.append(torch.arange(target_count))
 
     positions = torch.cat(position_parts, dim=0)
     total_query_length = positions.numel()
@@ -204,4 +207,5 @@ def _pack_window_inputs(
         attention_mask=attention_mask,
         teacher_probabilities=torch.cat(teacher_parts, dim=0),
         rejection_target_mask=rejection_target_mask,
+        proposal_depths=torch.cat(depth_parts, dim=0).to(positions.device),
     )

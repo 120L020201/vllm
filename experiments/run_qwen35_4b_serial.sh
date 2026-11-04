@@ -62,25 +62,22 @@ common_env=(
   "DATA_DIR=$DATA_DIR"
   "BENCHMARKS=$BENCHMARKS"
   "MODEL=$MODEL"
-  "GPU_ATTENTION_BACKEND=FLASH_ATTN"
+  "GPU_ATTENTION_BACKEND=${GPU_ATTENTION_BACKEND:-FLASHINFER}"
   "LANGUAGE_MODEL_ONLY=1"
   "DRY_RUN=$DRY_RUN"
 )
 
+# Online runs use the run.sh defaults.
 online_env=(
-  "ONLINE_DRAFT_LOSS=position"
-  "ONLINE_DRAFT_LR_REFERENCE_ROWS=60"
-  "ONLINE_DRAFT_MASTER_WEIGHTS=1"
-  "ONLINE_DRAFT_PERSISTENT_GRADS=1"
-  "ONLINE_DRAFT_CONTINUOUS_TRAINING=1"
-  "ONLINE_DRAFT_DFLASH_LOSS_GAMMA=7"
-  "ONLINE_DRAFT_DFLASH_LOSS_NORMALIZATION=weights"
-  "ONLINE_DRAFT_DFLASH_LOSS_REJECTION_WEIGHT=1"
-  "ONLINE_DRAFT_DFLASH_LOSS_OBJECTIVE=kl"
-  "ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE=0.6"
-  "ONLINE_DRAFT_DFLASH_LOSS_TOP_K=0"
-  "ONLINE_DRAFT_DFLASH_LOSS_TOP_P=1.0"
   "DFLASH_MAX_TRAIN_ROUNDS=16"
+)
+# The Qwen3.5-4B EAGLE3 draft has head_dim 160, which FlashInfer does not
+# support, and the V2 runner reuses the target's attention metadata for the
+# draft prefill, so EAGLE3 runs need FLASH_ATTN for both.
+eagle3_env=(
+  "GPU_ATTENTION_BACKEND=FLASH_ATTN"
+  "SPEC_MODEL=$EAGLE3_MODEL"
+  "SPEC_TOKENS=7"
 )
 
 current_method=
@@ -90,10 +87,10 @@ for current_method in "${METHODS[@]}"; do
   run_env=("${common_env[@]}")
   case "$current_method" in
     eagle3)
-      run_env+=("SPEC_MODEL=$EAGLE3_MODEL" "SPEC_TOKENS=7")
+      run_env+=("${eagle3_env[@]}")
       ;;
     online_draft+eagle3)
-      run_env+=("${online_env[@]}" "SPEC_MODEL=$EAGLE3_MODEL" "SPEC_TOKENS=7")
+      run_env+=("${online_env[@]}" "${eagle3_env[@]}")
       ;;
     dflash)
       run_env+=("SPEC_MODEL=$DFLASH_MODEL")

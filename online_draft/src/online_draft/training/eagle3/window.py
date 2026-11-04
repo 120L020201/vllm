@@ -15,7 +15,7 @@ from online_draft.training.eagle3.cache import (
     persistent_cache_length,
 )
 from online_draft.training.eagle3.distill import (
-    window_forward_kl_loss,
+    position_forward_kl_loss,
 )
 from online_draft.training.eagle3.draft_model import AutoregressiveDraftModel
 from online_draft.training.eagle3.inputs import (
@@ -209,10 +209,10 @@ def train_eagle3_window(
             logits = model.compute_draft_logits(hidden_states_for_loss)
 
         with profile_range("online_draft.loss", profile_timeline):
-            loss = window_forward_kl_loss(
+            loss = position_forward_kl_loss(
                 student_logits=logits,
                 teacher_probabilities=training_inputs.teacher_probabilities,
-                rejection_target_mask=training_inputs.rejection_target_mask,
+                proposal_depths=training_inputs.proposal_depths,
             )
 
         input_length = training_inputs.input_length

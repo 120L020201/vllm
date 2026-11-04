@@ -227,7 +227,9 @@ CPU attention backward 使用独立 C++ extension，需要 C++ 编译器和 Ninj
 | --- | --- | --- | --- |
 | `learning_rate` | 全部 | `1e-5` | AdamW 学习率，须为正 |
 | `fused_optimizer` | 全部 | `True` | fused AdamW |
-| `master_weights` | 全部 | `False` | FP32 master weights |
+| `master_weights` | 全部 | `False` | FP32 master weights；CPU BF16 参数用原生单遍 AdamW，编译失败时用 FP32 副本 + torch AdamW（`experiments/run.sh` 默认开启） |
+| `lr_reference_rows` | 全部 | `None` | 每步 lr 乘 `min(1, 监督行数 / N)` |
+| `continuous_training` | 全部 | `False` | 队列排空即训练，安装槽空出时发布最新权重 |
 | `frozen_parameter_prefixes` | 全部 | `[]` | 按名字前缀冻结参数，例如 `["lm_head"]` |
 | `check_gradients` | 全部 | `False` | 每步检查梯度是否有限 |
 | `log_updates` | 全部 | `False` | 记录每次 GPU 权重安装 |
@@ -239,6 +241,13 @@ CPU attention backward 使用独立 C++ extension，需要 C++ 编译器和 Ninj
 | `rebuild_kv` | EAGLE3、Qwen3.5 MTP、DFlash | `True` | 训练更新后重新投影 confirmed KV；关闭时复用训练前已构造的 KV |
 | `grouped_query_attention` | DFlash | `False` | CPU attention 按 GQA 重排，不展开历史 K/V |
 | `selective_last_layer` | DFlash | `False` | 最后一层只计算监督行 |
+| `loss_temperature` | DFlash | `0` | KL 温度；`0` 保持 T=1，正数把 teacher 与 draft 都锐化到该温度 |
+
+无 bias 的可训练 linear 总是把权重梯度写入常驻缓冲，不需要配置。
+
+各方法的 loss 固定在训练窗口里：EAGLE3、Qwen3.5 MTP 与 Gemma4 MTP 用每轮深度
+`0.9**d` 加权的 forward KL（除以行数，`training/eagle3/distill.py`），DFlash 用
+`exp(-d/7)` 权重的 KL（`training/dflash/distill.py`）。
 
 MTP 与 target 共享 lm_head，不训练 lm_head。Gemma4 MTP（assistant）的 lm_head
 是自有参数，同样冻结；`post_projection` 只把输出送回下一个 draft 步，而这些输入是

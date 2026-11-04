@@ -871,11 +871,9 @@ class DflashLaunchTest(unittest.TestCase):
         self.assertEqual(env["OSD_DRAFT_MODEL"], "")
         self.assertEqual(env["VLLM_ONLINE_DRAFT_TRAIN"], "0")
 
-        command, env = self._command(
-            "online_draft", "--draft-method", "mtp", "--online-draft-loss", "entropy"
-        )
+        command, env = self._command("online_draft", "--draft-method", "mtp")
         config = json.loads(command[command.index("--additional-config") + 1])
-        self.assertEqual(config["online_draft"]["loss_mode"], "entropy")
+        self.assertTrue(config["online_draft"]["master_weights"])
         self.assertEqual(env["VLLM_ONLINE_DRAFT_TRAIN"], "1")
 
     def test_prepare_includes_dflash_drafts(self):

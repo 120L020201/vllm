@@ -4,8 +4,8 @@
 import torch
 import torch.nn.functional as F
 
-_POSITION_WEIGHT = 1.0
-_REJECTION_POSITION_WEIGHT = 2.0
+# Per-round depth decay of the EAGLE3 and MTP online losses.
+_POSITION_DECAY = 0.9
 
 
 def project_teacher_distribution(
@@ -49,45 +49,30 @@ def project_teacher_distribution(
     return teacher_probabilities.detach(), coverage.detach()
 
 
-def window_forward_kl_loss(
+def position_forward_kl_loss(
     student_logits: torch.Tensor,
     teacher_probabilities: torch.Tensor,
-    rejection_target_mask: torch.Tensor,
+    proposal_depths: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute forward KL for selected targets from multiple rounds.
+    """Compute forward KL weighted by ``0.9 ** depth`` within each round.
 
-    The caller selects supervised hidden-state rows before the LM head,
-    so student and teacher rows are already aligned. Multiple positions
-    may be marked as rejected because one window may contain many rounds.
+    Depth restarts at zero on every round's anchor row. The weighted sum is
+    divided by the row count, so later rows count less without raising the
+    weight of earlier ones.
 
     Args:
         student_logits: Selected draft logits shaped
             [target_count, draft_vocab_size].
         teacher_probabilities: Teacher probabilities with the same shape.
-        rejection_target_mask: Boolean rejection markers shaped
-            [target_count].
+        proposal_depths: Draft depth of each row shaped [target_count].
 
     Returns:
-        A scalar FP32 rejection-weighted forward-KL loss.
+        A scalar FP32 position-weighted forward-KL loss.
     """
-    position_weights = _make_masked_position_weights(rejection_target_mask)
     per_position_kl = F.kl_div(
         F.log_softmax(student_logits.float(), dim=-1),
         teacher_probabilities.detach().float(),
         reduction="none",
     ).sum(dim=-1)
-    return (per_position_kl * position_weights).sum() / position_weights.sum()
-
-
-def _make_masked_position_weights(
-    rejection_target_mask: torch.Tensor,
-) -> torch.Tensor:
-    weights = torch.full(
-        rejection_target_mask.shape,
-        _POSITION_WEIGHT,
-        dtype=torch.float32,
-        device=rejection_target_mask.device,
-    )
-    weights[rejection_target_mask] = _REJECTION_POSITION_WEIGHT
-
-    return weights
+    weights = _POSITION_DECAY ** proposal_depths.to(per_position_kl).float()
+    return (per_position_kl * weights).sum() / per_position_kl.numel()

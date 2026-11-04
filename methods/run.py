@@ -153,71 +153,10 @@ def build_parser():
     )
     parser.add_argument("--dflash-max-train-rounds", type=int, default=16)
     parser.add_argument(
-        "--dflash-loss-gamma",
-        type=float,
-        default=None,
-        help="DFlash position decay exp(-depth/gamma); default keeps rho=0.9",
-    )
-    parser.add_argument(
-        "--dflash-loss-normalization",
-        choices=("mean", "weights", "block"),
-        default="mean",
-        help="normalize DFlash loss by token, weight sum, or equally per block",
-    )
-    parser.add_argument(
-        "--dflash-loss-rejection-weight",
-        type=float,
-        default=1.0,
-        help="extra weight on each block's first rejected prediction",
-    )
-    parser.add_argument(
-        "--dflash-loss-objective",
-        choices=("kl", "overlap", "ce", "kl_overlap"),
-        default="kl",
-        help="DFlash objective: full KL, acceptance overlap, top-1 CE, or KL+overlap",
-    )
-    parser.add_argument(
-        "--dflash-loss-overlap-weight",
-        type=float,
-        default=1.0,
-        help="overlap coefficient for the kl_overlap objective",
-    )
-    parser.add_argument(
         "--dflash-loss-temperature",
         type=float,
-        default=1.0,
-        help="temperature shared by the DFlash student and teacher distributions",
-    )
-    parser.add_argument(
-        "--dflash-loss-top-k",
-        type=int,
-        default=0,
-        help="teacher sampler top-k used by the DFlash objective; 0 keeps all",
-    )
-    parser.add_argument(
-        "--dflash-loss-top-p",
-        type=float,
-        default=1.0,
-        help="teacher sampler top-p used by the DFlash objective",
-    )
-    parser.add_argument(
-        "--dflash-loss-reference-weight",
-        type=float,
         default=0.0,
-        help="KL weight toward the frozen initial DFlash draft",
-    )
-    parser.add_argument(
-        "--dflash-loss-reference-decay-tokens",
-        type=int,
-        default=0,
-        help="linearly release the DFlash reference KL by this sequence "
-        "length; 0 keeps it",
-    )
-    parser.add_argument(
-        "--online-draft-loss",
-        choices=("uniform", "position", "entropy"),
-        default="uniform",
-        help="CPU online loss; position uses rho=0.9 and entropy uses gamma=2",
+        help="sharpen the online DFlash KL to this temperature; 0 keeps T=1",
     )
     parser.add_argument(
         "--check-gradients",
@@ -234,7 +173,8 @@ def build_parser():
         "--master-weights",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="keep FP32 optimizer master weights (default: on for tts only)",
+        help="keep FP32 optimizer master weights (default: on for tts and "
+        "online_draft)",
     )
     parser.add_argument(
         "--eagle3-recurrent-gradients",
@@ -243,27 +183,16 @@ def build_parser():
         help="backpropagate GPU EAGLE3 losses through the draft recurrence",
     )
     parser.add_argument(
-        "--persistent-grads",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="reuse CPU gradient buffers during online training",
-    )
-    parser.add_argument(
         "--continuous-training",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="train queued rounds without waiting for the next weight install",
-    )
-    parser.add_argument(
-        "--online-draft-train-schedule",
-        default="",
-        help="cumulative completed rounds at which to train, e.g. 63,111,151",
+        default=False,
+        help="train queued online rounds without waiting for the next install",
     )
     parser.add_argument(
         "--lr-reference-rows",
         type=float,
-        default=None,
-        help="scale the online learning rate by target_rows / reference_rows",
+        default=0.0,
+        help="scale the online learning rate by min(1, rows / N); 0 disables",
     )
     parser.add_argument(
         "--log-updates",
@@ -290,20 +219,15 @@ def configure(args):
     log_updates = args.log_updates
     if log_updates is None:
         log_updates = args.method == "online_draft"
-    master_weights = (
-        args.method == "tts" if args.master_weights is None else args.master_weights
-    )
-    persistent_grads = bool(args.persistent_grads)
-    continuous_training = bool(args.continuous_training)
-    train_schedule = tuple(
-        int(value)
-        for value in args.online_draft_train_schedule.replace(",", " ").split()
-    )
-    if train_schedule and (
-        any(value < 1 for value in train_schedule)
-        or any(left >= right for left, right in zip(train_schedule, train_schedule[1:]))
+    master_weights = args.master_weights
+    if master_weights is None:
+        master_weights = args.method in {"tts", "online_draft"}
+    if not math.isfinite(args.dflash_loss_temperature) or (
+        args.dflash_loss_temperature < 0
     ):
-        raise ValueError("train schedule must be strictly increasing rounds")
+        raise ValueError("dflash loss temperature must be finite and nonnegative")
+    if not math.isfinite(args.lr_reference_rows) or args.lr_reference_rows < 0:
+        raise ValueError("lr reference rows must be finite and nonnegative")
     if os.environ.get("VLLM_ONLINE_DRAFT_TRAIN") not in (None, "", cpu_online):
         raise ValueError(
             "VLLM_ONLINE_DRAFT_TRAIN conflicts with the selected method; "
@@ -431,8 +355,6 @@ def configure(args):
             "OSD_LOG_UPDATES": str(int(log_updates)),
             "OSD_MASTER_WEIGHTS": str(int(master_weights)),
             "OSD_EAGLE3_RECURRENT_GRADIENTS": str(int(args.eagle3_recurrent_gradients)),
-            "OSD_PERSISTENT_GRADS": str(int(persistent_grads)),
-            "OSD_CONTINUOUS_TRAINING": str(int(continuous_training)),
             "OSD_FROZEN_PARAMETER_PREFIXES": ",".join(prefixes),
             "PYTHONPATH": os.pathsep.join(python_path),
         }
@@ -444,41 +366,15 @@ def configure(args):
         "check_gradients": args.check_gradients,
         "log_updates": log_updates,
     }
-    # The vLLM online runtime rejects unknown keys; send extensions only on use.
-    if args.method == "online_draft" and args.online_draft_loss != "uniform":
-        online_draft_config["loss_mode"] = args.online_draft_loss
-    if master_weights and args.method == "online_draft":
-        online_draft_config["master_weights"] = True
-    if persistent_grads:
-        online_draft_config["persistent_grads"] = True
-    if continuous_training:
-        online_draft_config["continuous_training"] = True
-    if train_schedule:
-        online_draft_config["train_schedule"] = list(train_schedule)
-    if args.lr_reference_rows is not None:
-        online_draft_config["lr_reference_rows"] = args.lr_reference_rows
+    if args.method == "online_draft":
+        online_draft_config.update(
+            master_weights=master_weights,
+            lr_reference_rows=args.lr_reference_rows or None,
+            continuous_training=args.continuous_training,
+        )
     if draft_method == "dflash":
         online_draft_config["max_train_rounds"] = args.dflash_max_train_rounds
-        dflash_loss = {
-            "loss_gamma": (args.dflash_loss_gamma, None),
-            "loss_normalization": (args.dflash_loss_normalization, "mean"),
-            "loss_rejection_weight": (args.dflash_loss_rejection_weight, 1.0),
-            "loss_objective": (args.dflash_loss_objective, "kl"),
-            "loss_overlap_weight": (args.dflash_loss_overlap_weight, 1.0),
-            "loss_temperature": (args.dflash_loss_temperature, 1.0),
-            "loss_top_k": (args.dflash_loss_top_k, 0),
-            "loss_top_p": (args.dflash_loss_top_p, 1.0),
-            "loss_reference_weight": (args.dflash_loss_reference_weight, 0.0),
-            "loss_reference_decay_tokens": (
-                args.dflash_loss_reference_decay_tokens,
-                0,
-            ),
-        }
-        online_draft_config.update(
-            (key, value)
-            for key, (value, default) in dflash_loss.items()
-            if value != default
-        )
+        online_draft_config["loss_temperature"] = args.dflash_loss_temperature
     else:
         online_draft_config["attention_backend"] = args.cpu_training_attention_backend
 
@@ -578,9 +474,7 @@ def main(argv=None):
             f"method={env['OSD_METHOD']} draft_method={env['OSD_DRAFT_METHOD']} "
             f"online={int(args.method not in {'eagle', 'dflash', 'mtp'})} "
             f"cpu_online={env['VLLM_ONLINE_DRAFT_TRAIN']} "
-            f"master_weights={env['OSD_MASTER_WEIGHTS']} "
-            f"persistent_grads={env['OSD_PERSISTENT_GRADS']} "
-            f"continuous_training={env['OSD_CONTINUOUS_TRAINING']}"
+            f"master_weights={env['OSD_MASTER_WEIGHTS']}"
         )
         return
     os.execvpe(command[0], command, env)

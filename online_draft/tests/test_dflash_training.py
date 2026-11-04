@@ -303,16 +303,22 @@ def test_packed_window_matches_sequential_loss_and_parameter_gradients(
             )
 
 
-def test_position_decay_restarts_per_block_and_weights_kl():
+@pytest.mark.parametrize("temperature", [0.0, 0.6])
+def test_position_decay_restarts_per_block_and_weights_kl(temperature: float):
+    """Temperature 0 keeps the T=1 KL; a positive value sharpens both sides."""
     rounds = (make_batch(5, 1, prompt=True), make_batch(7, 3))
     weights = position_weights(rounds)
     expected = torch.exp(-torch.tensor([0, 1, 0, 1, 2]) / 7)
     torch.testing.assert_close(weights, expected)
     logits = torch.randn(5, 23, requires_grad=True)
     teacher = torch.cat([batch.teacher_probabilities for batch in rounds])
-    kl = (teacher * (teacher.log() - logits.log_softmax(-1))).sum(-1)
+    scale = temperature or 1.0
+    sharp_teacher = (teacher.log() / scale).softmax(-1)
+    student = (logits / scale).log_softmax(-1)
+    kl = (sharp_teacher * (sharp_teacher.log() - student)).sum(-1)
     torch.testing.assert_close(
-        dflash_kl_loss(logits, teacher, weights), (kl * expected).sum() / expected.sum()
+        dflash_kl_loss(logits, teacher, weights, temperature=temperature),
+        (kl * expected).sum() / expected.sum(),
     )
 
 

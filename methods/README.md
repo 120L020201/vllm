@@ -329,9 +329,11 @@ The built-in CPU online trainer is selected by all three `online_draft` aliases,
 which automatically set `VLLM_ONLINE_DRAFT_TRAIN=1`.
 Other entries set it to `0`. `CHECK_GRADIENTS`, `FROZEN_PARAMETER_PREFIXES`,
 `FUSED_OPTIMIZER`, and `LOG_UPDATES` configure the shared trainer;
-`VLLM_ONLINE_DRAFT_PROFILE` applies to all recipes. `ONLINE_DRAFT_LOSS` selects
-`uniform`, `position`, or `entropy`; DFlash also accepts
-`DFLASH_MAX_TRAIN_ROUNDS`.
+`VLLM_ONLINE_DRAFT_PROFILE` applies to all recipes. The losses are fixed per
+method; `ONLINE_DRAFT_MASTER_WEIGHTS` (default 1),
+`ONLINE_DRAFT_CONTINUOUS_TRAINING` and `ONLINE_DRAFT_LR_REFERENCE_ROWS` (default
+0) control CPU training. DFlash also accepts `DFLASH_MAX_TRAIN_ROUNDS` and
+`ONLINE_DRAFT_DFLASH_LOSS_TEMPERATURE` (default 0, which keeps T=1).
 
 Base, EAGLE3, DFlash, and MTP support resume and default to `RESUME=1`, skipping successful
 questions individually. `online_draft`, TTS, and OSpec default to `RESUME=0` and
